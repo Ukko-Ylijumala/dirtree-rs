@@ -303,23 +303,29 @@ impl DirTree {
             Ok(entries) => entries,
             Err(_) => return,
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+        for entry in entries.filter_map(Result::ok) {
             let path: PathBuf = entry.path();
-            if self.debug {
-                eprintln!("**     Found: {} ", path.to_string_lossy())
+            let meta: Metadata = match entry.metadata() {
+                Ok(metadata) => {
+                    if self.debug {
+                        eprintln!("**     Found: {} ", path.to_string_lossy())
+                    };
+                    metadata
+                }
+                Err(_) => {
+                    if self.debug {
+                        eprintln!("Error reading metadata: {}", path.to_string_lossy());
+                    }
+                    continue;
+                }
             };
-            let meta: Option<Metadata> = entry.metadata().ok();
-            if path.is_dir() {
-                self.insert(&path, NodeItem::AsDir, meta);
+            if meta.is_dir() {
+                self.insert(&path, NodeItem::AsDir, Some(meta));
                 if recursive {
                     self.populate(&path, recursive);
                 }
-            } else if path.is_file() {
-                self.insert(&path, NodeItem::AsFile, meta);
+            } else if meta.is_file() {
+                self.insert(&path, NodeItem::AsFile, Some(meta));
             }
         }
     }
@@ -356,7 +362,7 @@ impl DirTree {
     /// Remove a Node (or a leaf) from the trie. Expects an absolute path.
     ///
     /// NOTE: uses unsafe code to work with raw pointers.
-    /// 
+    ///
     /// WARNING: implementation is WIP and may yet contain bugs.
     pub fn remove(&mut self, path: &str) {
         let mut current: *mut Node = &mut self.root;
