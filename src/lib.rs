@@ -6,6 +6,7 @@ use crate::{metadata, HashMap, Instant, Metadata, MetadataExt, PathBuf, VecDeque
 use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
+    io::{Error, ErrorKind},
     ptr,
 };
 
@@ -65,12 +66,12 @@ trait DirectoryEntry {
             // failed to get metadata, likely deleted in the meantime
             None => return Err(()),
         };
-        if !self.data().inode == meta.ino() {
+        if self.data().inode != meta.ino() {
             // inode changed, file/dir was replaced and we're out of sync
             // this case must be handled by the caller
             return Err(());
         }
-        if !self.data().mode == meta.mode() {
+        if self.data().mode != meta.mode() {
             self.data_mut().mode = meta.mode();
         }
         self.data_mut().scanned += 1;
@@ -98,21 +99,18 @@ trait DirectoryEntry {
 pub struct Directory(Data);
 
 impl Directory {
-    pub fn new(path: PathBuf, meta: Option<Metadata>) -> Self {
-        let meta: Metadata = match meta {
-            Some(m) => m,
-            None => match metadata(path.as_path()) {
-                Ok(m) => m,
-                Err(_) => panic!("Failed to get metadata for: {}", path.display()),
-            },
-        };
-        Self(Data {
-            path,
-            inode: meta.ino(),
-            mode: meta.mode(),
-            scanned: 1,
-            when: Instant::now(),
-        })
+    pub fn new(path: PathBuf, meta: Option<Metadata>) -> Result<Self, Error> {
+        let meta: Option<Metadata> = meta.or_else(|| metadata(&path).ok());
+        match meta {
+            Some(m) => Ok(Self(Data {
+                path,
+                inode: m.ino(),
+                mode: m.mode(),
+                scanned: 1,
+                when: Instant::now(),
+            })),
+            None => Err(Error::new(ErrorKind::NotFound, "Failed to get metadata")),
+        }
     }
 }
 
@@ -130,18 +128,18 @@ impl DirectoryEntry for Directory {
 pub struct File(Data);
 
 impl File {
-    pub fn new(path: PathBuf, meta: Option<Metadata>) -> Self {
-        let meta: Metadata = match meta {
-            Some(m) => m,
-            None => metadata(path.as_path()).unwrap(),
-        };
-        Self(Data {
-            path,
-            inode: meta.ino(),
-            mode: meta.mode(),
-            scanned: 1,
-            when: Instant::now(),
-        })
+    pub fn new(path: PathBuf, meta: Option<Metadata>) -> Result<Self, Error> {
+        let meta: Option<Metadata> = meta.or_else(|| metadata(&path).ok());
+        match meta {
+            Some(m) => Ok(Self(Data {
+                path,
+                inode: m.ino(),
+                mode: m.mode(),
+                scanned: 1,
+                when: Instant::now(),
+            })),
+            None => Err(Error::new(ErrorKind::NotFound, "Failed to get metadata")),
+        }
     }
 }
 
@@ -337,22 +335,24 @@ impl DirTree {
         for part in path_parts(&path.to_string_lossy()) {
             current = current.children.entry(part.to_owned()).or_default();
         }
-        if current.item.is_dir() || current.item.is_file() {
+        if matches!(current.item, NodeItem::Dir(_) | NodeItem::File(_)) {
             // for now we don't overwrite existing nodes, but
             // this may change in the future to allow for updates
             return;
         }
-        match node_t {
+        current.item = match node_t {
             NodeItem::AsDir => {
-                current.item = NodeItem::Dir(Directory::new(path.clone(), meta));
+                let d: NodeItem = NodeItem::Dir(Directory::new(path.clone(), meta).unwrap());
                 self.dirs += 1;
+                d
             }
             NodeItem::AsFile => {
-                current.item = NodeItem::File(File::new(path.clone(), meta));
+                let f: NodeItem = NodeItem::File(File::new(path.clone(), meta).unwrap());
                 self.files += 1;
+                f
             }
             _ => return,
-        }
+        };
         self.nodes += 1;
         if self.debug {
             eprintln!("*** Inserted: {:?}", current)
