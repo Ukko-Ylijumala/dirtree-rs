@@ -191,6 +191,7 @@ impl NodeItem {
         matches!(self, Self::Uninitialized)
     }
 
+    /// Returns a reference to the inner [`Directory`] if the node item is [`Dir`].
     pub fn as_dir(&self) -> Option<&Directory> {
         if let Self::Dir(v) = self {
             Some(v)
@@ -199,6 +200,7 @@ impl NodeItem {
         }
     }
 
+    /// Returns a reference to the inner [`File`] if the node item is [`File`].
     pub fn as_file(&self) -> Option<&File> {
         if let Self::File(v) = self {
             Some(v)
@@ -206,14 +208,25 @@ impl NodeItem {
             None
         }
     }
+
+    /// Returns a reference to item's [`Data`] if the node item is [`Dir`] or [`File`].
+    fn data(&self) -> Option<&Data> {
+        Some(match self {
+            Self::Dir(d) => d.data(),
+            Self::File(f) => f.data(),
+            _ => return None,
+        })
+    }
 }
 
+// Implement `From` for converting `Directory` into `NodeItem`.
 impl From<Directory> for NodeItem {
     fn from(v: Directory) -> Self {
         Self::Dir(v)
     }
 }
 
+// Implement `From` for converting `File` into `NodeItem`.
 impl From<File> for NodeItem {
     fn from(v: File) -> Self {
         Self::File(v)
@@ -254,10 +267,10 @@ impl Node {
 pub struct DirTree {
     from: PathBuf,
     nodes: u64,
-    debug: bool,
-    root: Node,
     pub dirs: u32,
     pub files: u64,
+    root: Node,
+    debug: bool,
 }
 
 impl DirTree {
@@ -494,6 +507,17 @@ impl DirTree {
         self.iter().filter_map(|node| {
             if node.item.is_file() {
                 node.item.as_file()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// An iterator over all Paths in the tree.
+    pub fn iter_paths(&self) -> impl Iterator<Item = &str> {
+        self.iter().filter_map(|node| {
+            if node.item.is_file() || node.item.is_dir() {
+                Some(node.item.data().unwrap().path.to_str().unwrap())
             } else {
                 None
             }
