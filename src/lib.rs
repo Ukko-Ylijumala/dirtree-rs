@@ -2,15 +2,20 @@
 
 #![allow(dead_code)]
 
-use crate::{metadata, HashMap, Instant, Metadata, MetadataExt, PathBuf, VecDeque};
+use crate::{
+    metadata, Deref, DerefMut, HashMap, Instant, Metadata, MetadataExt, PathBuf, VecDeque,
+};
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
     ptr,
+    rc::{Rc, Weak},
 };
 
 const PATH_SEP: char = '/';
+const META_FAIL: &str = "Failed to get metadata";
 
 #[derive(Debug, Clone, Eq)]
 struct Data {
@@ -60,23 +65,23 @@ trait DirectoryEntry {
         };
     }
 
-    fn rescan(&mut self) -> Result<(), ()> {
+    fn rescan(&mut self) -> Result<Metadata, Error> {
         let meta: Metadata = match self.stat() {
             Some(m) => m,
             // failed to get metadata, likely deleted in the meantime
-            None => return Err(()),
+            None => return Err(Error::new(ErrorKind::NotFound, META_FAIL)),
         };
         if self.data().inode != meta.ino() {
             // inode changed, file/dir was replaced and we're out of sync
             // this case must be handled by the caller
-            return Err(());
+            return Err(Error::new(ErrorKind::AlreadyExists, "Inode changed"));
         }
         if self.data().mode != meta.mode() {
             self.data_mut().mode = meta.mode();
         }
         self.data_mut().scanned += 1;
         self.data_mut().when = Instant::now();
-        Ok(())
+        Ok(meta)
     }
 
     fn parent(&self) -> PathBuf {
@@ -109,7 +114,7 @@ impl Directory {
                 scanned: 1,
                 when: Instant::now(),
             })),
-            None => Err(Error::new(ErrorKind::NotFound, "Failed to get metadata")),
+            None => Err(Error::new(ErrorKind::NotFound, META_FAIL)),
         }
     }
 }
@@ -138,7 +143,7 @@ impl File {
                 scanned: 1,
                 when: Instant::now(),
             })),
-            None => Err(Error::new(ErrorKind::NotFound, "Failed to get metadata")),
+            None => Err(Error::new(ErrorKind::NotFound, META_FAIL)),
         }
     }
 }
@@ -217,6 +222,15 @@ impl NodeItem {
             _ => return None,
         })
     }
+
+    /// Returns the item's path as Option<&str> if the node item is [`Dir`] or [`File`].
+    fn path_str(&self) -> Option<&str> {
+        Some(match self {
+            Self::Dir(d) => d.data().path.to_str().unwrap(),
+            Self::File(f) => f.data().path.to_str().unwrap(),
+            _ => return None,
+        })
+    }
 }
 
 // Implement `From` for converting `Directory` into `NodeItem`.
@@ -236,9 +250,10 @@ impl From<File> for NodeItem {
 // ######################################################################### //
 
 /// Node in the trie structure for storing paths.
-#[derive(Default, Debug, Clone, PartialEq)]
+#[derive(Default, Debug)]
 pub struct Node {
     item: NodeItem,
+    parent: RefCell<Weak<Node>>,
     children: HashMap<String, Node>,
 }
 
@@ -247,6 +262,7 @@ impl Node {
     pub fn new(item: NodeItem) -> Self {
         Self {
             item,
+            parent: RefCell::new(Weak::new()),
             ..Default::default()
         }
     }
@@ -258,12 +274,82 @@ impl Node {
             NodeItem::Dir(_) | NodeItem::Uninitialized | NodeItem::Root
         )
     }
+
+    /// Returns a weak reference to this node.
+    fn weakref(&self) -> RefCell<Weak<Self>> {
+        RefCell::new(Rc::downgrade(&Rc::new(self.clone())))
+    }
+}
+
+impl Clone for Node {
+    /// Clones the node and its children.
+    fn clone(&self) -> Self {
+        Self {
+            item: self.item.clone(),
+            parent: self.parent.clone(),
+            children: self.children.clone(),
+        }
+    }
+}
+
+impl AsRef<NodeItem> for Node {
+    fn as_ref(&self) -> &NodeItem {
+        &self.item
+    }
+}
+
+// Implement Deref for Node to allow access to NodeItem methods.
+impl Deref for Node {
+    type Target = NodeItem;
+
+    fn deref(&self) -> &Self::Target {
+        &self.item
+    }
+}
+
+// Implement mutable Deref for Node to allow changing NodeItem.
+impl DerefMut for Node {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.item
+    }
+}
+
+// For a File or Directory, the hash is based on the path and inode.
+impl Hash for Node {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if matches!(self.item, NodeItem::Dir(_) | NodeItem::File(_)) {
+            self.item.data().hash(state);
+        } else {
+            self.item.hash(state);
+        }
+    }
+}
+
+// Implement <Node> == <Node> comparisons
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.item == other.item
+    }
+}
+
+// Implement <Node> == <NodeItem> comparisons
+impl PartialEq<NodeItem> for Node {
+    fn eq(&self, other: &NodeItem) -> bool {
+        self.item == *other
+    }
+}
+
+// Implement <NodeItem> == <Node> comparisons
+impl PartialEq<Node> for NodeItem {
+    fn eq(&self, other: &Node) -> bool {
+        *self == other.item
+    }
 }
 
 // ######################################################################### //
 
 /// Trie structure for storing a directory tree.
-#[derive(Default, Debug, Clone, PartialEq)]
+#[derive(Default, Debug, Clone)]
 pub struct DirTree {
     from: PathBuf,
     nodes: u64,
@@ -345,14 +431,27 @@ impl DirTree {
     /// The path is split on forward slash ("/") and the first empty string discarded.
     pub fn insert(&mut self, path: &PathBuf, node_t: NodeItem, meta: Option<Metadata>) {
         let mut current: &mut Node = &mut self.root;
+
         for part in path_parts(&path.to_string_lossy()) {
-            current = current.children.entry(part.to_owned()).or_default();
+            let part: String = part.to_owned();
+            if !current.children.contains_key(&part) {
+                eprintln!(">>> cur: {:?}", current);
+                // eprintln!("*** node   : {part} ::: parent: {:?}", parent);
+                let mut new: Node = Node::default();
+                new.parent = current.weakref();
+                eprintln!("*** new: {:?}", &new);
+                current.children.insert(part.clone(), new);
+            }
+            // current = current.children.entry(part).or_default();
+            current = current.children.get_mut(&part).unwrap();
         }
+
         if matches!(current.item, NodeItem::Dir(_) | NodeItem::File(_)) {
             // for now we don't overwrite existing nodes, but
             // this may change in the future to allow for updates
             return;
         }
+
         current.item = match node_t {
             NodeItem::AsDir => {
                 let d: NodeItem = NodeItem::Dir(Directory::new(path.clone(), meta).unwrap());
@@ -366,6 +465,7 @@ impl DirTree {
             }
             _ => return,
         };
+
         self.nodes += 1;
         if self.debug {
             eprintln!("*** Inserted: {:?}", current)
@@ -460,30 +560,12 @@ impl DirTree {
 
     /// Returns a Vec of all `Directory` items in the tree.
     pub fn dirs(&self) -> Vec<&Directory> {
-        self.nodes()
-            .iter()
-            .filter_map(|n| {
-                if n.item.is_dir() {
-                    n.item.as_dir()
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.nodes().iter().filter_map(|n| n.as_dir()).collect()
     }
 
     /// Returns a Vec of all `File` items in the tree.
     pub fn files(&self) -> Vec<&File> {
-        self.nodes()
-            .iter()
-            .filter_map(|n| {
-                if n.item.is_file() {
-                    n.item.as_file()
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.nodes().iter().filter_map(|n| n.as_file()).collect()
     }
 
     /// Creates an iterator to walk through all Nodes in the tree.
@@ -493,35 +575,17 @@ impl DirTree {
 
     /// An iterator over all `Directory` items in the tree.
     pub fn iter_dirs(&self) -> impl Iterator<Item = &Directory> {
-        self.iter().filter_map(|node| {
-            if node.item.is_dir() {
-                node.item.as_dir()
-            } else {
-                None
-            }
-        })
+        self.iter().filter_map(|node| node.as_dir())
     }
 
     /// An iterator over all `File` items in the tree.
     pub fn iter_files(&self) -> impl Iterator<Item = &File> {
-        self.iter().filter_map(|node| {
-            if node.item.is_file() {
-                node.item.as_file()
-            } else {
-                None
-            }
-        })
+        self.iter().filter_map(|node| node.as_file())
     }
 
     /// An iterator over all Paths in the tree.
     pub fn iter_paths(&self) -> impl Iterator<Item = &str> {
-        self.iter().filter_map(|node| {
-            if node.item.is_file() || node.item.is_dir() {
-                Some(node.item.data().unwrap().path.to_str().unwrap())
-            } else {
-                None
-            }
-        })
+        self.iter().filter_map(|node| node.path_str())
     }
 
     /// Traverses recursively from a Node and applies function `f` to each child Node.
@@ -552,10 +616,8 @@ impl DirTree {
     pub fn print(&self) {
         eprintln!("{:?}\n", self);
         self.traverse(|node| {
-            if node.item.is_file() {
-                println!("{}", node.item.as_file().unwrap().data().path.display());
-            } else if node.item.is_dir() {
-                println!("{}", node.item.as_dir().unwrap().data().path.display());
+            if node.is_file() || node.is_dir() {
+                println!("{}", node.data().unwrap().path.display());
             }
         });
     }
