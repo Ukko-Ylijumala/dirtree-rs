@@ -10,7 +10,7 @@ use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
-    sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
+    sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed},
 };
 
 const PATH_SEP: char = '/';
@@ -18,24 +18,32 @@ const META_FAIL: &str = "Failed to get metadata";
 
 #[derive(Debug, Clone, Eq)]
 struct Data {
-    path: PathBuf,
+    root: Arc<PathBuf>,
+    relpath: String,
     inode: u64,
     mode: u32,
     scanned: u64,
     when: Instant,
 }
 
+impl Data {
+    /// Full path of the file or directory, as `root.join(relpath)`
+    fn path(&self) -> PathBuf {
+        (*self.root).clone().join(&self.relpath)
+    }
+}
+
 // Path and inode are enough to uniquely identify a file or directory.
 impl Hash for Data {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.path.hash(state);
+        self.path().hash(state);
         self.inode.hash(state);
     }
 }
 
 impl PartialEq for Data {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.inode == other.inode
+        self.path() == other.path() && self.inode == other.inode
     }
 }
 
@@ -51,14 +59,33 @@ impl PartialOrd for Data {
     }
 }
 
+/// `std::time::Instant` does not implement Default, so we cannot use
+/// #[derive(Default)] for Data and must implement it ourselves.
+impl Default for Data {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::new().into(),
+            relpath: String::new(),
+            inode: 0,
+            mode: 0,
+            scanned: 0,
+            when: Instant::now(),
+        }
+    }
+}
+
 /* ######################################################################### */
 
+/// A common trait for Directory and File entries.
+///
+/// Used to consolidate common code between `Directory` and `File` structs
+/// (which themselves are just type placeholders for `Entry` struct).
 trait DirectoryEntry {
     fn data(&self) -> &Data;
     fn data_mut(&mut self) -> &mut Data;
 
     fn stat(&self) -> Option<Metadata> {
-        match metadata(self.data().path.as_path()) {
+        match metadata(self.data().path().as_path()) {
             Ok(meta) => return Some(meta),
             Err(_) => return None,
         };
@@ -84,12 +111,12 @@ trait DirectoryEntry {
     }
 
     fn parent(&self) -> PathBuf {
-        self.data().path.parent().unwrap().to_path_buf()
+        self.data().path().parent().unwrap().to_path_buf()
     }
 
     fn name(&self) -> String {
         self.data()
-            .path
+            .path()
             .file_name()
             .unwrap()
             .to_string_lossy()
@@ -103,28 +130,50 @@ impl AsRef<Data> for dyn DirectoryEntry {
     }
 }
 
-/* ######################################################################### */
+/// A generic struct wrapping the `Data` struct, with an extra type parameter `T`.
+/// The `Entry` struct's `new()` method is responsible for creating `Directory`
+/// and `File` instances with the given path and metadata.
+///
+/// Two empty structs `Directory` and `File` are also defined, which are used
+/// as type parameters for `Entry`. These structs implement the `Default` trait,
+/// which is needed for creating `Entry` instances without additional params.
+///
+/// This approach allows us to share the implementation of `DirectoryEntry`
+/// trait between `Directory` and `File` without too much code duplication.
+///
+/// You can use the struct like this:
+/// ```rust
+/// let d = Entry::<Directory>::new(PathBuf::from("/dir/path"), None).unwrap();
+/// let f = Entry::<File>::new(PathBuf::from("/file/path"), None).unwrap();
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Entry<T>(Data, T);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Directory(Data);
-
-impl Directory {
-    pub fn new(path: PathBuf, meta: Option<Metadata>) -> Result<Self, Error> {
+impl<T: Default> Entry<T> {
+    fn new(root: Arc<PathBuf>, relpath: String, meta: Option<Metadata>) -> Result<Self, Error> {
+        let path: PathBuf = root.join(&relpath);
         let meta: Option<Metadata> = meta.or_else(|| metadata(&path).ok());
         match meta {
-            Some(m) => Ok(Self(Data {
-                path,
-                inode: m.ino(),
-                mode: m.mode(),
-                scanned: 1,
-                when: Instant::now(),
-            })),
+            Some(m) => Ok(Self(
+                Data {
+                    root,
+                    relpath,
+                    inode: m.ino(),
+                    mode: m.mode(),
+                    scanned: 1,
+                    when: Instant::now(),
+                },
+                Default::default(), // provides the type parameter T
+            )),
             None => Err(Error::new(ErrorKind::NotFound, META_FAIL)),
         }
     }
 }
 
-impl DirectoryEntry for Directory {
+/// Implement trait `DirectoryEntry` for `Entry` struct.
+///
+/// Basically, this allows us to consolidate common code under trait
+/// `DirectoryEntry` since then we can reference the inner `Data` struct there.
+impl<T> DirectoryEntry for Entry<T> {
     fn data(&self) -> &Data {
         &self.0
     }
@@ -134,32 +183,23 @@ impl DirectoryEntry for Directory {
     }
 }
 
+/// An empty struct, used as a type parameter T for `Entry`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct File(Data);
+pub struct Directory;
 
-impl File {
-    pub fn new(path: PathBuf, meta: Option<Metadata>) -> Result<Self, Error> {
-        let meta: Option<Metadata> = meta.or_else(|| metadata(&path).ok());
-        match meta {
-            Some(m) => Ok(Self(Data {
-                path,
-                inode: m.ino(),
-                mode: m.mode(),
-                scanned: 1,
-                when: Instant::now(),
-            })),
-            None => Err(Error::new(ErrorKind::NotFound, META_FAIL)),
-        }
+impl Default for Directory {
+    fn default() -> Self {
+        Directory
     }
 }
 
-impl DirectoryEntry for File {
-    fn data(&self) -> &Data {
-        &self.0
-    }
+/// An empty struct, used as a type parameter T for `Entry`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct File;
 
-    fn data_mut(&mut self) -> &mut Data {
-        &mut self.0
+impl Default for File {
+    fn default() -> Self {
+        File
     }
 }
 
@@ -205,8 +245,8 @@ impl NodeType {
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeItem {
     Root,
-    Dir(Directory),
-    File(File),
+    Dir(Entry<Directory>),
+    File(Entry<File>),
     #[default]
     None,
 }
@@ -237,7 +277,7 @@ impl NodeItem {
     }
 
     /// Returns a reference to the inner [`Directory`] if the node item is [`Dir`].
-    pub fn as_dir(&self) -> Option<&Directory> {
+    pub fn as_dir(&self) -> Option<&Entry<Directory>> {
         if let Self::Dir(v) = self {
             Some(v)
         } else {
@@ -246,7 +286,7 @@ impl NodeItem {
     }
 
     /// Returns a reference to the inner [`File`] if the node item is [`File`].
-    pub fn as_file(&self) -> Option<&File> {
+    pub fn as_file(&self) -> Option<&Entry<File>> {
         if let Self::File(v) = self {
             Some(v)
         } else {
@@ -263,26 +303,26 @@ impl NodeItem {
         })
     }
 
-    /// Returns the item's path as Option<&str> if the node item is [`Dir`] or [`File`].
-    fn path_str(&self) -> Option<&str> {
+    /// Returns the item's path as Option<String> if the node item is [`Dir`] or [`File`].
+    fn path_str(&self) -> Option<String> {
         Some(match self {
-            Self::Dir(d) => d.data().path.to_str().unwrap(),
-            Self::File(f) => f.data().path.to_str().unwrap(),
+            Self::Dir(d) => d.data().path().to_str().map(|s| s.to_owned())?,
+            Self::File(f) => f.data().path().to_str().map(|s| s.to_owned())?,
             _ => return None,
         })
     }
 }
 
 // Implement `From` for converting `Directory` into `NodeItem`.
-impl From<Directory> for NodeItem {
-    fn from(v: Directory) -> Self {
+impl From<Entry<Directory>> for NodeItem {
+    fn from(v: Entry<Directory>) -> Self {
         Self::Dir(v)
     }
 }
 
 // Implement `From` for converting `File` into `NodeItem`.
-impl From<File> for NodeItem {
-    fn from(v: File) -> Self {
+impl From<Entry<File>> for NodeItem {
+    fn from(v: Entry<File>) -> Self {
         Self::File(v)
     }
 }
@@ -295,11 +335,13 @@ pub struct Node {
     node_t: NodeType,
     item: RwLock<NodeItem>,
     parent: Weak<Node>,
+    depth: AtomicU8,
     children: Option<RwLock<HashMap<String, Arc<Node>>>>,
 }
 
 impl Node {
     /// Returns a new node with the given item.
+    /// NOTE: children are initialized only for containers (directories and root).
     pub fn new(item: NodeItem, parent: Option<Arc<Node>>) -> Self {
         let node_t: NodeType = match item {
             NodeItem::Root => NodeType::Root,
@@ -307,34 +349,36 @@ impl Node {
             NodeItem::File(_) => NodeType::File,
             NodeItem::None => NodeType::Uninitialized,
         };
+        let depth: AtomicU8 = match parent {
+            Some(ref p) => (p.depth.load(Relaxed) + 1).into(),
+            None => AtomicU8::new(0),
+        };
         Self {
             children: match node_t {
                 NodeType::Root | NodeType::Directory => Some(RwLock::new(HashMap::new())),
-                NodeType::Uninitialized => Some(RwLock::new(HashMap::new())),
+                NodeType::Uninitialized => None,
                 NodeType::File => None,
             },
             node_t,
             item: RwLock::new(item),
             parent: parent.map_or_else(|| Weak::new(), |p| make_weak_ref(p)),
+            depth,
         }
     }
 
     /// Returns `true` if the node is traversable (`children` != `None`).
     pub fn is_traversable(&self) -> bool {
-        matches!(
-            self.node_t,
-            NodeType::Directory | NodeType::Root | NodeType::Uninitialized
-        )
+        matches!(self.node_t, NodeType::Directory | NodeType::Root)
     }
 
-    fn as_dir(&self) -> Option<Directory> {
+    fn as_dir(&self) -> Option<Entry<Directory>> {
         match self.item.read().as_dir() {
             Some(d) => Some(d.clone()),
             None => None,
         }
     }
 
-    fn as_file(&self) -> Option<File> {
+    fn as_file(&self) -> Option<Entry<File>> {
         match self.item.read().as_file() {
             Some(d) => Some(d.clone()),
             None => None,
@@ -348,8 +392,8 @@ impl Node {
 
     /// Wrap the node in an Arc for sharing between threads.
     #[inline]
-    fn into_arc(self) -> Arc<Node> {
-        Arc::new(self)
+    fn arc(self) -> Arc<Node> {
+        self.into()
     }
 
     /// Whether we have a child with the given name.
@@ -387,6 +431,7 @@ impl Clone for Node {
             node_t: self.node_t.clone(),
             item: RwLock::new(self.item.read().clone()),
             parent: self.parent.clone(),
+            depth: AtomicU8::new(self.depth.load(Relaxed)),
             children: match self.children {
                 Some(ref children) => Some(RwLock::new(children.read().clone())),
                 None => None,
@@ -452,15 +497,17 @@ impl PartialEq<Node> for NodeItem {
 #[derive(Default, Debug)]
 pub struct Counts {
     /// Does not include the root node.
-    nodes: AtomicU64,
+    nodes: AtomicU32,
+    /// Maximum depth of the tree. Root is at depth 0.
+    depth: AtomicU8,
     pub dirs: AtomicU32,
-    pub files: AtomicU64,
+    pub files: AtomicU32,
 }
 
 /// Trie structure for storing a directory tree.
 #[derive(Default, Debug)]
 pub struct DirTree {
-    from: PathBuf,
+    from: Arc<PathBuf>,
     pub counts: Arc<Counts>,
     root: Arc<Node>,
     debug: bool,
@@ -468,13 +515,12 @@ pub struct DirTree {
 
 impl DirTree {
     /// Creates a new empty directory tree (internally a Trie structure).
-    pub fn new(debug: bool) -> Arc<RwLock<Self>> {
-        let tree: DirTree = DirTree {
+    pub fn new(debug: bool) -> Self {
+        DirTree {
             root: Arc::new(Node::new(NodeItem::Root, None)),
             debug,
             ..Default::default()
-        };
-        Arc::new(RwLock::new(tree))
+        }
     }
 
     /// Creates a new tree (trie) with the given path as root.
@@ -482,30 +528,27 @@ impl DirTree {
     /// If `recursive` is true, also populates the tree by recursively walking
     /// the full directory structure (starting from from the given directory)
     /// and inserting each found path into the tree.
-    pub fn new_from_path(path: &str, recursive: bool, debug: bool) -> Arc<RwLock<Self>> {
-        let tree = Self::new(debug);
+    pub fn new_from_path(path: &str, recursive: bool, debug: bool) -> Arc<Self> {
+        let mut tree: DirTree = Self::new(debug);
         let p: PathBuf = PathBuf::from(path);
-        {
-            let mut tree_rw = tree.write();
-            tree_rw.from = p.clone();
-        };
-        tree.read().insert(&p, NodeType::Directory, None);
+        tree.from = p.clone().into();
 
         if debug {
-            eprintln!("Created tree: {:?}", *tree)
+            eprintln!("<TREE> : {:?}", tree)
         };
 
+        tree.insert(&p, NodeType::Directory, None);
         if recursive {
-            tree.read().populate(&p, true);
+            tree.populate(&p, true);
         };
-        tree
+        tree.into()
     }
 
     /// Populate a leaf node in the trie with the contents of a directory.
     /// NOTE: single threaded, potentially slow with large directory trees.
     pub fn populate(&self, path: &PathBuf, recursive: bool) {
         if self.debug {
-            eprintln!("* Populating: {}", path.to_string_lossy())
+            eprintln!(" -> DIR: {}", path.to_string_lossy())
         };
         let entries = match path.read_dir() {
             Ok(entries) => entries,
@@ -516,7 +559,7 @@ impl DirTree {
             let meta: Metadata = match entry.metadata() {
                 Ok(metadata) => {
                     if self.debug {
-                        eprintln!("**     Found: {} ", path.to_string_lossy())
+                        eprintln!("  entry: {} ", path.to_string_lossy())
                     };
                     metadata
                 }
@@ -542,29 +585,42 @@ impl DirTree {
     /// The path is split on forward slash ("/") and the first empty string discarded.
     pub fn insert(&self, path: &PathBuf, node_t: NodeType, meta: Option<Metadata>) {
         let mut current: Arc<Node> = self.root.clone();
-        let len: usize = path_parts_vec(&path.to_string_lossy()).len();
+        let p_unicode = path.to_string_lossy();
+        let parts: Vec<&str> = path_parts_vec(&p_unicode);
+        let len: usize = parts.len();
         let mut depth: usize = 0; // root node is at depth 0
 
-        for part in path_parts(&path.to_string_lossy()) {
+        for part in parts {
+            depth += 1;
             let part: String = part.to_owned();
             if !current.has_child(&part) {
                 if self.debug {
-                    eprintln!(">>> cur : {:?}", &current);
+                    eprintln!("<NODE> : {:?}", &current);
                 }
                 // we don't have an item for this node yet, hence NodeItem::None
+                // also node_t must be set here since later the Node will be in
+                // an Arc and we can't change that field anymore
                 let mut new: Node = Node::new(NodeItem::None, Some(current.clone()));
                 if depth < len {
+                    if self.debug {
+                        eprintln!("\n<---- {part} ----> depth: {depth} len: {len}");
+                    }
                     // must be a container (directory)
-                    // Node.children is initialized in Node::new() except for files
                     new.node_t = NodeType::Directory;
+                    // Node.children = None in Node::new() for NodeItem::None
+                    new.children = Some(RwLock::new(HashMap::new()));
+                } else {
+                    new.node_t = node_t.clone();
+                    if node_t == NodeType::Directory {
+                        new.children = Some(RwLock::new(HashMap::new()));
+                    }
                 }
                 if self.debug {
-                    eprintln!("*** new ::: {part} ::: {:?}", &new);
+                    eprintln!("  + new: {part} ::: {:?}", &new);
                 }
-                current.add_child(part.clone(), new.into_arc());
+                current.add_child(part.clone(), new.arc());
             }
             current = current.get_child(&part).unwrap();
-            depth += 1;
         }
 
         if !matches!(*current.item.read(), NodeItem::None) {
@@ -573,21 +629,30 @@ impl DirTree {
             return;
         }
 
+        let relpath: String = path
+            .strip_prefix(self.from.as_ref())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         match node_t {
             NodeType::Directory => {
-                *current.item.write() = NodeItem::Dir(Directory::new(path.clone(), meta).unwrap());
+                *current.item.write() = NodeItem::Dir(
+                    Entry::<Directory>::new(self.from.clone(), relpath, meta).unwrap(),
+                );
                 self.counts.dirs.fetch_add(1, Relaxed);
             }
             NodeType::File => {
-                *current.item.write() = NodeItem::File(File::new(path.clone(), meta).unwrap());
+                *current.item.write() =
+                    NodeItem::File(Entry::<File>::new(self.from.clone(), relpath, meta).unwrap());
                 self.counts.files.fetch_add(1, Relaxed);
             }
             _ => return,
         };
 
         self.counts.nodes.fetch_add(1, Relaxed);
+        self.counts.depth.fetch_max(len as u8, Relaxed);
         if self.debug {
-            eprintln!("*** Inserted: {:?}", current)
+            eprintln!(" ++ INS: {:?}", current)
         };
     }
 
@@ -596,26 +661,32 @@ impl DirTree {
     /// WARNING: implementation is WIP and may yet contain bugs.
     pub fn remove(&self, path: &str) {
         match self.get_node(path) {
-            Some(node) => {
-                match node.parent.upgrade() {
-                    Some(parent) => {
-                        eprintln!("*** Removing ***\n{:?}", node);
-                        eprintln!("\n*** Parent before ***\n{:?}", (*parent));
-                        parent.remove_child(
-                            PathBuf::from(path).file_name().unwrap().to_str().unwrap(),
-                        );
-                        eprintln!("\n*** Parent after ***\n{:?}", (*parent));
-                        self.counts.nodes.fetch_sub(1, Relaxed);
-                        if node.item.read().is_dir() {
-                            self.counts.dirs.fetch_sub(1, Relaxed);
-                        } else if node.item.read().is_file() {
-                            self.counts.files.fetch_sub(1, Relaxed);
-                        }
+            Some(node) => match node.parent.upgrade() {
+                Some(parent) => {
+                    eprintln!("*** Removing ***\n{:?}", node);
+                    eprintln!("\n*** Parent before ***\n{:?}", (*parent));
+                    parent.remove_child(PathBuf::from(path).file_name().unwrap().to_str().unwrap());
+                    eprintln!("\n*** Parent after ***\n{:?}", (*parent));
+                    self.counts.nodes.fetch_sub(1, Relaxed);
+                    if node.item.read().is_dir() {
+                        self.counts.dirs.fetch_sub(1, Relaxed);
+                    } else if node.item.read().is_file() {
+                        self.counts.files.fetch_sub(1, Relaxed);
                     }
-                    None => return, // node parent reference is stale
                 }
+                None => {
+                    if self.debug {
+                        eprintln!("*** ERROR: stale parent reference for: {:?}", node)
+                    };
+                    return;
+                }
+            },
+            None => {
+                if self.debug {
+                    eprintln!("*** WARN: node not found: {path}")
+                };
+                return;
             }
-            None => return, // node not found
         }
     }
 
@@ -701,12 +772,12 @@ impl DirTree {
     }
 
     /// An iterator over all `Directory` items in the tree.
-    pub fn iter_dirs(&self) -> impl Iterator<Item = Directory> {
+    pub fn iter_dirs(&self) -> impl Iterator<Item = Entry<Directory>> {
         self.iter().filter_map(|node: Arc<Node>| node.as_dir())
     }
 
     /// An iterator over all `File` items in the tree.
-    pub fn iter_files(&self) -> impl Iterator<Item = File> {
+    pub fn iter_files(&self) -> impl Iterator<Item = Entry<File>> {
         self.iter().filter_map(|node: Arc<Node>| node.as_file())
     }
 
@@ -748,7 +819,7 @@ impl DirTree {
         self.traverse(|node: Arc<Node>| {
             if matches!(node.node_t, NodeType::Directory | NodeType::File) {
                 match node.item.read().data() {
-                    Some(data) => println!("{}", data.path.display()),
+                    Some(data) => println!("{}", data.path().display()),
                     None => {}
                 }
             }
@@ -766,6 +837,9 @@ impl Iterator for DirTreeIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.pop_front().map(|node| {
+            if node.children.is_none() {
+                return node;
+            }
             // Push all found children to the stack
             for child in node
                 .children
