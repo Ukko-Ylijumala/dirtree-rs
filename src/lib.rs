@@ -4,7 +4,7 @@
 
 use crate::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, Deref, DerefMut, HashMap, Instant,
-    Metadata, MetadataExt, PathBuf, RwLock, VecDeque, Weak,
+    Metadata, MetadataExt, PathBuf, RwLock, ScanState, VecDeque, Weak,
 };
 use std::{
     cmp::Ordering,
@@ -497,9 +497,9 @@ impl PartialEq<Node> for NodeItem {
 #[derive(Default, Debug)]
 pub struct Counts {
     /// Does not include the root node.
-    nodes: AtomicU32,
+    pub nodes: AtomicU32,
     /// Maximum depth of the tree. Root is at depth 0.
-    depth: AtomicU8,
+    pub depth: AtomicU8,
     pub dirs: AtomicU32,
     pub files: AtomicU32,
 }
@@ -528,25 +528,25 @@ impl DirTree {
     /// If `recursive` is true, also populates the tree by recursively walking
     /// the full directory structure (starting from from the given directory)
     /// and inserting each found path into the tree.
-    pub fn new_from_path(path: &str, recursive: bool, debug: bool) -> Arc<Self> {
-        let mut tree: DirTree = Self::new(debug);
+    pub fn new_from_path(path: &str, recursive: bool, state: &ScanState) -> Self {
+        let mut tree: DirTree = Self::new(state.debug);
         let p: PathBuf = PathBuf::from(path);
         tree.from = p.clone().into();
 
-        if debug {
+        if state.debug {
             eprintln!("<TREE> : {:?}", tree)
         };
 
         tree.insert(&p, NodeType::Directory, None);
         if recursive {
-            tree.populate(&p, true);
+            tree.populate(&p, true, state);
         };
-        tree.into()
+        tree
     }
 
     /// Populate a leaf node in the trie with the contents of a directory.
     /// NOTE: single threaded, potentially slow with large directory trees.
-    pub fn populate(&self, path: &PathBuf, recursive: bool) {
+    pub fn populate(&self, path: &PathBuf, recursive: bool, state: &ScanState) {
         if self.debug {
             eprintln!(" -> DIR: {}", path.to_string_lossy())
         };
@@ -572,11 +572,18 @@ impl DirTree {
             };
             if meta.is_dir() {
                 self.insert(&path, NodeType::Directory, Some(meta));
+                state.num_d.inc1();
+                state.d_bar.inc(1);
                 if recursive {
-                    self.populate(&path, recursive);
+                    self.populate(&path, recursive, state);
                 }
             } else if meta.is_file() {
+                if state.verbose {
+                    state.fsize.fetch_add(meta.len());
+                }
                 self.insert(&path, NodeType::File, Some(meta));
+                state.num_f.inc1();
+                state.f_bar.inc(1);
             }
         }
     }
