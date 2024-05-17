@@ -3,9 +3,10 @@
 #![allow(dead_code)]
 
 use crate::{
-    make_weak_ref, metadata, path_parts, path_parts_vec, Arc, Deref, DerefMut, HashMap, Instant,
-    Metadata, MetadataExt, PathBuf, RwLock, ScanState, VecDeque, Weak,
+    make_weak_ref, metadata, path_parts, path_parts_vec, Arc, Deref, DerefMut, DirEntry, HashMap,
+    Instant, Metadata, MetadataExt, PathBuf, ReadDir, RwLock, ScanState, VecDeque, Weak,
 };
+use rayon::prelude::*;
 use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
@@ -508,16 +509,31 @@ pub struct Counts {
 #[derive(Default, Debug)]
 pub struct DirTree {
     from: Arc<PathBuf>,
-    pub counts: Arc<Counts>,
+    counts: Arc<Counts>,
     root: Arc<Node>,
     debug: bool,
 }
 
 impl DirTree {
+    /// Tree root path (in the filesystem) from which the tree is built.
+    /// NOTE: internally stored paths are relative to this.
+    pub fn from(&self) -> &PathBuf {
+        &self.from
+    }
+
+    fn set_from(&mut self, from: PathBuf) {
+        self.from = from.into();
+        self.insert(&self.from, NodeType::Directory, None);
+    }
+
+    pub fn counts(&self) -> &Counts {
+        &self.counts
+    }
+
     /// Creates a new empty directory tree (internally a Trie structure).
     pub fn new(debug: bool) -> Self {
         DirTree {
-            root: Arc::new(Node::new(NodeItem::Root, None)),
+            root: Node::new(NodeItem::Root, None).into(),
             debug,
             ..Default::default()
         }
@@ -530,52 +546,80 @@ impl DirTree {
     /// and inserting each found path into the tree.
     pub fn new_from_path(path: &str, recursive: bool, state: &ScanState) -> Self {
         let mut tree: DirTree = Self::new(state.debug);
-        let p: PathBuf = PathBuf::from(path);
-        tree.from = p.clone().into();
+        tree.set_from(PathBuf::from(path));
 
         if state.debug {
             eprintln!("<TREE> : {:?}", tree)
         };
 
-        tree.insert(&p, NodeType::Directory, None);
         if recursive {
-            tree.populate(&p, true, state);
+            match state.parallel {
+                true => tree.populate_par(&tree.from, true, state),
+                false => tree.populate(&tree.from, true, state),
+            }
         };
         tree
     }
 
     /// Populate a leaf node in the trie with the contents of a directory.
     /// NOTE: single threaded, potentially slow with large directory trees.
+    #[inline]
     pub fn populate(&self, path: &PathBuf, recursive: bool, state: &ScanState) {
+        let entries: ReadDir = match self.get_entries(path) {
+            Some(value) => value,
+            None => return,
+        };
+        for entry in entries.filter_map(Result::ok) {
+            self.process_entry(entry, state, recursive);
+        }
+    }
+
+    /// Parallel version of `populate()` using Rayon's `par_bridge()`.
+    #[inline]
+    pub fn populate_par(&self, path: &PathBuf, recursive: bool, state: &ScanState) {
+        let entries: ReadDir = match self.get_entries(path) {
+            Some(value) => value,
+            None => return,
+        };
+        entries
+            .filter_map(Result::ok)
+            .par_bridge()
+            .for_each(|entry: DirEntry| {
+                self.process_entry(entry, state, recursive);
+            });
+    }
+
+    /// Get the entries in a directory as a `ReadDir` iterator.
+    #[inline]
+    fn get_entries(&self, path: &PathBuf) -> Option<ReadDir> {
         if self.debug {
             eprintln!(" -> DIR: {}", path.to_string_lossy())
         };
-        let entries = match path.read_dir() {
+        let entries: ReadDir = match path.read_dir() {
             Ok(entries) => entries,
-            Err(_) => return,
+            Err(_) => return None,
         };
-        for entry in entries.filter_map(Result::ok) {
-            let path: PathBuf = entry.path();
-            let meta: Metadata = match entry.metadata() {
-                Ok(metadata) => {
-                    if self.debug {
-                        eprintln!("  entry: {} ", path.to_string_lossy())
-                    };
-                    metadata
-                }
-                Err(_) => {
-                    if self.debug {
-                        eprintln!("Error reading metadata: {}", path.to_string_lossy());
-                    }
-                    continue;
-                }
+        Some(entries)
+    }
+
+    /// Process a directory entry and insert it into the trie.
+    #[inline]
+    fn process_entry(&self, entry: DirEntry, state: &ScanState, recursive: bool) {
+        let path: PathBuf = entry.path();
+        if let Ok(meta) = entry.metadata() {
+            if self.debug {
+                eprintln!("  entry: {} ", path.to_string_lossy())
             };
+
             if meta.is_dir() {
                 self.insert(&path, NodeType::Directory, Some(meta));
                 state.num_d.inc1();
                 state.d_bar.inc(1);
                 if recursive {
-                    self.populate(&path, recursive, state);
+                    match state.parallel {
+                        true => self.populate_par(&path, recursive, state),
+                        false => self.populate(&path, recursive, state),
+                    }
                 }
             } else if meta.is_file() {
                 if state.verbose {
@@ -584,6 +628,10 @@ impl DirTree {
                 self.insert(&path, NodeType::File, Some(meta));
                 state.num_f.inc1();
                 state.f_bar.inc(1);
+            }
+        } else {
+            if self.debug {
+                eprintln!("Error reading metadata: {}", path.to_string_lossy());
             }
         }
     }
