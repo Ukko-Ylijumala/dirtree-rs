@@ -2,16 +2,16 @@
 
 #![allow(dead_code)]
 
-use crate::{
-    make_weak_ref, metadata, path_parts, path_parts_vec, Arc, Deref, DerefMut, DirEntry, HashMap,
-    Instant, Metadata, MetadataExt, PathBuf, ReadDir, RwLock, ScanState, VecDeque, Weak,
+use super::{
+    make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
+    DirEntry, HashMap, Instant, Metadata, MetadataExt, PathBuf, ReadDir, Relaxed, RwLock,
+    ScanState, VecDeque, Weak,
 };
 use rayon::prelude::*;
 use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
-    sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed},
 };
 
 const PATH_SEP: char = '/';
@@ -150,7 +150,7 @@ impl AsRef<Data> for dyn DirectoryEntry {
 pub struct Entry<T>(Data, T);
 
 impl<T: Default> Entry<T> {
-    fn new(root: Arc<PathBuf>, relpath: String, meta: Option<Metadata>) -> Result<Self, Error> {
+    pub fn new(root: Arc<PathBuf>, relpath: String, meta: Option<Metadata>) -> Result<Self, Error> {
         let path: PathBuf = root.join(&relpath);
         let meta: Option<Metadata> = meta.or_else(|| metadata(&path).ok());
         match meta {
