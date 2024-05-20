@@ -780,49 +780,46 @@ impl DirTree {
 
     /// Walk the tree recursively from a Node and return a Vec of child Nodes.
     /// The `dirs` and `files` flags control whether to include directory/file Nodes.
-    fn walk(&self, node: Arc<Node>, dirs: bool, files: bool) -> Vec<Arc<Node>> {
-        let mut nodes: Vec<Arc<Node>> = Vec::new();
+    fn walk(&self, node: Arc<Node>, dirs: bool, files: bool) -> Arc<RwLock<Vec<Arc<Node>>>> {
+        let all_nodes: Arc<RwLock<Vec<Arc<Node>>>> = RwLock::new(Vec::new()).into();
         if node.is_traversable() {
-            for (_, child) in node.children.as_ref().unwrap().read().iter() {
-                if dirs && child.node_t.is_dir() {
-                    nodes.push(child.clone());
-                } else if files && child.node_t.is_file() {
-                    nodes.push(child.clone());
-                }
-                if child.is_traversable() {
-                    nodes.extend(self.walk(child.clone(), dirs, files));
-                }
-            }
+            node.children
+                .as_ref()
+                .unwrap()
+                .read()
+                .values()
+                .par_bridge()
+                .for_each(|child| {
+                    let mut tmp_nodes = Vec::new();
+                    if dirs && child.node_t.is_dir() {
+                        tmp_nodes.push(child.clone());
+                    } else if files && child.node_t.is_file() {
+                        tmp_nodes.push(child.clone());
+                    }
+                    if child.is_traversable() {
+                        tmp_nodes
+                            .extend(self.walk(child.clone(), dirs, files).read().iter().cloned());
+                    }
+                    all_nodes.write().extend(tmp_nodes);
+                });
         }
-        nodes
+        all_nodes
     }
 
     /// Iterates the full tree and returns a Vec of all Nodes. WARNING: this can be
     /// slow and memory intensive for large trees. Prefer using `DirTree::iter()`.
     pub fn nodes(&self) -> Vec<Arc<Node>> {
-        self.walk(self.root.clone(), true, true)
+        self.walk(self.root.clone(), true, true).read().to_vec()
     }
 
     /// Returns a Vec of all `Directory` nodes in the tree.
     pub fn dirs(&self) -> Vec<Arc<Node>> {
-        self.walk(self.root.clone(), true, false)
-            .iter()
-            .filter_map(|n| match n.node_t.is_dir() {
-                true => Some(n.clone()),
-                false => None,
-            })
-            .collect()
+        self.walk(self.root.clone(), true, false).read().to_vec()
     }
 
     /// Returns a Vec of all `File` nodes in the tree.
     pub fn files(&self) -> Vec<Arc<Node>> {
-        self.walk(self.root.clone(), false, true)
-            .iter()
-            .filter_map(|n| match n.node_t.is_file() {
-                true => Some(n.clone()),
-                false => None,
-            })
-            .collect()
+        self.walk(self.root.clone(), false, true).read().to_vec()
     }
 
     /// Creates an iterator to walk through the tree starting from a Node.
@@ -941,17 +938,30 @@ impl DirTree {
         let want_f: u32 = self.counts.files.load(Relaxed);
         assert_eq!(want_n, want_d + want_f, "master node count != dirs+files");
 
+        let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.count_from(self.root.clone());
         assert_eq!(nodes, dirs + files, "count_from() node count != dirs+files");
         assert_eq!(want_n, nodes, "count_from() node count != master count");
         assert_eq!(want_d, dirs, "count_from() dirs do not match");
         assert_eq!(want_f, files, "count_from() files do not match");
+        eprintln!(" --> count_from()  = {:?}", start.elapsed());
 
+        let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.iter_count();
         assert_eq!(nodes, dirs + files, "iter_count() node count != dirs+files");
         assert_eq!(want_n, nodes, "iter_count() node count != master count");
         assert_eq!(want_d, dirs, "iter_count() dirs do not match");
         assert_eq!(want_f, files, "iter_count() files do not match");
+        eprintln!(" --> iter_count()  = {:?}", start.elapsed());
+
+        let start: Instant = Instant::now();
+        let dirs = self.dirs().len() as u32;
+        eprintln!(" --> walk: dirs()  = {:?}", start.elapsed());
+        let start: Instant = Instant::now();
+        let files = self.files().len() as u32;
+        eprintln!(" --> walk: files() = {:#?}", start.elapsed());
+        assert_eq!(want_d, dirs, "walk() dirs do not match");
+        assert_eq!(want_f, files, "walk() files do not match");
     }
 }
 
