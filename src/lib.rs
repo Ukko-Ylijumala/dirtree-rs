@@ -554,7 +554,7 @@ impl DirTree {
         };
 
         if recursive {
-            match state.parallel {
+            match state.parallel && !state.sync {
                 true => tree.populate_par(&tree.from, true, state),
                 false => tree.populate(&tree.from, true, state),
             }
@@ -617,7 +617,7 @@ impl DirTree {
                 state.num_d.inc1();
                 state.d_bar.inc(1);
                 if recursive {
-                    match state.parallel {
+                    match state.parallel && !state.sync {
                         true => self.populate_par(&path, recursive, state),
                         false => self.populate(&path, recursive, state),
                     }
