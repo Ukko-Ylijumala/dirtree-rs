@@ -12,6 +12,7 @@ use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
+    //    thread,
 };
 
 const PATH_SEP: char = '/';
@@ -147,7 +148,7 @@ impl AsRef<Data> for dyn DirectoryEntry {
 /// use statter::tree::{Directory, Entry, File};
 /// use std::path::PathBuf;
 /// use std::sync::Arc;
-/// 
+///
 /// let root: Arc<PathBuf> = PathBuf::from("/etc").into();
 /// let d = Entry::<Directory>::new(root.clone(), "systemd".to_string(), None).unwrap();
 /// let f = Entry::<File>::new(root.clone(), "passwd".to_string(), None).unwrap();
@@ -225,6 +226,7 @@ impl NodeType {
     ///
     /// [`Directory`]: NodeType::Directory
     #[must_use]
+    #[inline]
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Directory)
     }
@@ -233,6 +235,7 @@ impl NodeType {
     ///
     /// [`File`]: NodeType::File
     #[must_use]
+    #[inline]
     pub fn is_file(&self) -> bool {
         matches!(self, Self::File)
     }
@@ -241,6 +244,7 @@ impl NodeType {
     ///
     /// [`Uninitialized`]: NodeType::Uninitialized
     #[must_use]
+    #[inline]
     pub fn is_uninit(&self) -> bool {
         matches!(self, Self::Uninitialized)
     }
@@ -262,6 +266,7 @@ impl NodeItem {
     ///
     /// [`Directory`]: NodeItem::Dir
     #[must_use]
+    #[inline]
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Dir(_))
     }
@@ -270,6 +275,7 @@ impl NodeItem {
     ///
     /// [`File`]: NodeItem::File
     #[must_use]
+    #[inline]
     pub fn is_file(&self) -> bool {
         matches!(self, Self::File(_))
     }
@@ -278,6 +284,7 @@ impl NodeItem {
     ///
     /// [`None`]: NodeItem::None
     #[must_use]
+    #[inline]
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
@@ -669,6 +676,11 @@ impl DirTree {
                     new.node_t = NodeType::Directory;
                     // Node.children = None in Node::new() for NodeItem::None
                     new.children = Some(RwLock::new(HashMap::new()));
+                    // we must increment the node counters here since we've
+                    // not reached the leaf node yet and we shouldn't do a
+                    // full initialization for an intermediate node
+                    self.counts.nodes.fetch_add(1, Relaxed);
+                    self.counts.dirs.fetch_add(1, Relaxed);
                 } else {
                     new.node_t = node_t.clone();
                     if node_t == NodeType::Directory {
@@ -678,7 +690,7 @@ impl DirTree {
                 if self.debug {
                     eprintln!("  + new: {part} ::: {:?}", &new);
                 }
-                current.add_child(part.clone(), new.arc());
+                current.add_child(part.clone(), new.into());
             }
             current = current.get_child(&part).unwrap();
         }
@@ -723,16 +735,12 @@ impl DirTree {
         match self.get_node(path) {
             Some(node) => match node.parent.upgrade() {
                 Some(parent) => {
+                    let (nodes, dirs, files) = self.count_from(node.clone());
                     eprintln!("*** Removing ***\n{:?}", node);
-                    eprintln!("\n*** Parent before ***\n{:?}", (*parent));
                     parent.remove_child(PathBuf::from(path).file_name().unwrap().to_str().unwrap());
-                    eprintln!("\n*** Parent after ***\n{:?}", (*parent));
-                    self.counts.nodes.fetch_sub(1, Relaxed);
-                    if node.item.read().is_dir() {
-                        self.counts.dirs.fetch_sub(1, Relaxed);
-                    } else if node.item.read().is_file() {
-                        self.counts.files.fetch_sub(1, Relaxed);
-                    }
+                    self.counts.nodes.fetch_sub(nodes, Relaxed);
+                    self.counts.dirs.fetch_sub(dirs, Relaxed);
+                    self.counts.files.fetch_sub(files, Relaxed);
                 }
                 None => {
                     if self.debug {
@@ -782,16 +790,18 @@ impl DirTree {
     }
 
     /// Walk the tree recursively from a Node and return a Vec of child Nodes.
-    fn walk(&self, node: Arc<Node>) -> Vec<Arc<Node>> {
+    /// The `dirs` and `files` flags control whether to include directory/file Nodes.
+    fn walk(&self, node: Arc<Node>, dirs: bool, files: bool) -> Vec<Arc<Node>> {
         let mut nodes: Vec<Arc<Node>> = Vec::new();
         if node.is_traversable() {
-            for (name, child) in node.children.as_ref().unwrap().read().iter() {
-                if self.debug {
-                    eprintln!("*** Walking Node: {name}");
+            for (_, child) in node.children.as_ref().unwrap().read().iter() {
+                if dirs && child.node_t.is_dir() {
+                    nodes.push(child.clone());
+                } else if files && child.node_t.is_file() {
+                    nodes.push(child.clone());
                 }
-                nodes.push(child.clone());
                 if child.is_traversable() {
-                    nodes.extend(self.walk(child.clone()));
+                    nodes.extend(self.walk(child.clone(), dirs, files));
                 }
             }
         }
@@ -801,34 +811,39 @@ impl DirTree {
     /// Iterates the full tree and returns a Vec of all Nodes. WARNING: this can be
     /// slow and memory intensive for large trees. Prefer using `DirTree::iter()`.
     pub fn nodes(&self) -> Vec<Arc<Node>> {
-        self.walk(self.root.clone())
+        self.walk(self.root.clone(), true, true)
     }
 
     /// Returns a Vec of all `Directory` nodes in the tree.
     pub fn dirs(&self) -> Vec<Arc<Node>> {
-        self.nodes()
+        self.walk(self.root.clone(), true, false)
             .iter()
-            .filter_map(|n| match n.node_t {
-                NodeType::Directory => Some(n.clone()),
-                _ => None,
+            .filter_map(|n| match n.node_t.is_dir() {
+                true => Some(n.clone()),
+                false => None,
             })
             .collect()
     }
 
     /// Returns a Vec of all `File` nodes in the tree.
     pub fn files(&self) -> Vec<Arc<Node>> {
-        self.nodes()
+        self.walk(self.root.clone(), false, true)
             .iter()
-            .filter_map(|n| match n.node_t {
-                NodeType::File => Some(n.clone()),
-                _ => None,
+            .filter_map(|n| match n.node_t.is_file() {
+                true => Some(n.clone()),
+                false => None,
             })
             .collect()
     }
 
+    /// Creates an iterator to walk through the tree starting from a Node.
+    fn iter_from(&self, node: Arc<Node>) -> DirTreeIterator {
+        DirTreeIterator(VecDeque::from(vec![node.clone()]))
+    }
+
     /// Creates an iterator to walk through all Nodes in the tree.
     pub fn iter(&self) -> DirTreeIterator {
-        DirTreeIterator(VecDeque::from(vec![self.root.clone()]))
+        self.iter_from(self.root.clone())
     }
 
     /// An iterator over all `Directory` items in the tree.
@@ -847,8 +862,25 @@ impl DirTree {
             .filter_map(|node: Arc<Node>| node.item.read().path_str().map(|s| s.to_owned()))
     }
 
+    /// Count the number of directory and file Nodes by iterating the tree.
+    pub fn iter_count(&self) -> (u32, u32, u32) {
+        let mut nodes: u32 = 0;
+        let mut dirs: u32 = 0;
+        let mut files: u32 = 0;
+        self.iter().for_each(|node: Arc<Node>| {
+            nodes += 1;
+            if node.node_t.is_dir() {
+                dirs += 1;
+            } else if node.node_t.is_file() {
+                files += 1;
+            }
+        });
+        nodes -= 1; // remove root node since we started from it
+        (nodes, dirs, files)
+    }
+
     /// Traverses recursively from a Node and applies function `f` to each child Node.
-    fn traverse_node<F>(&self, node: Arc<Node>, f: &mut F)
+    pub fn traverse_from<F>(&self, node: Arc<Node>, f: &mut F)
     where
         F: FnMut(Arc<Node>),
     {
@@ -857,7 +889,7 @@ impl DirTree {
             for child in node.children.as_ref().unwrap().read().values() {
                 if child.is_traversable() {
                     // traverse directories first (depth-first search)
-                    self.traverse_node(child.clone(), f);
+                    self.traverse_from(child.clone(), f);
                 } else {
                     f(child.clone());
                 }
@@ -870,7 +902,35 @@ impl DirTree {
     where
         F: FnMut(Arc<Node>),
     {
-        self.traverse_node(self.root.clone(), &mut f);
+        self.traverse_from(self.root.clone(), &mut f);
+    }
+
+    /// Count the number of directory and file Nodes with traverse().
+    pub fn count_from(&self, node: Arc<Node>) -> (u32, u32, u32) {
+        if node.node_t.is_file() {
+            return (1, 0, 1);
+        }
+
+        let mut nodes: u32 = 0;
+        let mut files: u32 = 0;
+        let mut dirs: u32 = match node.node_t {
+            NodeType::Root => 0, // root node shan't be counted
+            _ => 1,
+        };
+
+        self.traverse_from(node.clone(), &mut |n: Arc<Node>| {
+            nodes += 1;
+            if n.node_t.is_dir() {
+                dirs += 1;
+            } else if n.node_t.is_file() {
+                files += 1;
+            }
+        });
+
+        if node.node_t == NodeType::Root {
+            nodes -= 1; // remove root node if we started from it
+        };
+        (nodes, dirs, files)
     }
 
     /// Print the full contents of the tree recursively. This is a debugging function.
@@ -884,6 +944,25 @@ impl DirTree {
                 }
             }
         });
+    }
+
+    pub fn validate_counts(&self) {
+        let want_n: u32 = self.counts.nodes.load(Relaxed);
+        let want_d: u32 = self.counts.dirs.load(Relaxed);
+        let want_f: u32 = self.counts.files.load(Relaxed);
+        assert_eq!(want_n, want_d + want_f, "master node count != dirs+files");
+
+        let (nodes, dirs, files) = self.count_from(self.root.clone());
+        assert_eq!(nodes, dirs + files, "count_from() node count != dirs+files");
+        assert_eq!(want_n, nodes, "count_from() node count != master count");
+        assert_eq!(want_d, dirs, "count_from() dirs do not match");
+        assert_eq!(want_f, files, "count_from() files do not match");
+
+        let (nodes, dirs, files) = self.iter_count();
+        assert_eq!(nodes, dirs + files, "iter_count() node count != dirs+files");
+        assert_eq!(want_n, nodes, "iter_count() node count != master count");
+        assert_eq!(want_d, dirs, "iter_count() dirs do not match");
+        assert_eq!(want_f, files, "iter_count() files do not match");
     }
 }
 
