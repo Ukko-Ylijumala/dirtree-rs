@@ -19,30 +19,29 @@ const META_FAIL: &str = "Failed to get metadata";
 
 #[derive(Debug, Clone, Eq)]
 struct Data {
-    root: Arc<PathBuf>,
     relpath: String,
     inode: u64,
     when: Instant,
 }
 
 impl Data {
-    /// Full path of the file or directory, as `root.join(relpath)`
-    fn path(&self) -> PathBuf {
-        (*self.root).clone().join(&self.relpath)
+    /// Full path of the file or directory, as `root.join(&self.relpath)`
+    fn path(&self, root: Arc<PathBuf>) -> PathBuf {
+        root.join(&self.relpath)
     }
 }
 
-// Path and inode are enough to uniquely identify a file or directory.
+// Relative path and inode are enough to uniquely identify a file or directory.
 impl Hash for Data {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.path().hash(state);
+        self.relpath.hash(state);
         self.inode.hash(state);
     }
 }
 
 impl PartialEq for Data {
     fn eq(&self, other: &Self) -> bool {
-        self.path() == other.path() && self.inode == other.inode
+        self.relpath == other.relpath && self.inode == other.inode
     }
 }
 
@@ -63,7 +62,6 @@ impl PartialOrd for Data {
 impl Default for Data {
     fn default() -> Self {
         Self {
-            root: PathBuf::new().into(),
             relpath: String::new(),
             inode: 0,
             when: Instant::now(),
@@ -81,15 +79,15 @@ trait DirectoryEntry {
     fn data(&self) -> &Data;
     fn data_mut(&mut self) -> &mut Data;
 
-    fn stat(&self) -> Option<Metadata> {
-        match metadata(self.data().path().as_path()) {
+    fn stat(&self, root: &Arc<PathBuf>) -> Option<Metadata> {
+        match metadata(root.join(&self.data().relpath)) {
             Ok(meta) => return Some(meta),
             Err(_) => return None,
         };
     }
 
-    fn rescan(&mut self) -> Result<Metadata, Error> {
-        let meta: Metadata = match self.stat() {
+    fn rescan(&mut self, root: Arc<PathBuf>) -> Result<Metadata, Error> {
+        let meta: Metadata = match self.stat(&root) {
             Some(m) => m,
             // failed to get metadata, likely deleted in the meantime
             None => return Err(Error::new(ErrorKind::NotFound, META_FAIL)),
@@ -104,12 +102,14 @@ trait DirectoryEntry {
     }
 
     fn parent(&self) -> PathBuf {
-        self.data().path().parent().unwrap().to_path_buf()
+        PathBuf::from(&self.data().relpath)
+            .parent()
+            .unwrap()
+            .to_path_buf()
     }
 
     fn name(&self) -> String {
-        self.data()
-            .path()
+        PathBuf::from(&self.data().relpath)
             .file_name()
             .unwrap()
             .to_string_lossy()
@@ -153,7 +153,6 @@ impl<T: Default> Entry<T> {
         match meta {
             Some(m) => Ok(Self(
                 Data {
-                    root,
                     relpath,
                     inode: m.ino(),
                     when: Instant::now(),
@@ -237,6 +236,12 @@ impl NodeType {
     pub fn is_uninit(&self) -> bool {
         matches!(self, Self::Uninitialized)
     }
+
+    /// Returns `true` if the node contains a `Data` struct.
+    #[inline]
+    pub fn has_data(&self) -> bool {
+        matches!(self, Self::Directory | Self::File)
+    }
 }
 
 /* ######################################################################### */
@@ -305,11 +310,11 @@ impl NodeItem {
         })
     }
 
-    /// Returns the item's path as Option<String> if the node item is [`Dir`] or [`File`].
+    /// Returns the item's RELATIVE path as Option<String> if the node item is [`Dir`] or [`File`].
     fn path_str(&self) -> Option<String> {
         Some(match self {
-            Self::Dir(d) => d.data().path().to_str().map(|s| s.to_owned())?,
-            Self::File(f) => f.data().path().to_str().map(|s| s.to_owned())?,
+            Self::Dir(d) => d.data().relpath.clone(),
+            Self::File(f) => f.data().relpath.clone(),
             _ => return None,
         })
     }
@@ -337,7 +342,6 @@ pub struct Node {
     node_t: NodeType,
     item: RwLock<NodeItem>,
     parent: Weak<Node>,
-    depth: AtomicU8,
     children: Option<RwLock<HashMap<String, Arc<Node>>>>,
 }
 
@@ -351,10 +355,6 @@ impl Node {
             NodeItem::File(_) => NodeType::File,
             NodeItem::None => NodeType::Uninitialized,
         };
-        let depth: AtomicU8 = match parent {
-            Some(ref p) => (p.depth.load(Relaxed) + 1).into(),
-            None => AtomicU8::new(0),
-        };
         Self {
             children: match node_t {
                 NodeType::Root | NodeType::Directory => Some(RwLock::new(HashMap::new())),
@@ -364,7 +364,6 @@ impl Node {
             node_t,
             item: RwLock::new(item),
             parent: parent.map_or_else(|| Weak::new(), |p| make_weak_ref(p)),
-            depth,
         }
     }
 
@@ -373,6 +372,7 @@ impl Node {
         matches!(self.node_t, NodeType::Directory | NodeType::Root)
     }
 
+    /// The Node as an `Entry<Directory>`, if it contains a directory.
     fn as_dir(&self) -> Option<Entry<Directory>> {
         match self.item.read().as_dir() {
             Some(d) => Some(d.clone()),
@@ -380,6 +380,7 @@ impl Node {
         }
     }
 
+    /// The Node as an `Entry<File>`, if it contains a file.
     fn as_file(&self) -> Option<Entry<File>> {
         match self.item.read().as_file() {
             Some(d) => Some(d.clone()),
@@ -433,7 +434,6 @@ impl Clone for Node {
             node_t: self.node_t.clone(),
             item: RwLock::new(self.item.read().clone()),
             parent: self.parent.clone(),
-            depth: AtomicU8::new(self.depth.load(Relaxed)),
             children: match self.children {
                 Some(ref children) => Some(RwLock::new(children.read().clone())),
                 None => None,
@@ -522,13 +522,15 @@ impl DirTree {
         &self.from
     }
 
+    /// Set the root (filesystem) path of the tree.
     fn set_from(&mut self, from: PathBuf) {
         self.from = from.into();
         self.insert(&self.from, NodeType::Directory, None);
     }
 
-    pub fn counts(&self) -> &Counts {
-        &self.counts
+    /// Returns a reference to the tree's `counts` struct.
+    pub fn counts(&self) -> Arc<Counts> {
+        self.counts.clone()
     }
 
     /// Creates a new empty directory tree (internally a Trie structure).
@@ -778,6 +780,14 @@ impl DirTree {
         Some(item)
     }
 
+    /// The filesystem path of a Node, if it contains a file or directory.
+    pub fn fs_path(&self, node: Arc<Node>) -> Option<PathBuf> {
+        match node.node_t.has_data() {
+            true => Some(node.item.read().data().unwrap().path(self.from.clone())),
+            false => None,
+        }
+    }
+
     /// Walk the tree recursively from a Node and return a Vec of child Nodes.
     /// The `dirs` and `files` flags control whether to include directory/file Nodes.
     fn walk(&self, node: Arc<Node>, dirs: bool, files: bool) -> Arc<RwLock<Vec<Arc<Node>>>> {
@@ -923,9 +933,9 @@ impl DirTree {
     pub fn print(&self) {
         eprintln!("\n{:?}\n", self);
         self.traverse(|node: Arc<Node>| {
-            if matches!(node.node_t, NodeType::Directory | NodeType::File) {
+            if node.node_t.has_data() {
                 match node.item.read().data() {
-                    Some(data) => println!("{}", data.path().display()),
+                    Some(data) => println!("{}", &data.relpath),
                     None => {}
                 }
             }
