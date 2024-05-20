@@ -12,7 +12,6 @@ use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
-    //    thread,
 };
 
 const PATH_SEP: char = '/';
@@ -23,8 +22,6 @@ struct Data {
     root: Arc<PathBuf>,
     relpath: String,
     inode: u64,
-    mode: u32,
-    scanned: u64,
     when: Instant,
 }
 
@@ -69,8 +66,6 @@ impl Default for Data {
             root: PathBuf::new().into(),
             relpath: String::new(),
             inode: 0,
-            mode: 0,
-            scanned: 0,
             when: Instant::now(),
         }
     }
@@ -104,10 +99,6 @@ trait DirectoryEntry {
             // this case must be handled by the caller
             return Err(Error::new(ErrorKind::AlreadyExists, "Inode changed"));
         }
-        if self.data().mode != meta.mode() {
-            self.data_mut().mode = meta.mode();
-        }
-        self.data_mut().scanned += 1;
         self.data_mut().when = Instant::now();
         Ok(meta)
     }
@@ -165,8 +156,6 @@ impl<T: Default> Entry<T> {
                     root,
                     relpath,
                     inode: m.ino(),
-                    mode: m.mode(),
-                    scanned: 1,
                     when: Instant::now(),
                 },
                 Default::default(), // provides the type parameter T
@@ -838,7 +827,7 @@ impl DirTree {
 
     /// Creates an iterator to walk through the tree starting from a Node.
     fn iter_from(&self, node: Arc<Node>) -> DirTreeIterator {
-        DirTreeIterator(VecDeque::from(vec![node.clone()]))
+        DirTreeIterator(VecDeque::from(vec![node]))
     }
 
     /// Creates an iterator to walk through all Nodes in the tree.
