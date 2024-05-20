@@ -144,8 +144,13 @@ impl AsRef<Data> for dyn DirectoryEntry {
 ///
 /// You can use the struct like this:
 /// ```rust
-/// let d = Entry::<Directory>::new(PathBuf::from("/dir/path"), None).unwrap();
-/// let f = Entry::<File>::new(PathBuf::from("/file/path"), None).unwrap();
+/// use statter::tree::{Directory, Entry, File};
+/// use std::path::PathBuf;
+/// use std::sync::Arc;
+/// 
+/// let root: Arc<PathBuf> = PathBuf::from("/etc").into();
+/// let d = Entry::<Directory>::new(root.clone(), "systemd".to_string(), None).unwrap();
+/// let f = Entry::<File>::new(root.clone(), "passwd".to_string(), None).unwrap();
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Entry<T>(Data, T);
 
