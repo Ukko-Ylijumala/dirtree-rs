@@ -550,6 +550,11 @@ impl DirTree {
     pub fn new_from_path(path: &str, recursive: bool, state: &ScanState) -> Self {
         let mut tree: DirTree = Self::new(state.debug);
         tree.set_from(PathBuf::from(path));
+        // Technically we've not yet scanned the root directory, but this place
+        // is the most logical one to do the increment to keep the counter in
+        // sync as adding more logic to `populate*()` methods would be counter-
+        // productive. Besides, this counter is only for display for now.
+        state.num_d.inc1();
 
         if state.debug {
             eprintln!("<TREE> : {:?}", tree)
