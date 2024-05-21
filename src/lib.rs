@@ -617,7 +617,6 @@ impl DirTree {
             if meta.is_dir() {
                 self.insert(&path, NodeType::Directory, Some(meta));
                 state.num_d.inc1();
-                state.d_bar.inc(1);
                 if recursive {
                     match state.parallel && !state.sync {
                         true => self.populate_par(&path, recursive, state),
@@ -630,7 +629,6 @@ impl DirTree {
                 }
                 self.insert(&path, NodeType::File, Some(meta));
                 state.num_f.inc1();
-                state.f_bar.inc(1);
             }
         } else {
             if self.debug {
