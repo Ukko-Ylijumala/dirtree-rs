@@ -5,7 +5,7 @@
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
     DirEntry, HashMap, Instant, Metadata, MetadataExt, PathBuf, ReadDir, Relaxed, RwLock,
-    ScanState, VecDeque, Weak,
+    ScanState, SecondsSinceEpoch, VecDeque, Weak,
 };
 use rayon::prelude::*;
 use std::{
@@ -17,11 +17,12 @@ use std::{
 const PATH_SEP: char = '/';
 const META_FAIL: &str = "Failed to get metadata";
 
-#[derive(Debug, Clone, Eq)]
+#[derive(Default, Debug, Clone, Eq)]
 struct Data {
     relpath: String,
     inode: u64,
-    when: Instant,
+    /// last scan time (seconds since UNIX epoch)
+    when: SecondsSinceEpoch,
 }
 
 impl Data {
@@ -57,18 +58,6 @@ impl PartialOrd for Data {
     }
 }
 
-/// `std::time::Instant` does not implement Default, so we cannot use
-/// #[derive(Default)] for Data and must implement it ourselves.
-impl Default for Data {
-    fn default() -> Self {
-        Self {
-            relpath: String::new(),
-            inode: 0,
-            when: Instant::now(),
-        }
-    }
-}
-
 /* ######################################################################### */
 
 /// A common trait for Directory and File entries.
@@ -97,7 +86,7 @@ trait DirectoryEntry {
             // this case must be handled by the caller
             return Err(Error::new(ErrorKind::AlreadyExists, "Inode changed"));
         }
-        self.data_mut().when = Instant::now();
+        self.data_mut().when = SecondsSinceEpoch::new();
         Ok(meta)
     }
 
@@ -148,14 +137,12 @@ pub struct Entry<T>(Data, T);
 
 impl<T: Default> Entry<T> {
     pub fn new(root: Arc<PathBuf>, relpath: String, meta: Option<Metadata>) -> Result<Self, Error> {
-        let path: PathBuf = root.join(&relpath);
-        let meta: Option<Metadata> = meta.or_else(|| metadata(&path).ok());
-        match meta {
+        match meta.or_else(|| metadata(&root.join(&relpath)).ok()) {
             Some(m) => Ok(Self(
                 Data {
                     relpath,
                     inode: m.ino(),
-                    when: Instant::now(),
+                    when: SecondsSinceEpoch::new(),
                 },
                 Default::default(), // provides the type parameter T
             )),
@@ -511,6 +498,7 @@ pub struct Counts {
 pub struct DirTree {
     from: Arc<PathBuf>,
     counts: Arc<Counts>,
+    created: SecondsSinceEpoch,
     root: Arc<Node>,
     debug: bool,
 }
@@ -531,6 +519,11 @@ impl DirTree {
     /// Returns a reference to the tree's `counts` struct.
     pub fn counts(&self) -> Arc<Counts> {
         self.counts.clone()
+    }
+
+    /// Returns a reference to the tree's creation time.
+    pub fn created(&self) -> &SecondsSinceEpoch {
+        &self.created
     }
 
     /// Creates a new empty directory tree (internally a Trie structure).
@@ -934,7 +927,7 @@ impl DirTree {
 
     /// Print the full contents of the tree recursively. This is a debugging function.
     pub fn print(&self) {
-        eprintln!("\n{:?}\n", self);
+        eprintln!("\n{:#?}\n", self);
         self.traverse(|node: Arc<Node>| {
             if node.node_t.has_data() {
                 match node.item.read().data() {
