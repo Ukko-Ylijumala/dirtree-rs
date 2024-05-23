@@ -4,8 +4,8 @@
 
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
-    DirEntry, HashMap, Instant, Metadata, MetadataExt, PathBuf, ReadDir, Relaxed, RwLock,
-    ScanState, SecondsSinceEpoch, VecDeque, Weak,
+    DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, Instant, Metadata, MetadataExt, PathBuf,
+    ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak,
 };
 use rayon::prelude::*;
 use std::{
@@ -109,12 +109,15 @@ impl AsRef<Data> for dyn DirectoryEntry {
 /// You can use the struct like this:
 /// ```rust
 /// use statter::tree::{Directory, Entry, File};
+/// use std::fs::{metadata, Metadata};
 /// use std::path::PathBuf;
-/// use std::sync::Arc;
 ///
-/// let root: Arc<PathBuf> = PathBuf::from("/etc").into();
-/// let d = Entry::<Directory>::new(root.clone(), "systemd".to_string(), None).unwrap();
-/// let f = Entry::<File>::new(root.clone(), "passwd".to_string(), None).unwrap();
+/// let root: PathBuf = PathBuf::from("/etc");
+/// let pwfile: PathBuf = root.join("passwd");
+/// let pwmeta: Metadata = metadata(&pwfile).ok().expect("Metadata should be returned");
+///
+/// let d = Entry::<Directory>::new(&root.join("systemd"), None).unwrap();
+/// let f = Entry::<File>::new(&pwfile, Some(pwmeta)).unwrap();
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Entry<T>(Data, T);
 
@@ -302,7 +305,7 @@ pub struct Node {
     node_t: NodeType,
     item: RwLock<NodeItem>,
     parent: Weak<Node>,
-    children: Option<RwLock<HashMap<String, Arc<Node>>>>,
+    children: Option<RwLock<DirTreeHashMap<String, Arc<Node>>>>,
 }
 
 impl Node {
@@ -317,7 +320,9 @@ impl Node {
         };
         Self {
             children: match node_t {
-                NodeType::Root | NodeType::Directory => Some(RwLock::new(HashMap::new())),
+                NodeType::Root | NodeType::Directory => {
+                    Some(RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)))
+                }
                 NodeType::Uninitialized => None,
                 NodeType::File => None,
             },
@@ -494,7 +499,7 @@ impl DerefMut for Node {
     }
 }
 
-// For a File or Directory, the hash is based on the path and inode.
+// For a File or Directory, the hash is based on the inode.
 impl Hash for Node {
     fn hash<H: Hasher>(&self, state: &mut H) {
         if matches!(self.node_t, NodeType::Directory | NodeType::File) {
@@ -502,6 +507,7 @@ impl Hash for Node {
         } else {
             self.read().hash(state);
         }
+        self.node_t.hash(state);
     }
 }
 
@@ -711,7 +717,7 @@ impl DirTree {
                     // must be a container (directory)
                     new.node_t = NodeType::Directory;
                     // Node.children = None in Node::new() for NodeItem::None
-                    new.children = Some(RwLock::new(HashMap::new()));
+                    new.children = Some(RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)));
                     // we must increment the node counters here since we've
                     // not reached the leaf node yet and we shouldn't do a
                     // full initialization for an intermediate node
@@ -720,7 +726,7 @@ impl DirTree {
                 } else {
                     new.node_t = node_t.clone();
                     if node_t == NodeType::Directory {
-                        new.children = Some(RwLock::new(HashMap::new()));
+                        new.children = Some(RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)));
                     }
                 }
                 if self.debug {
@@ -739,14 +745,11 @@ impl DirTree {
 
         match node_t {
             NodeType::Directory => {
-                *current.item.write() = NodeItem::Dir(
-                    Entry::<Directory>::new(path, meta).unwrap(),
-                );
+                *current.item.write() = NodeItem::Dir(Entry::<Directory>::new(path, meta).unwrap());
                 self.counts.dirs.fetch_add(1, Relaxed);
             }
             NodeType::File => {
-                *current.item.write() =
-                    NodeItem::File(Entry::<File>::new(path, meta).unwrap());
+                *current.item.write() = NodeItem::File(Entry::<File>::new(path, meta).unwrap());
                 self.counts.files.fetch_add(1, Relaxed);
             }
             _ => return,
@@ -894,8 +897,9 @@ impl DirTree {
 
     /// An iterator over all Paths in the tree.
     pub fn iter_paths(&self) -> impl Iterator<Item = String> + '_ {
-            self.iter()
-            .filter_map(|node: Arc<Node>| self.fs_path(node)).map(|p| p.to_string_lossy().to_string())
+        self.iter()
+            .filter_map(|node: Arc<Node>| self.fs_path(node))
+            .map(|p| p.to_string_lossy().to_string())
     }
 
     /// Count the number of directory and file Nodes by iterating the tree.
