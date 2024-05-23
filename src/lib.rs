@@ -303,6 +303,7 @@ impl From<Entry<File>> for NodeItem {
 #[derive(Default, Debug)]
 pub struct Node {
     node_t: NodeType,
+    // TODO: either make this an enum with variants for each NodeType, or Option<..>
     item: RwLock<NodeItem>,
     parent: Weak<Node>,
     children: Option<RwLock<DirTreeHashMap<String, Arc<Node>>>>,
@@ -555,6 +556,7 @@ pub struct DirTree {
     counts: Arc<Counts>,
     created: SecondsSinceEpoch,
     root: Arc<Node>,
+    dirs: bool,
     debug: bool,
 }
 
@@ -582,10 +584,11 @@ impl DirTree {
     }
 
     /// Creates a new empty directory tree (internally a Trie structure).
-    pub fn new(debug: bool) -> Self {
+    pub fn new(debug: bool, dirs: bool) -> Self {
         DirTree {
             root: Node::new(NodeItem::Root, None).into(),
             debug,
+            dirs,
             ..Default::default()
         }
     }
@@ -595,8 +598,8 @@ impl DirTree {
     /// If `recursive` is true, also populates the tree by recursively walking
     /// the full directory structure (starting from from the given directory)
     /// and inserting each found path into the tree.
-    pub fn new_from_path(path: &str, recursive: bool, state: &ScanState) -> Self {
-        let mut tree: DirTree = Self::new(state.debug);
+    pub fn new_from_path(path: &str, recursive: bool, state: &ScanState, dirs: bool) -> Self {
+        let mut tree: DirTree = Self::new(state.debug, dirs);
         tree.set_from(PathBuf::from(path));
         // Technically we've not yet scanned the root directory, but this place
         // is the most logical one to do the increment to keep the counter in
@@ -749,7 +752,11 @@ impl DirTree {
                 self.counts.dirs.fetch_add(1, Relaxed);
             }
             NodeType::File => {
-                *current.item.write() = NodeItem::File(Entry::<File>::new(path, meta).unwrap());
+                if !self.dirs {
+                    // optimization: don't create file Entry to conserve memory
+                    // the node itself exists though, just not fully initialized
+                    *current.item.write() = NodeItem::File(Entry::<File>::new(path, meta).unwrap());
+                }
                 self.counts.files.fetch_add(1, Relaxed);
             }
             _ => return,
