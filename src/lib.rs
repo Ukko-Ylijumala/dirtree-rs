@@ -380,10 +380,68 @@ impl Node {
         make_weak_ref(self)
     }
 
-    /// Wrap the node in an Arc for sharing between threads.
+    /// Resolve the weak reference to this node's parent node.
     #[inline]
-    fn arc(self) -> Arc<Node> {
-        self.into()
+    fn parent(&self) -> Option<Arc<Node>> {
+        match self.parent.upgrade() {
+            None => return None,
+            Some(parent) => {
+                return Some(parent.clone());
+            }
+        }
+    }
+
+    /// Construct this node's full path by walking the tree upwards to Root.
+    fn construct_path(&self) -> Vec<String> {
+        let mut path: Vec<String> = Vec::new();
+        let (_, mut current) = self
+            .parent()
+            .expect("Node should have a parent")
+            .get_child_byref(self)
+            .expect("Node's parent should return a name and an Arc reference");
+
+        loop {
+            match current.parent() {
+                Some(parent) => {
+                    path.insert(
+                        0,
+                        parent
+                            .get_child_byref(&*current)
+                            .expect("Node should have a name")
+                            .0,
+                    );
+                    current = parent;
+                }
+                None => break,
+            }
+        }
+        path
+    }
+
+    /// Filesystem path of this node as a `PathBuf`.
+    pub fn path(&self) -> PathBuf {
+        let mut path: PathBuf = PathBuf::from("/");
+        for part in self.construct_path() {
+            path.push(part);
+        }
+        path
+    }
+
+    /// Get this node's name from parent node's `children` HashMap.
+    /// Root node always returns "/".
+    pub fn name(&self) -> Result<String, Error> {
+        match self.parent() {
+            Some(parent) => Ok(parent
+                .get_child_byref(self)
+                .expect("Parent's children HashMap should contain the child node's name")
+                .0),
+            None => {
+                if self.node_t == NodeType::Root {
+                    return Ok("/".to_string());
+                }
+                Err(Error::new(ErrorKind::NotFound, "Stale parent reference"))
+            }
+        }
     }
 
     /// Whether we have a child with the given name.
@@ -411,6 +469,24 @@ impl Node {
     /// Remove a child node by name.
     fn remove_child(&self, name: &str) {
         self.children.as_ref().unwrap().write().remove(name);
+    }
+
+    /// Get the name of a child node and its `Arc<Node>` ptr from a reference
+    /// to the child node itself. The main use case is for a child node to find
+    /// its own name and reference in the parent node's `children` HashMap.
+    #[inline]
+    fn get_child_byref(&self, child: &Node) -> Option<(String, Arc<Node>)> {
+        match self
+            .children
+            .as_ref()
+            .unwrap()
+            .read()
+            .par_iter()
+            .find_any(|item: &(&String, &Arc<Node>)| **item.1 == *child)
+        {
+            Some((name, child)) => Some((name.clone(), child.clone())),
+            None => None,
+        }
     }
 }
 
@@ -720,7 +796,7 @@ impl DirTree {
     /// WARNING: implementation is WIP and may yet contain bugs.
     pub fn remove(&self, path: &str) {
         match self.get_node(path) {
-            Some(node) => match node.parent.upgrade() {
+            Some(node) => match node.parent() {
                 Some(parent) => {
                     let (nodes, dirs, files) = self.count_from(node.clone());
                     eprintln!("*** Removing ***\n{:?}", node);
@@ -779,7 +855,7 @@ impl DirTree {
     /// The filesystem path of a Node, if it contains a file or directory.
     pub fn fs_path(&self, node: Arc<Node>) -> Option<PathBuf> {
         match node.node_t.has_data() {
-            true => Some(node.item.read().data().unwrap().path(self.from.clone())),
+            true => Some(node.path()),
             false => None,
         }
     }
@@ -849,9 +925,9 @@ impl DirTree {
     }
 
     /// An iterator over all Paths in the tree.
-    pub fn iter_paths(&self) -> impl Iterator<Item = String> {
-        self.iter()
-            .filter_map(|node: Arc<Node>| node.item.read().path_str().map(|s| s.to_owned()))
+    pub fn iter_paths(&self) -> impl Iterator<Item = String> + '_ {
+            self.iter()
+            .filter_map(|node: Arc<Node>| self.fs_path(node)).map(|p| p.to_string_lossy().to_string())
     }
 
     /// Count the number of directory and file Nodes by iterating the tree.
@@ -930,9 +1006,10 @@ impl DirTree {
         eprintln!("\n{:#?}\n", self);
         self.traverse(|node: Arc<Node>| {
             if node.node_t.has_data() {
-                match node.item.read().data() {
-                    Some(data) => println!("{}", &data.relpath),
-                    None => {}
+                if self.debug {
+                    println!("{:?}", &node.construct_path());
+                } else {
+                    println!("{}", &node.path().to_string_lossy());
                 }
             }
         });
