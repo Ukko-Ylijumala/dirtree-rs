@@ -19,30 +19,28 @@ const META_FAIL: &str = "Failed to get metadata";
 
 #[derive(Default, Debug, Clone, Eq)]
 struct Data {
-    relpath: String,
     inode: u64,
     /// last scan time (seconds since UNIX epoch)
     when: SecondsSinceEpoch,
 }
 
 impl Data {
-    /// Full path of the file or directory, as `root.join(&self.relpath)`
-    fn path(&self, root: Arc<PathBuf>) -> PathBuf {
-        root.join(&self.relpath)
+    /// The inode of the file or directory.
+    pub fn inode(&self) -> u64 {
+        self.inode
     }
 }
 
-// Relative path and inode are enough to uniquely identify a file or directory.
+// An inode should be enough to uniquely identify a file or directory.
 impl Hash for Data {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.relpath.hash(state);
         self.inode.hash(state);
     }
 }
 
 impl PartialEq for Data {
     fn eq(&self, other: &Self) -> bool {
-        self.relpath == other.relpath && self.inode == other.inode
+        self.inode == other.inode
     }
 }
 
@@ -68,15 +66,15 @@ trait DirectoryEntry {
     fn data(&self) -> &Data;
     fn data_mut(&mut self) -> &mut Data;
 
-    fn stat(&self, root: &Arc<PathBuf>) -> Option<Metadata> {
-        match metadata(root.join(&self.data().relpath)) {
+    fn stat(&self, path: &PathBuf) -> Option<Metadata> {
+        match metadata(path) {
             Ok(meta) => return Some(meta),
             Err(_) => return None,
         };
     }
 
-    fn rescan(&mut self, root: Arc<PathBuf>) -> Result<Metadata, Error> {
-        let meta: Metadata = match self.stat(&root) {
+    fn rescan(&mut self, path: &PathBuf) -> Result<Metadata, Error> {
+        let meta: Metadata = match self.stat(path) {
             Some(m) => m,
             // failed to get metadata, likely deleted in the meantime
             None => return Err(Error::new(ErrorKind::NotFound, META_FAIL)),
@@ -88,21 +86,6 @@ trait DirectoryEntry {
         }
         self.data_mut().when = SecondsSinceEpoch::new();
         Ok(meta)
-    }
-
-    fn parent(&self) -> PathBuf {
-        PathBuf::from(&self.data().relpath)
-            .parent()
-            .unwrap()
-            .to_path_buf()
-    }
-
-    fn name(&self) -> String {
-        PathBuf::from(&self.data().relpath)
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string()
     }
 }
 
@@ -136,11 +119,10 @@ impl AsRef<Data> for dyn DirectoryEntry {
 pub struct Entry<T>(Data, T);
 
 impl<T: Default> Entry<T> {
-    pub fn new(root: Arc<PathBuf>, relpath: String, meta: Option<Metadata>) -> Result<Self, Error> {
-        match meta.or_else(|| metadata(&root.join(&relpath)).ok()) {
+    pub fn new(path: &PathBuf, meta: Option<Metadata>) -> Result<Self, Error> {
+        match meta.or_else(|| metadata(path).ok()) {
             Some(m) => Ok(Self(
                 Data {
-                    relpath,
                     inode: m.ino(),
                     when: SecondsSinceEpoch::new(),
                 },
@@ -293,15 +275,6 @@ impl NodeItem {
         Some(match self {
             Self::Dir(d) => d.data(),
             Self::File(f) => f.data(),
-            _ => return None,
-        })
-    }
-
-    /// Returns the item's RELATIVE path as Option<String> if the node item is [`Dir`] or [`File`].
-    fn path_str(&self) -> Option<String> {
-        Some(match self {
-            Self::Dir(d) => d.data().relpath.clone(),
-            Self::File(f) => f.data().relpath.clone(),
             _ => return None,
         })
     }
@@ -764,21 +737,16 @@ impl DirTree {
             return;
         }
 
-        let relpath: String = path
-            .strip_prefix(self.from.as_ref())
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
         match node_t {
             NodeType::Directory => {
                 *current.item.write() = NodeItem::Dir(
-                    Entry::<Directory>::new(self.from.clone(), relpath, meta).unwrap(),
+                    Entry::<Directory>::new(path, meta).unwrap(),
                 );
                 self.counts.dirs.fetch_add(1, Relaxed);
             }
             NodeType::File => {
                 *current.item.write() =
-                    NodeItem::File(Entry::<File>::new(self.from.clone(), relpath, meta).unwrap());
+                    NodeItem::File(Entry::<File>::new(path, meta).unwrap());
                 self.counts.files.fetch_add(1, Relaxed);
             }
             _ => return,
