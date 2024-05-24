@@ -550,6 +550,19 @@ pub struct Counts {
 }
 
 /// Trie structure for storing a directory tree.
+///
+/// You can use it f.ex. like this:
+/// ```ignore
+/// use statter::args::Config;
+/// use statter::tree::DirTree;
+/// use statter::ScanState;
+///
+/// let conf: Config = Config::parse(); // parse command line args
+/// let state: ScanState = ScanState::new(&conf);
+/// state.start_updates(); // start the progress bars
+///
+/// let tree: DirTree = DirTree::new_from_path("/home", &state, true, false);
+/// tree.print_info(); // print basic tree info (nodes, dirs, files etc)
 #[derive(Default, Debug)]
 pub struct DirTree {
     from: Arc<PathBuf>,
@@ -598,7 +611,7 @@ impl DirTree {
     /// If `recursive` is true, also populates the tree by recursively walking
     /// the full directory structure (starting from from the given directory)
     /// and inserting each found path into the tree.
-    pub fn new_from_path(path: &str, recursive: bool, state: &ScanState, dirs: bool) -> Self {
+    pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, dirs: bool) -> Self {
         let mut tree: DirTree = Self::new(state.debug, dirs);
         tree.set_from(PathBuf::from(path));
         // Technically we've not yet scanned the root directory, but this place
@@ -980,8 +993,20 @@ impl DirTree {
         (nodes, dirs, files)
     }
 
+    /// Print the tree's info (nodes, dirs, files, depth, ctime) to stderr.
+    pub fn print_info(&self) {
+        eprintln!(
+            "Tree info : nodes {}, dirs {}, files {}, depth {}, ctime {} UTC",
+            self.counts().nodes.load(Relaxed),
+            self.counts().dirs.load(Relaxed),
+            self.counts().files.load(Relaxed),
+            self.counts().depth.load(Relaxed),
+            self.created(),
+        );
+    }
+
     /// Print the full contents of the tree recursively. This is a debugging function.
-    pub fn print(&self) {
+    pub fn print_debug(&self) {
         eprintln!("\n{:#?}\n", self);
         self.traverse(|node: Arc<Node>| {
             if node.node_t.has_data() {
