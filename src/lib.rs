@@ -302,7 +302,7 @@ impl From<Entry<File>> for NodeItem {
 /// Node in the trie structure for storing paths and items, respectively.
 #[derive(Default, Debug)]
 pub struct Node {
-    node_t: NodeType,
+    pub node_t: NodeType,
     // TODO: either make this an enum with variants for each NodeType, or Option<..>
     item: RwLock<NodeItem>,
     parent: Weak<Node>,
@@ -568,8 +568,8 @@ pub struct DirTree {
     from: Arc<PathBuf>,
     counts: Arc<Counts>,
     created: SecondsSinceEpoch,
-    root: Arc<Node>,
-    dirs: bool,
+    pub root: Arc<Node>,
+    dirsonly: bool,
     debug: bool,
 }
 
@@ -597,11 +597,11 @@ impl DirTree {
     }
 
     /// Creates a new empty directory tree (internally a Trie structure).
-    pub fn new(debug: bool, dirs: bool) -> Self {
+    pub fn new(debug: bool, dirsonly: bool) -> Self {
         DirTree {
             root: Node::new(NodeItem::Root, None).into(),
             debug,
-            dirs,
+            dirsonly,
             ..Default::default()
         }
     }
@@ -611,8 +611,10 @@ impl DirTree {
     /// If `recursive` is true, also populates the tree by recursively walking
     /// the full directory structure (starting from from the given directory)
     /// and inserting each found path into the tree.
-    pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, dirs: bool) -> Self {
-        let mut tree: DirTree = Self::new(state.debug, dirs);
+    ///
+    /// If `dirsonly` is true, only directory items are fully initialized during creation.
+    pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, dirsonly: bool) -> Self {
+        let mut tree: DirTree = Self::new(state.debug, dirsonly);
         tree.set_from(PathBuf::from(path));
         // Technically we've not yet scanned the root directory, but this place
         // is the most logical one to do the increment to keep the counter in
@@ -765,7 +767,7 @@ impl DirTree {
                 self.counts.dirs.fetch_add(1, Relaxed);
             }
             NodeType::File => {
-                if !self.dirs {
+                if !self.dirsonly {
                     // optimization: don't create file Entry to conserve memory
                     // the node itself exists though, just not fully initialized
                     *current.item.write() = NodeItem::File(Entry::<File>::new(path, meta).unwrap());
@@ -1019,6 +1021,20 @@ impl DirTree {
         });
     }
 
+    /// Validate the counts of nodes, dirs, and files in the tree.
+    ///
+    /// We take the counts from the tree's `Counts` struct as master data and
+    /// firstly validate that the counts of directories and files add up to the
+    /// total number of nodes. Then we compare those to the counts we get by
+    /// traversing the tree with:
+    /// - `count_from()` (`traverse_from()` -> count)
+    /// - `iter_count()` (`iter()` -> count)
+    /// - `dirs().len()` and `files().len()` (`walk()` -> count)
+    ///
+    /// We will also print the time it took to count the nodes using each method.
+    ///
+    /// This is a debugging function using asserts, hence it will panic if the
+    /// counts do not match.
     pub fn validate_counts(&self) {
         let want_n: u32 = self.counts.nodes.load(Relaxed);
         let want_d: u32 = self.counts.dirs.load(Relaxed);
@@ -1042,10 +1058,10 @@ impl DirTree {
         eprintln!(" --> iter_count()  = {:?}", start.elapsed());
 
         let start: Instant = Instant::now();
-        let dirs = self.dirs().len() as u32;
+        let dirs: u32 = self.dirs().len() as u32;
         eprintln!(" --> walk: dirs()  = {:?}", start.elapsed());
         let start: Instant = Instant::now();
-        let files = self.files().len() as u32;
+        let files: u32 = self.files().len() as u32;
         eprintln!(" --> walk: files() = {:#?}", start.elapsed());
         assert_eq!(want_d, dirs, "walk() dirs do not match");
         assert_eq!(want_f, files, "walk() files do not match");
@@ -1086,5 +1102,132 @@ impl Iterator for DirTreeIterator {
             }
             node
         })
+    }
+}
+
+/* ######################################################################### */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{testdirs::create_test_dirs, Config, ScanState};
+    use ctor::dtor;
+    use nix::libc;
+    use parking_lot::Mutex;
+    use tempfile::TempDir;
+
+    const TEST_NUM: [u64; 3] = [9, 11, 7];
+    const EXP_DIRS: u32 = (TEST_NUM[0] + TEST_NUM[0] * TEST_NUM[1]) as u32;
+    const EXP_FILES: u32 = (TEST_NUM[0] * TEST_NUM[1] * TEST_NUM[2] + 1) as u32;
+    const EXP_NODES: u32 = EXP_DIRS + EXP_FILES;
+
+    // statics for all tests
+    static mut CONF: Option<Config> = None;
+    static mut STATE: Option<ScanState> = None;
+    static mut TESTDIR: Option<TempDir> = None;
+    static INITIALIZED: Mutex<bool> = Mutex::new(false);
+
+    /// Setup common test environment for all tests. Will initialize
+    /// the needed statics only once (due to the Mutex).
+    unsafe fn setup_tests() {
+        let mut init = INITIALIZED.lock();
+        if *init {
+            // already initialized
+            return;
+        }
+        CONF = Some(Config::default());
+        STATE = Some(ScanState::default());
+        TESTDIR = Some(create_test_dirs_for_tree_test());
+        *init = true;
+    }
+
+    #[dtor]
+    unsafe fn teardown() {
+        // println! or eprintln! in `dtor` will panic as Rust has already
+        // shut down certain facilities. We can use libc::printf instead.
+        libc::printf("*** DirTree tests done, tearing down ***\n\0".as_ptr() as *const i8);
+        if let Some(_) = TESTDIR {
+            libc::printf(" - Deleting temp directory...\n\0".as_ptr() as *const i8);
+            let temp: TempDir = TESTDIR.take().unwrap();
+            temp.close().unwrap();
+        }
+        libc::printf("*** Teardown finished ***\n\n\0".as_ptr() as *const i8);
+    }
+
+    #[test]
+    fn test_create_empty_tree() {
+        unsafe { setup_tests() }
+        let tree: DirTree = DirTree::new(false, false);
+
+        assert_eq!(tree.root.node_t, NodeType::Root);
+        assert_eq!(*tree.from(), PathBuf::default());
+        tree.validate_counts();
+        let (nodes, dirs, files, depth) = counts(&tree);
+        assert_eq!(nodes, 0, "nodes mismatch");
+        assert_eq!(dirs, 0, "dirs mismatch");
+        assert_eq!(files, 0, "files mismatch");
+        assert_eq!(depth, 0, "depth mismatch");
+    }
+
+    #[test]
+    fn test_tree_new_from_path() {
+        unsafe { setup_tests() }
+        let (path, state) = unsafe {
+            (
+                TESTDIR.as_ref().unwrap().path().to_str().unwrap(),
+                STATE.as_ref().unwrap(),
+            )
+        };
+        let tree: DirTree = DirTree::new_from_path(path, state, false, false);
+        let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
+        let (nodes, dirs, files, depth) = counts(&tree);
+
+        assert_eq!(tree.root.node_t, NodeType::Root);
+        assert_eq!(*tree.from(), PathBuf::from(path));
+        tree.validate_counts();
+        assert_eq!(nodes, root_depth.into(), "nodes mismatch");
+        assert_eq!(dirs, root_depth.into(), "dirs mismatch");
+        assert_eq!(files, 0, "files mismatch");
+        assert_eq!(depth, root_depth, "depth mismatch");
+    }
+
+    #[test]
+    fn test_tree_new_from_path_recursive() {
+        unsafe { setup_tests() }
+        let (path, state) = unsafe {
+            (
+                TESTDIR.as_ref().unwrap().path().to_str().unwrap(),
+                STATE.as_ref().unwrap(),
+            )
+        };
+        let tree: DirTree = DirTree::new_from_path(path, state, true, false);
+        let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
+        let (nodes, dirs, files, depth) = counts(&tree);
+
+        assert_eq!(tree.root.node_t, NodeType::Root);
+        assert_eq!(*tree.from(), PathBuf::from(path));
+        tree.validate_counts();
+        assert_eq!(nodes, EXP_NODES + root_depth as u32, "nodes mismatch");
+        assert_eq!(dirs, EXP_DIRS + root_depth as u32, "dirs mismatch");
+        assert_eq!(files, EXP_FILES, "files mismatch");
+        assert_eq!(depth, root_depth + 3, "depth mismatch");
+    }
+
+    fn counts(tree: &DirTree) -> (u32, u32, u32, u8) {
+        (
+            tree.counts().nodes.load(Relaxed),
+            tree.counts().dirs.load(Relaxed),
+            tree.counts().files.load(Relaxed),
+            tree.counts().depth.load(Relaxed),
+        )
+    }
+
+    /// Optimally the test directory should be created only once and then
+    /// reused for all tests. The unsafe `setup_tests()` should ensure that.
+    fn create_test_dirs_for_tree_test() -> TempDir {
+        let temp_dir: TempDir = TempDir::new().unwrap();
+        let path: &str = temp_dir.path().to_str().unwrap();
+        create_test_dirs(path, Some(TEST_NUM.to_vec()), true, false).unwrap();
+        temp_dir
     }
 }
