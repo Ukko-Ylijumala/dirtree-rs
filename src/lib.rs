@@ -372,6 +372,9 @@ impl Node {
 
     /// Construct this node's full path by walking the tree upwards to Root.
     fn construct_path(&self) -> Vec<String> {
+        if self.node_t == NodeType::Root {
+            return vec!["/".to_string()];
+        }
         let mut path: Vec<String> = Vec::new();
         let (_, mut current) = self
             .parent()
@@ -425,7 +428,7 @@ impl Node {
 
     /// Whether we have a child with the given name.
     #[inline]
-    fn has_child(&self, name: &str) -> bool {
+    pub fn has_child(&self, name: &str) -> bool {
         self.children
             .as_ref()
             .map_or(false, |c| c.read().contains_key(name))
@@ -439,7 +442,7 @@ impl Node {
 
     /// Get a child node by name.
     #[inline]
-    fn get_child(&self, name: &str) -> Option<Arc<Node>> {
+    pub fn get_child(&self, name: &str) -> Option<Arc<Node>> {
         self.children
             .as_ref()
             .and_then(|c| c.read().get(name).cloned())
@@ -941,7 +944,8 @@ impl DirTree {
         (nodes, dirs, files)
     }
 
-    /// Traverses recursively from a Node and applies function `f` to each child Node.
+    /// Traverses recursively from a Node and applies function `f` to each
+    /// child Node, AND the starting Node itself.
     pub fn traverse_from<F>(&self, node: Arc<Node>, f: &mut F)
     where
         F: FnMut(Arc<Node>),
@@ -959,7 +963,7 @@ impl DirTree {
         }
     }
 
-    /// Traverses the tree and applies function `f` to each Node.
+    /// Traverses the tree from root and applies function `f` to each Node.
     pub fn traverse<F>(&self, mut f: F)
     where
         F: FnMut(Arc<Node>),
@@ -1114,11 +1118,12 @@ mod tests {
     use ctor::dtor;
     use nix::libc;
     use parking_lot::Mutex;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     const TEST_NUM: [u64; 3] = [9, 11, 7];
     const EXP_DIRS: u32 = (TEST_NUM[0] + TEST_NUM[0] * TEST_NUM[1]) as u32;
-    const EXP_FILES: u32 = (TEST_NUM[0] * TEST_NUM[1] * TEST_NUM[2] + 1) as u32;
+    const EXP_FILES: u32 = (TEST_NUM[0] * TEST_NUM[1] * TEST_NUM[2] + TEST_NUM[0] + 1) as u32;
     const EXP_NODES: u32 = EXP_DIRS + EXP_FILES;
 
     // statics for all tests
@@ -1154,15 +1159,17 @@ mod tests {
         libc::printf("*** Teardown finished ***\n\n\0".as_ptr() as *const i8);
     }
 
+    /* --------------------------------- */
+
     #[test]
     fn test_create_empty_tree() {
         unsafe { setup_tests() }
         let tree: DirTree = DirTree::new(false, false);
+        let (nodes, dirs, files, depth) = counts(&tree);
 
         assert_eq!(tree.root.node_t, NodeType::Root);
         assert_eq!(*tree.from(), PathBuf::default());
         tree.validate_counts();
-        let (nodes, dirs, files, depth) = counts(&tree);
         assert_eq!(nodes, 0, "nodes mismatch");
         assert_eq!(dirs, 0, "dirs mismatch");
         assert_eq!(files, 0, "files mismatch");
@@ -1171,20 +1178,9 @@ mod tests {
 
     #[test]
     fn test_tree_new_from_path() {
-        unsafe { setup_tests() }
-        let (path, state) = unsafe {
-            (
-                TESTDIR.as_ref().unwrap().path().to_str().unwrap(),
-                STATE.as_ref().unwrap(),
-            )
-        };
-        let tree: DirTree = DirTree::new_from_path(path, state, false, false);
-        let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
+        let (_, tree, root_depth) = create_test_tree(false);
         let (nodes, dirs, files, depth) = counts(&tree);
 
-        assert_eq!(tree.root.node_t, NodeType::Root);
-        assert_eq!(*tree.from(), PathBuf::from(path));
-        tree.validate_counts();
         assert_eq!(nodes, root_depth.into(), "nodes mismatch");
         assert_eq!(dirs, root_depth.into(), "dirs mismatch");
         assert_eq!(files, 0, "files mismatch");
@@ -1193,6 +1189,66 @@ mod tests {
 
     #[test]
     fn test_tree_new_from_path_recursive() {
+        let (_, tree, root_depth) = create_test_tree(true);
+        let (nodes, dirs, files, depth) = counts(&tree);
+        check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
+    }
+
+    #[test]
+    fn test_tree_contains() {
+        let (path, tree, root_depth) = create_test_tree(true);
+        let (nodes, dirs, files, depth) = counts(&tree);
+        check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
+
+        let mut ctr: u32 = 0;
+        for p in path_generator(path) {
+            assert!(tree.contains(&p), "Not found: {}", p);
+            ctr += 1;
+        }
+        assert!(tree.contains(&path), "Root not found: {}", path);
+        assert!(!tree.contains(""), "Found an empty path");
+        assert_eq!(ctr, EXP_DIRS + EXP_FILES, "All paths not accounted for");
+    }
+
+    #[test]
+    fn test_tree_traversals() {
+        let (path, tree, root_depth) = create_test_tree(true);
+        let (nodes, dirs, files, depth) = counts(&tree);
+        check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
+
+        let exp_paths: HashSet<String> = path_generator(path);
+        let paths_iter: HashSet<String> = tree.iter_paths().collect();
+        let paths_walk: HashSet<String> = tree
+            .nodes()
+            .iter()
+            .map(|n: &Arc<Node>| n.path().to_string_lossy().to_string())
+            .collect();
+        let mut paths_trav: HashSet<String> = HashSet::new();
+        tree.traverse(|n: Arc<Node>| {
+            paths_trav.insert(n.path().to_string_lossy().to_string());
+        });
+
+        assert!(
+            exp_paths.is_subset(&paths_iter),
+            "iter() paths mismatch: {:?}",
+            exp_paths.difference(&paths_iter)
+        );
+        assert!(
+            exp_paths.is_subset(&paths_walk),
+            "walk() paths mismatch: {:?}",
+            exp_paths.difference(&paths_walk)
+        );
+        assert!(
+            exp_paths.is_subset(&paths_trav),
+            "traverse() paths mismatch: {:?}",
+            exp_paths.difference(&paths_trav)
+        );
+    }
+
+    /* --------------------------------- */
+
+    /// Create a test DirTree from path and perform some basic validations.
+    fn create_test_tree(recursive: bool) -> (&'static str, DirTree, u8) {
         unsafe { setup_tests() }
         let (path, state) = unsafe {
             (
@@ -1200,19 +1256,15 @@ mod tests {
                 STATE.as_ref().unwrap(),
             )
         };
-        let tree: DirTree = DirTree::new_from_path(path, state, true, false);
-        let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
-        let (nodes, dirs, files, depth) = counts(&tree);
-
+        let tree: DirTree = DirTree::new_from_path(path, state, recursive, false);
         assert_eq!(tree.root.node_t, NodeType::Root);
         assert_eq!(*tree.from(), PathBuf::from(path));
+        let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
         tree.validate_counts();
-        assert_eq!(nodes, EXP_NODES + root_depth as u32, "nodes mismatch");
-        assert_eq!(dirs, EXP_DIRS + root_depth as u32, "dirs mismatch");
-        assert_eq!(files, EXP_FILES, "files mismatch");
-        assert_eq!(depth, root_depth + 3, "depth mismatch");
+        (path, tree, root_depth)
     }
 
+    /// Return the node, dir and file counts from a DirTree.
     fn counts(tree: &DirTree) -> (u32, u32, u32, u8) {
         (
             tree.counts().nodes.load(Relaxed),
@@ -1222,12 +1274,42 @@ mod tests {
         )
     }
 
+    /// Check that node, dir, and file counts match the expected values.
+    fn check_nodes_dirs_files(nodes: u32, root_depth: u8, dirs: u32, files: u32, depth: u8) {
+        assert_eq!(nodes, EXP_NODES + root_depth as u32, "nodes mismatch");
+        assert_eq!(dirs, EXP_DIRS + root_depth as u32, "dirs mismatch");
+        assert_eq!(files, EXP_FILES, "files mismatch");
+        assert_eq!(depth, root_depth + 3, "depth mismatch");
+    }
+
+    /// Generate all expected paths for the test directory structure.
+    fn path_generator(path: &str) -> HashSet<String> {
+        let mut paths: HashSet<String> = HashSet::new();
+        paths.insert(format!("{}/test.bin", path));
+
+        for l1_idx in 0..TEST_NUM[0] {
+            paths.insert(format!("{}/level_1_{l1_idx}", path));
+            for l2_idx in 0..TEST_NUM[1] {
+                paths.insert(format!("{}/level_1_{l1_idx}/level_2_{l2_idx}", path));
+                for l3_idx in 1..=TEST_NUM[2] {
+                    paths.insert(format!(
+                        "{0}/level_1_{1}/level_2_{2}/file-{1}_{2}_{3}.bin",
+                        path, l1_idx, l2_idx, l3_idx
+                    ));
+                }
+                paths.insert(format!("{path}/level_1_{0}/file-{0}.bin", l1_idx));
+            }
+        }
+        paths
+    }
+
     /// Optimally the test directory should be created only once and then
-    /// reused for all tests. The unsafe `setup_tests()` should ensure that.
+    /// reused for all tests. The unsafe `setup_tests()` should ensure that
+    /// this fn is called only once.
     fn create_test_dirs_for_tree_test() -> TempDir {
         let temp_dir: TempDir = TempDir::new().unwrap();
         let path: &str = temp_dir.path().to_str().unwrap();
-        create_test_dirs(path, Some(TEST_NUM.to_vec()), true, false).unwrap();
+        create_test_dirs(path, Some(TEST_NUM.to_vec()), true, false, None).unwrap();
         temp_dir
     }
 }
