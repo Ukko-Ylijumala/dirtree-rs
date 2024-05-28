@@ -791,30 +791,47 @@ impl DirTree {
 
     /// Remove a Node (or a leaf) from the trie. Expects an absolute path.
     ///
+    /// Returns a tuple of `(nodes, dirs, files)` removed on success and `None`
+    /// if the path was not found. The root node cannot be removed.
+    ///
     /// WARNING: implementation is WIP and may yet contain bugs.
-    pub fn remove(&self, path: &str) {
+    pub fn remove(&self, path: &str) -> Result<Option<(u32, u32, u32)>, Error> {
         match self.get_node(path) {
-            Some(node) => match node.parent() {
-                Some(parent) => {
-                    let (nodes, dirs, files) = self.count_from(node.clone());
-                    eprintln!("*** Removing ***\n{:?}", node);
-                    parent.remove_child(PathBuf::from(path).file_name().unwrap().to_str().unwrap());
-                    self.counts.nodes.fetch_sub(nodes, Relaxed);
-                    self.counts.dirs.fetch_sub(dirs, Relaxed);
-                    self.counts.files.fetch_sub(files, Relaxed);
+            Some(node) => {
+                if node.node_t == NodeType::Root {
+                    return Err(Error::new(ErrorKind::InvalidInput, "Cannot remove root node"));
+                };
+
+                match node.parent() {
+                    Some(parent) => {
+                        let (nodes, dirs, files) = self.count_from(node.clone());
+                        if self.debug {
+                            eprintln!("*** Removing: {:?}", node.path());
+                        }
+                        let (name, c) = parent.get_child_byref(&node).unwrap();
+                        assert_eq!(node, c, "Node should be the same as the one in parent");
+                        parent.remove_child(&name);
+                        self.counts.nodes.fetch_sub(nodes, Relaxed);
+                        self.counts.dirs.fetch_sub(dirs, Relaxed);
+                        self.counts.files.fetch_sub(files, Relaxed);
+                        return Ok(Some((nodes, dirs, files)));
+                    }
+
+                    None => {
+                        let msg: String = format!("Stale parent reference: {:?}", node.path());
+                        if self.debug {
+                            eprintln!("ERROR: {msg}");
+                        };
+                        return Err(Error::new(ErrorKind::NotFound, msg));
+                    }
                 }
-                None => {
-                    if self.debug {
-                        eprintln!("*** ERROR: stale parent reference for: {:?}", node)
-                    };
-                    return;
-                }
-            },
+            }
+
             None => {
                 if self.debug {
-                    eprintln!("*** WARN: node not found: {path}")
+                    eprintln!("WARN: node not found: {path}")
                 };
-                return;
+                return Ok(None);
             }
         }
     }
@@ -1232,6 +1249,9 @@ mod tests {
         assert!(tree.contains(&path), "Root not found: {}", path);
         assert!(!tree.contains(""), "Found an empty path");
         assert_eq!(ctr, EXP_DIRS + EXP_FILES, "All paths not accounted for");
+        for &p in ["foo", "bar/foo", "/foo/baz", ".", "..", "../"].iter() {
+            assert!(!tree.contains(p), "Found a nonexistent path: {p}");
+        }
     }
 
     #[test]
@@ -1240,33 +1260,21 @@ mod tests {
         let (nodes, dirs, files, depth) = counts(&tree);
         check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
 
-        let exp_paths: HashSet<String> = path_generator(path);
-        let paths_iter: HashSet<String> = tree.iter_paths().collect();
-        let paths_walk: HashSet<String> = tree
+        let exp: HashSet<String> = path_generator(path);
+        let p_iter: HashSet<String> = tree.iter_paths().collect();
+        let p_walk: HashSet<String> = tree
             .nodes()
             .iter()
             .map(|n: &Arc<Node>| n.path().to_string_lossy().to_string())
             .collect();
-        let mut paths_trav: HashSet<String> = HashSet::new();
+        let mut p_trav: HashSet<String> = HashSet::new();
         tree.traverse(|n: Arc<Node>| {
-            paths_trav.insert(n.path().to_string_lossy().to_string());
+            p_trav.insert(n.path().to_string_lossy().to_string());
         });
 
-        assert!(
-            exp_paths.is_subset(&paths_iter),
-            "iter() paths mismatch: {:?}",
-            exp_paths.difference(&paths_iter)
-        );
-        assert!(
-            exp_paths.is_subset(&paths_walk),
-            "walk() paths mismatch: {:?}",
-            exp_paths.difference(&paths_walk)
-        );
-        assert!(
-            exp_paths.is_subset(&paths_trav),
-            "traverse() paths mismatch: {:?}",
-            exp_paths.difference(&paths_trav)
-        );
+        assert!(exp.is_subset(&p_iter), "iter() paths mismatch: {:?}", exp.difference(&p_iter));
+        assert!(exp.is_subset(&p_walk), "walk() paths mismatch: {:?}", exp.difference(&p_walk));
+        assert!(exp.is_subset(&p_trav), "traverse() paths mismatch: {:?}", exp.difference(&p_trav));
     }
 
     #[test]
@@ -1308,6 +1316,67 @@ mod tests {
             assert_eq!(l2_d, 1, "L2 dir count != expected");
             assert_eq!(l2_f, TEST_NUM[2], "L2 file count != expected");
             assert_eq!(l2_n, TEST_NUM[2] + 1, "L2 node count != expected");
+        }
+    }
+
+    #[test]
+    fn test_tree_removals() {
+        let (path, tree, root_depth) = create_test_tree(true);
+        let (mut nodes, mut dirs, mut files, depth) = counts(&tree);
+        check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
+
+        let l1_idx: u64 = TEST_NUM[0] - 1;
+        let file: String = format!("{path}/level_1_{0}/file-{0}.bin", l1_idx);
+        let l2_p: String = format!("{path}/level_1_{}/level_2_{}", l1_idx - 1, TEST_NUM[1] - 1);
+        let l1_p: String = format!("{path}/level_1_{}", l1_idx - 2);
+        for &p in [&file, &l2_p, &l1_p].iter() {
+            assert!(tree.contains(p), "Node/path not found (test error): {p}");
+        }
+
+        let (l2_n, l2_d, l2_f) =
+            validate_counts_below_node(&tree, tree.get_node(&l2_p).expect("L2 node not found"));
+        let (l1_n, l1_d, l1_f) =
+            validate_counts_below_node(&tree, tree.get_node(&l1_p).expect("L1 node not found"));
+
+        match tree.remove(&file) {
+            Ok(_) => {
+                tree.validate_counts();
+                nodes -= 1;
+                files -= 1;
+                assert!(!tree.contains(&file), "File found after removal: {file}");
+                assert_eq!(tree.counts().nodes.load(Relaxed), nodes, "Node count mismatch [file]");
+                assert_eq!(tree.counts().dirs.load(Relaxed), dirs, "Dir count not equal [file]");
+                assert_eq!(tree.counts().files.load(Relaxed), files, "File count mismatch [file]");
+            }
+            Err(e) => panic!("Error removing file: {e}"),
+        }
+
+        match tree.remove(&l2_p) {
+            Ok(_) => {
+                tree.validate_counts();
+                nodes -= l2_n as u32;
+                dirs -= l2_d as u32;
+                files -= l2_f as u32;
+                assert!(!tree.contains(&l2_p), "L2 dir found after removal: {l2_p}");
+                assert_eq!(tree.counts().nodes.load(Relaxed), nodes, "Node count mismatch [L2]");
+                assert_eq!(tree.counts().dirs.load(Relaxed), dirs, "Dir count mismatch [L2]");
+                assert_eq!(tree.counts().files.load(Relaxed), files, "File count mismatch [L2]");
+            }
+            Err(e) => panic!("Error removing L2 dir {l2_p}: {e}"),
+        }
+
+        match tree.remove(&l1_p) {
+            Ok(_) => {
+                tree.validate_counts();
+                nodes -= l1_n as u32;
+                dirs -= l1_d as u32;
+                files -= l1_f as u32;
+                assert!(!tree.contains(&l1_p), "L1 dir found after removal: {l1_p}");
+                assert_eq!(tree.counts().nodes.load(Relaxed), nodes, "Node count mismatch [L1]");
+                assert_eq!(tree.counts().dirs.load(Relaxed), dirs, "Dir count mismatch [L1]");
+                assert_eq!(tree.counts().files.load(Relaxed), files, "File count mismatch [L1]");
+            }
+            Err(e) => panic!("Error removing L1 dir {l1_p}: {e}"),
         }
     }
 
