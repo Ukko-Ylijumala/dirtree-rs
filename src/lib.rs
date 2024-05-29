@@ -4,14 +4,15 @@
 
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
-    DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, Instant, Metadata, MetadataExt,
-    PathBuf, ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak, HashSet,
+    DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, HashSet, Instant, Metadata, MetadataExt,
+    PathBuf, ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak,
 };
 use rayon::prelude::*;
 use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
+    sync::OnceLock,
 };
 
 const PATH_SEP: char = '/';
@@ -150,32 +151,28 @@ impl<T> DirectoryEntry for Entry<T> {
     }
 }
 
-/* 
-/// An empty struct, used as a type parameter T for `Entry`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Directory;
-
-impl Default for Directory {
-    fn default() -> Self {
-        Directory
-    }
-}
-*/
-
 /// A NodeItem struct representing a Directory.
 #[derive(Debug)]
 pub struct Directory {
     name: String,
     children: RwLock<DirTreeHashMap<String, Arc<Node>>>,
-    files: HashSet<String>,
+    files: RwLock<HashSet<String>>,
 }
 
 impl Directory {
     pub fn new(name: &str) -> Self {
         Directory {
-            name: name.into(),
+            name: name.to_owned(),
             ..Default::default()
         }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn set_name(&mut self, name: String) {
+        self.name = name;
     }
 
     #[inline]
@@ -186,19 +183,19 @@ impl Directory {
     /// Whether we have a child with the given name.
     #[inline]
     pub fn has_child(&self, name: &str) -> bool {
-        self.children().read().contains_key(name) || self.files.contains(name)
+        self.children().read().contains_key(name) || self.files.read().contains(name)
     }
 
     /// Add a child node to this item's children.
     #[inline]
-    fn add_child(&mut self, name: String, node: Arc<Node>) {
-        self.children.write().insert(name, node);
+    fn add_child(&self, name: String, node: Arc<Node>) {
+        self.write().insert(name, node);
     }
 
     /// Add a file name entry to the `files` HashSet.
     #[inline]
-    fn add_file(&mut self, name: String) {
-        self.files.insert(name);
+    fn add_file(&self, name: String) {
+        self.files.write().insert(name);
     }
 
     /// Get a child node by name.
@@ -208,18 +205,18 @@ impl Directory {
     }
 
     /// Remove a child node (or a file name entry) by name.
-    fn remove_child(&mut self, name: &str) {
-        self.children.write().remove(name);
-        self.files.remove(name);
+    fn remove_child(&self, name: &str) {
+        self.write().remove(name);
+        self.files.write().remove(name);
     }
 }
 
 impl Default for Directory {
     fn default() -> Self {
         Directory {
-            name: String::new(),
-            children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
-            files: HashSet::new(),
+            name: "".to_string(),
+            children: RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)).into(),
+            files: HashSet::new().into(),
         }
     }
 }
@@ -228,16 +225,16 @@ impl Clone for Directory {
     fn clone(&self) -> Self {
         Directory {
             name: self.name.clone(),
-            children: self.children.read().clone().into(),
-            files: self.files.clone(),
+            children: RwLock::new(self.read().clone()).into(),
+            files: self.files.read().clone().into(),
         }
     }
 }
 
 impl Hash for Directory {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-        let lock = self.children.read();
+        self.name().hash(state);
+        let lock = self.read();
         let mut children: Vec<(&String, &Arc<Node>)> = Vec::from_iter(lock.iter());
         children.sort_by_key(|k| k.0);
         children.hash(state);
@@ -250,11 +247,39 @@ impl PartialEq for Directory {
             // short circuit if the names don't match
             return false;
         }
-        *self.children.read() == *other.children.read()
+        *self.read() == *other.read()
     }
 }
 
 impl Eq for Directory {}
+
+impl Ord for Directory {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name().cmp(&other.name())
+    }
+}
+
+impl PartialOrd for Directory {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// Implement Deref for Directory to allow read access through RwLock to children.
+impl Deref for Directory {
+    type Target = RwLock<DirTreeHashMap<String, Arc<Node>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.children
+    }
+}
+
+// Implement mutable Deref for Directory to allow write access through RwLock to children.
+impl DerefMut for Directory {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.children
+    }
+}
 
 /// An empty struct, used as a type parameter T for `Entry`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -316,7 +341,7 @@ impl NodeType {
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeItem {
-    Root,
+    Root(Directory),
     Dir(Entry<Directory>),
     File(Entry<File>),
     #[default]
@@ -351,19 +376,36 @@ impl NodeItem {
         matches!(self, Self::None)
     }
 
-    /// Returns a reference to the inner [`Directory`] if the node item is [`Dir`].
-    pub fn as_dir(&self) -> Option<&Entry<Directory>> {
+    /// Set the name of the inner [`Directory`] if the node item is [`Dir`].
+    fn set_dir_name(&mut self, name: String) {
         if let Self::Dir(v) = self {
-            Some(v)
+            v.1.set_name(name);
+        }
+    }
+
+    /// Returns a ref to the inner [`Directory`] if the node item is [`Dir`] or [`Root`].
+    pub fn as_dir(&self) -> Option<&Directory> {
+        if self.is_file() {
+            // short circuit since files are expected to outnumber
+            // directories by a large margin and we can optimize for that
+            return None;
+        }
+
+        // Root and Dir store the `Directory` struct differently
+        // so we must handle them separately
+        if let Self::Dir(v) = self {
+            Some(&v.1)
+        } else if let Self::Root(v) = self {
+            Some(&v)
         } else {
             None
         }
     }
 
     /// Returns a reference to the inner [`File`] if the node item is [`File`].
-    pub fn as_file(&self) -> Option<&Entry<File>> {
+    pub fn as_file(&self) -> Option<&File> {
         if let Self::File(v) = self {
-            Some(v)
+            Some(&v.1)
         } else {
             None
         }
@@ -396,13 +438,11 @@ impl From<Entry<File>> for NodeItem {
 /* ######################################################################### */
 
 /// Node in the trie structure for storing paths and items, respectively.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Node {
     pub node_t: NodeType,
-    // TODO: either make this an enum with variants for each NodeType, or Option<..>
-    item: RwLock<NodeItem>,
+    item: Arc<OnceLock<NodeItem>>,
     parent: Weak<Node>,
-    children: Option<RwLock<DirTreeHashMap<String, Arc<Node>>>>,
 }
 
 impl Node {
@@ -410,44 +450,44 @@ impl Node {
     /// NOTE: children are initialized only for containers (directories and root).
     pub fn new(item: NodeItem, parent: Option<Arc<Node>>) -> Self {
         let node_t: NodeType = match item {
-            NodeItem::Root => NodeType::Root,
+            NodeItem::Root(_) => NodeType::Root,
             NodeItem::Dir(_) => NodeType::Directory,
             NodeItem::File(_) => NodeType::File,
             NodeItem::None => NodeType::Uninitialized,
         };
         Self {
-            children: match node_t {
-                NodeType::Root | NodeType::Directory => {
-                    Some(RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)))
-                }
-                NodeType::Uninitialized => None,
-                NodeType::File => None,
+            item: match node_t {
+                NodeType::Uninitialized => OnceLock::new().into(),
+                _ => Arc::new(item.into()),
             },
             node_t,
-            item: RwLock::new(item),
             parent: parent.map_or_else(|| Weak::new(), |p| make_weak_ref(p)),
         }
     }
 
+    #[inline]
+    pub fn item(&self) -> &NodeItem {
+        self.item
+            .get()
+            .expect("Node should have an item (but not initialized yet)")
+    }
+
     /// Returns `true` if the node is traversable (`children` != `None`).
+    #[inline]
     pub fn is_traversable(&self) -> bool {
         matches!(self.node_t, NodeType::Directory | NodeType::Root)
     }
 
-    /// The Node as an `Entry<Directory>`, if it contains a directory.
-    fn as_dir(&self) -> Option<Entry<Directory>> {
-        match self.item.read().as_dir() {
-            Some(d) => Some(d.clone()),
-            None => None,
-        }
+    /// The Node as a `Directory` struct, if it contains a directory.
+    #[inline]
+    fn as_dir(&self) -> Option<&Directory> {
+        self.item().as_dir()
     }
 
-    /// The Node as an `Entry<File>`, if it contains a file.
-    fn as_file(&self) -> Option<Entry<File>> {
-        match self.item.read().as_file() {
-            Some(d) => Some(d.clone()),
-            None => None,
-        }
+    /// The Node as a `File` struct, if it contains a file.
+    #[inline]
+    fn as_file(&self) -> Option<&File> {
+        self.item().as_file()
     }
 
     /// Returns a weak reference to this node.
@@ -522,39 +562,39 @@ impl Node {
         }
     }
 
-/* 
-    fn children_itm(&self) -> &RwLock<DirTreeHashMap<String, Arc<Node>>> {
-        (*self.read()).as_dir().unwrap().1.children()
-    }
-
-*/
     #[inline]
-    fn children(&self) -> Option<&RwLock<DirTreeHashMap<String, Arc<Node>>>> {
-        self.children.as_ref()
+    pub fn children(&self) -> Option<&RwLock<DirTreeHashMap<String, Arc<Node>>>> {
+        if matches!(self.item.get(), None) {
+            // catch uninitialized nodes
+            return None;
+        }
+        match self.item().as_dir() {
+            Some(dir) => dir.children().into(),
+            None => None,
+        }
     }
 
     /// Whether we have a child with the given name.
     #[inline]
     pub fn has_child(&self, name: &str) -> bool {
-        self.children()
-            .map_or(false, |c| c.read().contains_key(name))
+        self.as_dir().map_or(false, |dir| dir.has_child(name))
     }
 
     /// Add a child node to the current node's children.
     #[inline]
     fn add_child(&self, name: String, node: Arc<Node>) {
-        self.children().unwrap().write().insert(name, node);
+        self.as_dir().map(|dir| dir.add_child(name, node));
     }
 
     /// Get a child node by name.
     #[inline]
     pub fn get_child(&self, name: &str) -> Option<Arc<Node>> {
-        self.children().and_then(|c| c.read().get(name).cloned())
+        self.as_dir().map_or(None, |dir| dir.get_child(name))
     }
 
     /// Remove a child node by name.
     fn remove_child(&self, name: &str) {
-        self.children().unwrap().write().remove(name);
+        self.as_dir().map(|dir| dir.remove_child(name));
     }
 
     /// Get the name of a child node and its `Arc<Node>` ptr from a reference
@@ -575,44 +615,43 @@ impl Node {
     }
 }
 
+impl Default for Node {
+    fn default() -> Self {
+        Node {
+            node_t: NodeType::Uninitialized,
+            item: Arc::new(OnceLock::new()),
+            parent: Weak::new(),
+        }
+    }
+}
+
 impl Clone for Node {
     /// Clones the node and its children.
     fn clone(&self) -> Self {
         Self {
             node_t: self.node_t.clone(),
-            item: RwLock::new(self.item.read().clone()),
+            item: self.item.clone(),
             parent: self.parent.clone(),
-            children: match self.children {
-                Some(ref children) => Some(RwLock::new(children.read().clone())),
-                None => None,
-            },
         }
     }
 }
 
 // Implement Deref for Node to allow access to NodeItem methods.
 impl Deref for Node {
-    type Target = RwLock<NodeItem>;
+    type Target = NodeItem;
 
     fn deref(&self) -> &Self::Target {
-        &self.item
-    }
-}
-
-// Implement mutable Deref for Node to allow changing NodeItem.
-impl DerefMut for Node {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.item
+        self.item()
     }
 }
 
 // For a File or Directory, the hash is based on the inode.
 impl Hash for Node {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        if matches!(self.node_t, NodeType::Directory | NodeType::File) {
-            self.read().data().unwrap().hash(state);
+        if self.node_t.has_data() {
+            self.data().unwrap().hash(state);
         } else {
-            self.read().hash(state);
+            self.hash(state);
         }
         self.node_t.hash(state);
     }
@@ -621,22 +660,22 @@ impl Hash for Node {
 // Implement <Node> == <Node> comparisons
 impl PartialEq for Node {
     fn eq(&self, other: &Self) -> bool {
-        // *self.read() -> NodeItem (due to impl Deref)
-        &*self.read() == &*other.read()
+        // we could use plain `self` here due to impl Deref, but let's be explicit
+        &self.item == &other.item
     }
 }
 
 // Implement <Node> == <NodeItem> comparisons
 impl PartialEq<NodeItem> for Node {
     fn eq(&self, other: &NodeItem) -> bool {
-        &*self.read() == &*other
+        &*self.item() == &*other
     }
 }
 
 // Implement <NodeItem> == <Node> comparisons
 impl PartialEq<Node> for NodeItem {
     fn eq(&self, other: &Node) -> bool {
-        &*self == &*other.read()
+        &*self == &*other.item()
     }
 }
 
@@ -649,10 +688,10 @@ impl PartialEq<Node> for NodeItem {
 pub struct Counts {
     /// Does not include the root node.
     pub nodes: AtomicU32,
-    /// Maximum depth of the tree. Root is at depth 0.
-    pub depth: AtomicU8,
     pub dirs: AtomicU32,
     pub files: AtomicU32,
+    /// Maximum depth of the tree. Root is at depth 0.
+    pub depth: AtomicU8,
 }
 
 /// Trie structure for storing a directory tree.
@@ -705,7 +744,7 @@ impl DirTree {
     /// Creates a new empty directory tree (internally a Trie structure).
     pub fn new(debug: bool, dirsonly: bool) -> Self {
         DirTree {
-            root: Node::new(NodeItem::Root, None).into(),
+            root: Node::new(NodeItem::Root(Directory::new("ROOT")), None).into(),
             debug,
             dirsonly,
             ..Default::default()
@@ -824,6 +863,8 @@ impl DirTree {
         let parts: Vec<&str> = path_parts_vec(&p_unicode);
         let len: usize = parts.len();
         let mut depth: usize = 0; // root node is at depth 0
+        self.counts.depth.fetch_max(len as u8, Relaxed);
+        // max depth can just as well be updated at this point
 
         for part in parts {
             depth += 1;
@@ -840,10 +881,12 @@ impl DirTree {
                     if self.debug {
                         eprintln!("\n<---- {part} ----> depth: {depth} len: {len}");
                     }
-                    // must be a container (directory)
+                    // must be a container (directory) so let's create the basic structure
                     new.node_t = NodeType::Directory;
-                    // Node.children = None in Node::new() for NodeItem::None
-                    new.children = Some(RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)));
+                    let mut dir_item = NodeItem::Dir(Entry::<Directory>::default());
+                    dir_item.set_dir_name(part.clone());
+                    new.item.set(dir_item).ok();
+
                     // we must increment the node counters here since we've
                     // not reached the leaf node yet and we shouldn't do a
                     // full initialization for an intermediate node
@@ -852,7 +895,20 @@ impl DirTree {
                 } else {
                     new.node_t = node_t.clone();
                     if node_t == NodeType::Directory {
-                        new.children = Some(RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)));
+                        let mut itm =
+                            NodeItem::Dir(Entry::<Directory>::new(path, meta.clone()).unwrap());
+                        itm.set_dir_name(part.clone());
+                        new.item.set(itm).ok();
+                        self.counts.nodes.fetch_add(1, Relaxed);
+                        self.counts.dirs.fetch_add(1, Relaxed);
+                    } else if node_t == NodeType::File && self.dirsonly {
+                        // optimization: don't create file Nodes at all, just
+                        // record the fact that a file exists in the directory
+                        // NOTE: total node count is not incremented in this case
+                        drop(new);
+                        current.as_dir().map(|dir| dir.add_file(part.clone()));
+                        self.counts.files.fetch_add(1, Relaxed);
+                        return;
                     }
                 }
                 if self.debug {
@@ -860,10 +916,15 @@ impl DirTree {
                 }
                 current.add_child(part.clone(), new.into());
             }
-            current = current.get_child(&part).unwrap();
+            current = match current.get_child(&part) {
+                Some(node) => node,
+                None => {
+                    panic!("\n*** Child {part} missing from HashMap: {:?}\n\n{:?}", current, self)
+                }
+            }
         }
 
-        if !matches!(*current.item.read(), NodeItem::None) {
+        if !matches!(current.item.get(), None) {
             // for now we don't overwrite existing nodes, but
             // this may change in the future to allow for updates
             return;
@@ -871,22 +932,23 @@ impl DirTree {
 
         match node_t {
             NodeType::Directory => {
-                *current.item.write() = NodeItem::Dir(Entry::<Directory>::new(path, meta).unwrap());
+                let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, meta).unwrap());
+                itm.set_dir_name(path.file_name().unwrap().to_string_lossy().to_string());
+                current.item.set(itm).ok();
+                self.counts.nodes.fetch_add(1, Relaxed);
                 self.counts.dirs.fetch_add(1, Relaxed);
             }
             NodeType::File => {
-                if !self.dirsonly {
-                    // optimization: don't create file Entry to conserve memory
-                    // the node itself exists though, just not fully initialized
-                    *current.item.write() = NodeItem::File(Entry::<File>::new(path, meta).unwrap());
-                }
+                current
+                    .item
+                    .set(NodeItem::File(Entry::<File>::new(path, meta).unwrap()))
+                    .ok();
+                self.counts.nodes.fetch_add(1, Relaxed);
                 self.counts.files.fetch_add(1, Relaxed);
             }
             _ => return,
         };
 
-        self.counts.nodes.fetch_add(1, Relaxed);
-        self.counts.depth.fetch_max(len as u8, Relaxed);
         if self.debug {
             eprintln!(" ++ INS: {:?}", current)
         };
@@ -962,16 +1024,6 @@ impl DirTree {
         self.get_node(path).is_some()
     }
 
-    /// Returns a CLONE of the item at the given path. Expects an absolute path.
-    fn item(&self, path: &str) -> Option<NodeItem> {
-        let node: Arc<Node> = match self.get_node(path) {
-            Some(n) => n,
-            None => return None,
-        };
-        let item: NodeItem = node.item.read().clone();
-        Some(item)
-    }
-
     /// The filesystem path of a Node, if it contains a file or directory.
     pub fn fs_path(&self, node: Arc<Node>) -> Option<PathBuf> {
         match node.node_t.has_data() {
@@ -986,7 +1038,7 @@ impl DirTree {
     /// `dirs` and `files` flags control whether to include directory and/or file Nodes.
     fn walk(&self, node: Arc<Node>, dirs: bool, files: bool) -> Arc<RwLock<Vec<Arc<Node>>>> {
         let all_nodes: Arc<RwLock<Vec<Arc<Node>>>> = RwLock::new(Vec::new()).into();
-        if node.is_traversable() {
+        if node.is_traversable() && node.children().is_some() {
             node.children()
                 .unwrap()
                 .read()
@@ -1039,13 +1091,15 @@ impl DirTree {
     }
 
     /// An iterator over all `Directory` items in the tree.
-    pub fn iter_dirs(&self) -> impl Iterator<Item = Entry<Directory>> {
-        self.iter().filter_map(|node: Arc<Node>| node.as_dir())
+    pub fn iter_dirs(&self) -> impl Iterator<Item = Directory> {
+        self.iter()
+            .filter_map(|node: Arc<Node>| node.as_dir().cloned())
     }
 
     /// An iterator over all `File` items in the tree.
-    pub fn iter_files(&self) -> impl Iterator<Item = Entry<File>> {
-        self.iter().filter_map(|node: Arc<Node>| node.as_file())
+    pub fn iter_files(&self) -> impl Iterator<Item = File> {
+        self.iter()
+            .filter_map(|node: Arc<Node>| node.as_file().cloned())
     }
 
     /// An iterator over all Paths in the tree.
@@ -1094,7 +1148,7 @@ impl DirTree {
         F: FnMut(Arc<Node>),
     {
         f(node.clone());
-        if node.is_traversable() {
+        if node.is_traversable() && node.children().is_some() {
             for child in node.children().unwrap().read().values() {
                 if child.is_traversable() {
                     // traverse directories first (depth-first search)
@@ -1186,32 +1240,62 @@ impl DirTree {
         let want_n: u32 = self.counts.nodes.load(Relaxed);
         let want_d: u32 = self.counts.dirs.load(Relaxed);
         let want_f: u32 = self.counts.files.load(Relaxed);
-        assert_eq!(want_n, want_d + want_f, "master node count != dirs+files");
+        let d_o: &str = "[dirsonly]";
+        if self.dirsonly {
+            assert_eq!(want_n, want_d, "master node count != dirs {d_o}")
+        } else {
+            assert_eq!(want_n, want_d + want_f, "master node count != dirs+files")
+        }
+
+        /* ------------------------- */
 
         let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.count_from(self.root.clone());
-        assert_eq!(nodes, dirs + files, "count_from() node count != dirs+files");
-        assert_eq!(want_n, nodes, "count_from() node count != master count");
-        assert_eq!(want_d, dirs, "count_from() dirs do not match");
-        assert_eq!(want_f, files, "count_from() files do not match");
-        eprintln!(" --> count_from()  = {:?}", start.elapsed());
+        let n: &str = "count_from()";
+        if self.dirsonly {
+            assert_eq!(nodes, dirs, "{n} node count != dirs {d_o}");
+            assert_eq!(files, 0, "{n} files != 0 {d_o}");
+        } else {
+            assert_eq!(nodes, dirs + files, "{n} node count != dirs+files");
+            assert_eq!(want_f, files, "{n} files do not match");
+        }
+        assert_eq!(want_n, nodes, "{n} node count != master count");
+        assert_eq!(want_d, dirs, "{n} dirs do not match");
+        eprintln!(" --> {n} = {:?}", start.elapsed());
+
+        /* ------------------------- */
 
         let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.iter_count();
-        assert_eq!(nodes, dirs + files, "iter_count() node count != dirs+files");
-        assert_eq!(want_n, nodes, "iter_count() node count != master count");
-        assert_eq!(want_d, dirs, "iter_count() dirs do not match");
-        assert_eq!(want_f, files, "iter_count() files do not match");
-        eprintln!(" --> iter_count()  = {:?}", start.elapsed());
+        let n: &str = "iter_count()";
+        if self.dirsonly {
+            assert_eq!(nodes, dirs, "{n} node count != dirs {d_o}");
+            assert_eq!(files, 0, "{n} files != 0 {d_o}");
+        } else {
+            assert_eq!(nodes, dirs + files, "{n} node count != dirs+files");
+            assert_eq!(want_f, files, "{n} files do not match");
+        }
+        assert_eq!(want_n, nodes, "{n} node count != master count");
+        assert_eq!(want_d, dirs, "{n} dirs do not match");
+        eprintln!(" --> {n} = {:?}", start.elapsed());
 
+        /* ------------------------- */
+
+        let n: &str = "walk()";
         let start: Instant = Instant::now();
         let dirs: u32 = self.dirs().len() as u32;
-        eprintln!(" --> walk: dirs()  = {:?}", start.elapsed());
+        eprintln!(" --> {n} dirs  = {:?}", start.elapsed());
+
         let start: Instant = Instant::now();
         let files: u32 = self.files().len() as u32;
-        eprintln!(" --> walk: files() = {:#?}", start.elapsed());
-        assert_eq!(want_d, dirs, "walk() dirs do not match");
-        assert_eq!(want_f, files, "walk() files do not match");
+        eprintln!(" --> {n} files = {:#?}", start.elapsed());
+
+        assert_eq!(want_d, dirs, "{n} dirs do not match");
+        if self.dirsonly {
+            assert_eq!(files, 0, "{n} files != 0 {d_o}");
+        } else {
+            assert_eq!(want_f, files, "{n} files do not match");
+        }
     }
 }
 
@@ -1225,7 +1309,7 @@ impl Iterator for DirTreeIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.pop_front().map(|node| {
-            if node.children.is_none() {
+            if node.children().is_none() {
                 return node;
             }
             // Push all found children to the stack
@@ -1306,7 +1390,7 @@ mod tests {
     #[test]
     fn test_create_empty_tree() {
         unsafe { setup_tests() }
-        let tree: DirTree = DirTree::new(false, false);
+        let tree: DirTree = DirTree::new(true, false);
         let (nodes, dirs, files, depth) = counts(&tree);
 
         assert_eq!(tree.root.node_t, NodeType::Root);
@@ -1320,9 +1404,17 @@ mod tests {
 
     #[test]
     fn test_tree_new_from_path() {
-        let (_, tree, root_depth) = create_test_tree(false);
-        let (nodes, dirs, files, depth) = counts(&tree);
+        unsafe { setup_tests() }
+        let (path, _) = unsafe {
+            (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
+        };
 
+        let mut tree: DirTree = DirTree::new(true, false);
+        tree.set_from(PathBuf::from(path));
+        let (nodes, dirs, files, depth) = counts(&tree);
+        let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
+
+        tree.validate_counts();
         assert_eq!(nodes, root_depth.into(), "nodes mismatch");
         assert_eq!(dirs, root_depth.into(), "dirs mismatch");
         assert_eq!(files, 0, "files mismatch");
