@@ -4,8 +4,8 @@
 
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
-    DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, Instant, Metadata, MetadataExt, PathBuf,
-    ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak,
+    DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, Instant, Metadata, MetadataExt,
+    PathBuf, ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak, HashSet,
 };
 use rayon::prelude::*;
 use std::{
@@ -150,6 +150,7 @@ impl<T> DirectoryEntry for Entry<T> {
     }
 }
 
+/* 
 /// An empty struct, used as a type parameter T for `Entry`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Directory;
@@ -159,6 +160,101 @@ impl Default for Directory {
         Directory
     }
 }
+*/
+
+/// A NodeItem struct representing a Directory.
+#[derive(Debug)]
+pub struct Directory {
+    name: String,
+    children: RwLock<DirTreeHashMap<String, Arc<Node>>>,
+    files: HashSet<String>,
+}
+
+impl Directory {
+    pub fn new(name: &str) -> Self {
+        Directory {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[inline]
+    fn children(&self) -> &RwLock<DirTreeHashMap<String, Arc<Node>>> {
+        &self.children
+    }
+
+    /// Whether we have a child with the given name.
+    #[inline]
+    pub fn has_child(&self, name: &str) -> bool {
+        self.children().read().contains_key(name) || self.files.contains(name)
+    }
+
+    /// Add a child node to this item's children.
+    #[inline]
+    fn add_child(&mut self, name: String, node: Arc<Node>) {
+        self.children.write().insert(name, node);
+    }
+
+    /// Add a file name entry to the `files` HashSet.
+    #[inline]
+    fn add_file(&mut self, name: String) {
+        self.files.insert(name);
+    }
+
+    /// Get a child node by name.
+    #[inline]
+    pub fn get_child(&self, name: &str) -> Option<Arc<Node>> {
+        self.children().read().get(name).cloned()
+    }
+
+    /// Remove a child node (or a file name entry) by name.
+    fn remove_child(&mut self, name: &str) {
+        self.children.write().remove(name);
+        self.files.remove(name);
+    }
+}
+
+impl Default for Directory {
+    fn default() -> Self {
+        Directory {
+            name: String::new(),
+            children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
+            files: HashSet::new(),
+        }
+    }
+}
+
+impl Clone for Directory {
+    fn clone(&self) -> Self {
+        Directory {
+            name: self.name.clone(),
+            children: self.children.read().clone().into(),
+            files: self.files.clone(),
+        }
+    }
+}
+
+impl Hash for Directory {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        let lock = self.children.read();
+        let mut children: Vec<(&String, &Arc<Node>)> = Vec::from_iter(lock.iter());
+        children.sort_by_key(|k| k.0);
+        children.hash(state);
+    }
+}
+
+impl PartialEq for Directory {
+    fn eq(&self, other: &Self) -> bool {
+        if self.name != other.name {
+            // short circuit if the names don't match
+            return false;
+        }
+        *self.children.read() == *other.children.read()
+    }
+}
+
+impl Eq for Directory {}
 
 /// An empty struct, used as a type parameter T for `Entry`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -426,31 +522,39 @@ impl Node {
         }
     }
 
+/* 
+    fn children_itm(&self) -> &RwLock<DirTreeHashMap<String, Arc<Node>>> {
+        (*self.read()).as_dir().unwrap().1.children()
+    }
+
+*/
+    #[inline]
+    fn children(&self) -> Option<&RwLock<DirTreeHashMap<String, Arc<Node>>>> {
+        self.children.as_ref()
+    }
+
     /// Whether we have a child with the given name.
     #[inline]
     pub fn has_child(&self, name: &str) -> bool {
-        self.children
-            .as_ref()
+        self.children()
             .map_or(false, |c| c.read().contains_key(name))
     }
 
     /// Add a child node to the current node's children.
     #[inline]
     fn add_child(&self, name: String, node: Arc<Node>) {
-        self.children.as_ref().unwrap().write().insert(name, node);
+        self.children().unwrap().write().insert(name, node);
     }
 
     /// Get a child node by name.
     #[inline]
     pub fn get_child(&self, name: &str) -> Option<Arc<Node>> {
-        self.children
-            .as_ref()
-            .and_then(|c| c.read().get(name).cloned())
+        self.children().and_then(|c| c.read().get(name).cloned())
     }
 
     /// Remove a child node by name.
     fn remove_child(&self, name: &str) {
-        self.children.as_ref().unwrap().write().remove(name);
+        self.children().unwrap().write().remove(name);
     }
 
     /// Get the name of a child node and its `Arc<Node>` ptr from a reference
@@ -459,8 +563,7 @@ impl Node {
     #[inline]
     fn get_child_byref(&self, child: &Node) -> Option<(String, Arc<Node>)> {
         match self
-            .children
-            .as_ref()
+            .children()
             .unwrap()
             .read()
             .par_iter()
@@ -884,8 +987,7 @@ impl DirTree {
     fn walk(&self, node: Arc<Node>, dirs: bool, files: bool) -> Arc<RwLock<Vec<Arc<Node>>>> {
         let all_nodes: Arc<RwLock<Vec<Arc<Node>>>> = RwLock::new(Vec::new()).into();
         if node.is_traversable() {
-            node.children
-                .as_ref()
+            node.children()
                 .unwrap()
                 .read()
                 .values()
@@ -993,7 +1095,7 @@ impl DirTree {
     {
         f(node.clone());
         if node.is_traversable() {
-            for child in node.children.as_ref().unwrap().read().values() {
+            for child in node.children().unwrap().read().values() {
                 if child.is_traversable() {
                     // traverse directories first (depth-first search)
                     self.traverse_from(child.clone(), f);
@@ -1128,8 +1230,7 @@ impl Iterator for DirTreeIterator {
             }
             // Push all found children to the stack
             for child in node
-                .children
-                .as_ref()
+                .children()
                 .unwrap()
                 .read()
                 .values()
