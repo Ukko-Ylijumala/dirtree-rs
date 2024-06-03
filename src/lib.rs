@@ -4,8 +4,8 @@
 
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
-    DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, HashSet, Instant, Metadata, MetadataExt,
-    PathBuf, ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak,
+    DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, Instant, Metadata, MetadataExt, PathBuf,
+    ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -156,8 +156,7 @@ impl<T> DirectoryEntry for Entry<T> {
 #[derive(Debug)]
 pub struct Directory {
     name: String,
-    children: RwLock<DirTreeHashMap<String, Arc<Node>>>,
-    files: RwLock<HashSet<String>>,
+    children: RwLock<DirTreeHashMap<String, Option<Arc<Node>>>>,
 }
 
 impl Directory {
@@ -177,38 +176,33 @@ impl Directory {
     }
 
     #[inline]
-    fn children(&self) -> &RwLock<DirTreeHashMap<String, Arc<Node>>> {
+    fn children(&self) -> &RwLock<DirTreeHashMap<String, Option<Arc<Node>>>> {
         &self.children
     }
 
     /// Whether we have a child with the given name.
     #[inline]
     pub fn has_child(&self, name: &str) -> bool {
-        self.read().contains_key(name) || self.files.read().contains(name)
+        self.read().contains_key(name) // || self.files.read().contains(name)
     }
 
     /// Add a child node to this item's children.
     #[inline]
-    fn add_child(&self, name: String, node: Arc<Node>) {
-        self.write().insert(name, node);
-    }
-
-    /// Add a file name entry to the `files` HashSet.
-    #[inline]
-    fn add_file(&self, name: &str) {
-        self.files.write().insert(name.to_owned());
+    fn add_child(&self, name: &str, node: Option<Arc<Node>>) {
+        self.write().insert(name.to_owned(), node);
     }
 
     /// Get a child node by name.
     #[inline]
     pub fn get_child(&self, name: &str) -> Option<Arc<Node>> {
-        self.read().get(name).map(|v: &Arc<Node>| v.clone())
+        self.read()
+            .get(name)
+            .map(|v: &Option<Arc<Node>>| v.clone())?
     }
 
     /// Remove a child node (or a file name entry) by name.
     fn remove_child(&self, name: &str) {
         self.write().remove(name);
-        self.files.write().remove(name);
     }
 }
 
@@ -217,7 +211,6 @@ impl Default for Directory {
         Directory {
             name: "".to_string(),
             children: RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)),
-            files: HashSet::new().into(),
         }
     }
 }
@@ -227,7 +220,6 @@ impl Clone for Directory {
         Directory {
             name: self.name.clone(),
             children: self.children.read().clone().into(),
-            files: self.files.read().clone().into(),
         }
     }
 }
@@ -235,7 +227,7 @@ impl Clone for Directory {
 impl Hash for Directory {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.name().hash(state);
-        let mut children: Vec<(String, Arc<Node>)> = self
+        let mut children: Vec<(String, Option<Arc<Node>>)> = self
             .children
             .read()
             .iter()
@@ -258,7 +250,7 @@ impl PartialEq for Directory {
                     .children
                     .read()
                     .get(name)
-                    .map_or(false, |ov: &Arc<Node>| *child == *ov)
+                    .map_or(false, |ov: &Option<Arc<Node>>| *child == *ov)
             })
     }
 }
@@ -279,7 +271,7 @@ impl PartialOrd for Directory {
 
 // Implement Deref for Directory to allow read access through RwLock to children.
 impl Deref for Directory {
-    type Target = RwLock<DirTreeHashMap<String, Arc<Node>>>;
+    type Target = RwLock<DirTreeHashMap<String, Option<Arc<Node>>>>;
 
     fn deref(&self) -> &Self::Target {
         &self.children
@@ -564,7 +556,7 @@ impl Node {
     }
 
     #[inline]
-    pub fn children(&self) -> Option<&RwLock<DirTreeHashMap<String, Arc<Node>>>> {
+    pub fn children(&self) -> Option<&RwLock<DirTreeHashMap<String, Option<Arc<Node>>>>> {
         match self.item.get() {
             Some(item) => item.as_dir()?.children().into(),
             // catch uninitialized nodes
@@ -583,7 +575,7 @@ impl Node {
     #[inline]
     fn add_child(&self, name: &str, node: Arc<Node>) {
         self.as_dir()
-            .map(|dir: &Directory| dir.add_child(name.to_owned(), node));
+            .map(|dir: &Directory| dir.add_child(name, Some(node)));
     }
 
     /// Get a child node by name.
@@ -608,9 +600,9 @@ impl Node {
             .unwrap()
             .read()
             .par_iter()
-            .find_any(|&entry| **entry.1 == *child)
+            .find_any(|entry| entry.1 == child)
         {
-            Some((name, child)) => Some((name.to_owned(), child.clone())),
+            Some((name, child)) => Some((name.to_owned(), child.clone()?)),
             None => None,
         }
     }
@@ -663,6 +655,26 @@ impl PartialEq for Node {
     fn eq(&self, other: &Self) -> bool {
         // we could use plain `self` here due to impl Deref, but let's be explicit
         &self.item == &other.item
+    }
+}
+
+// Implement <Node> == Option<Arc<Node>> comparisons
+impl PartialEq<Option<Arc<Node>>> for Node {
+    fn eq(&self, other: &Option<Arc<Self>>) -> bool {
+        match other {
+            Some(other) => &self.item == &other.item,
+            None => false,
+        }
+    }
+}
+
+// Implement Option<Arc<Node>> == <Node> comparisons
+impl PartialEq<Node> for Option<Arc<Node>> {
+    fn eq(&self, other: &Node) -> bool {
+        match self {
+            Some(node) => &node.item == &other.item,
+            None => false,
+        }
     }
 }
 
@@ -914,7 +926,7 @@ impl DirTree {
                         // record the fact that a file exists in the directory
                         // NOTE: total node count is not incremented in this case
                         drop(new);
-                        current.as_dir().map(|dir| dir.add_file(part));
+                        current.as_dir().map(|dir| dir.add_child(part, None));
                         self.counts.files.fetch_add(1, Relaxed);
                         return;
                     }
@@ -1052,18 +1064,22 @@ impl DirTree {
                 .read()
                 .values()
                 .par_bridge()
-                .for_each(|child: &Arc<Node>| {
-                    let mut nodes_shard: Vec<Arc<Node>> = Vec::new();
-                    if dirs && child.node_t.is_dir() {
-                        nodes_shard.push(child.clone());
-                    } else if files && child.node_t.is_file() {
-                        nodes_shard.push(child.clone());
+                .for_each(|c: &Option<Arc<Node>>| match c {
+                    None => return,
+                    Some(child) => {
+                        let mut nodes_shard: Vec<Arc<Node>> = Vec::new();
+                        if dirs && child.node_t.is_dir() {
+                            nodes_shard.push(child.clone());
+                        } else if files && child.node_t.is_file() {
+                            nodes_shard.push(child.clone());
+                        }
+                        if child.is_traversable() {
+                            nodes_shard.extend(
+                                self.walk(child.clone(), dirs, files).lock().iter().cloned(),
+                            );
+                        }
+                        result.lock().extend(nodes_shard);
                     }
-                    if child.is_traversable() {
-                        nodes_shard
-                            .extend(self.walk(child.clone(), dirs, files).lock().iter().cloned());
-                    }
-                    result.lock().extend(nodes_shard);
                 });
         }
         result
@@ -1177,12 +1193,17 @@ impl DirTree {
                 .read()
                 .values()
                 .par_bridge()
-                .for_each(|child: &Arc<Node>| {
-                    if child.is_traversable() {
-                        // traverse directories first (depth-first search)
-                        self.traverse_par(&child, f);
-                    } else {
-                        f(child.clone());
+                .for_each(|c: &Option<Arc<Node>>| {
+                    match c {
+                        None => return,
+                        Some(child) => {
+                            if child.is_traversable() {
+                                // traverse directories first (depth-first search)
+                                self.traverse_par(&child, f);
+                            } else {
+                                f(child.clone());
+                            }
+                        }
                     }
                 });
         }
@@ -1200,12 +1221,17 @@ impl DirTree {
                 .unwrap()
                 .read()
                 .values()
-                .for_each(|child: &Arc<Node>| {
-                    if child.is_traversable() {
-                        // traverse directories first (depth-first search)
-                        self.traverse_from(&child, f);
-                    } else {
-                        f(child.clone());
+                .for_each(|c: &Option<Arc<Node>>| {
+                    match c {
+                        None => return,
+                        Some(child) => {
+                            if child.is_traversable() {
+                                // traverse directories first (depth-first search)
+                                self.traverse_from(&child, f);
+                            } else {
+                                f(child.clone());
+                            }
+                        }
                     }
                 });
         }
@@ -1372,13 +1398,18 @@ impl Iterator for DirTreeIterator {
                 .unwrap()
                 .read()
                 .values()
-                .for_each(|child: &Arc<Node>| {
-                    if child.is_traversable() {
-                        // push directories to the front of the queue...
-                        self.0.push_front(child.clone());
-                    } else {
-                        // ...and files to the back
-                        self.0.push_back(child.clone());
+                .for_each(|c: &Option<Arc<Node>>| {
+                    match c {
+                        None => return,
+                        Some(child) => {
+                            if child.is_traversable() {
+                                // push directories to the front of the queue...
+                                self.0.push_front(child.clone());
+                            } else {
+                                // ...and files to the back
+                                self.0.push_back(child.clone());
+                            }
+                        }
                     }
                 });
             node
