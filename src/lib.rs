@@ -13,6 +13,7 @@ use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
+    os::unix::fs::DirEntryExt,
     sync::OnceLock,
 };
 
@@ -112,29 +113,34 @@ impl AsRef<Data> for dyn DirectoryEntry {
 /// ```rust
 /// use statter::tree::{Directory, Entry, File};
 /// use std::fs::{metadata, Metadata};
+/// use std::os::unix::fs::MetadataExt;
 /// use std::path::PathBuf;
 ///
 /// let root: PathBuf = PathBuf::from("/etc");
 /// let pwfile: PathBuf = root.join("passwd");
 /// let pwmeta: Metadata = metadata(&pwfile).ok().expect("Metadata should be returned");
 ///
-/// let d = Entry::<Directory>::new(&root.join("systemd"), &None).unwrap();
-/// let f = Entry::<File>::new(&pwfile, &Some(pwmeta)).unwrap();
+/// let d = Entry::<Directory>::new(&root.join("systemd"), None).unwrap();
+/// let f = Entry::<File>::new(&pwfile, Some(pwmeta.ino())).unwrap();
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Entry<T>(Data, T);
 
 impl<T: Default> Entry<T> {
-    pub fn new(path: &PathBuf, meta: &Option<Metadata>) -> Result<Self, Error> {
-        match meta.clone().or_else(|| metadata(path).ok()) {
-            Some(m) => Ok(Self(
-                Data {
-                    inode: m.ino(),
-                    when: SecondsSinceEpoch::new(),
-                },
-                Default::default(), // provides the type parameter T
-            )),
-            None => Err(Error::new(ErrorKind::NotFound, META_FAIL)),
-        }
+    pub fn new(path: &PathBuf, inode: Option<u64>) -> Result<Self, Error> {
+        let inode: u64 = match inode {
+            Some(i) => i,
+            None => match metadata(path) {
+                Ok(meta) => meta.ino(),
+                Err(_) => return Err(Error::new(ErrorKind::NotFound, META_FAIL)),
+            },
+        };
+        Ok(Self(
+            Data {
+                inode,
+                when: SecondsSinceEpoch::new(),
+            },
+            Default::default(), // provides the type parameter T
+        ))
     }
 }
 
@@ -302,7 +308,7 @@ pub enum NodeType {
     Root,
     Directory,
     File,
-    /// Signifies a node with a name but no data.
+    /// Signifies an entry with a name, but for which no Node should be created.
     Name,
     #[default]
     Uninitialized,
@@ -843,34 +849,37 @@ impl DirTree {
     #[inline]
     fn process_entry(&self, entry: DirEntry, state: &ScanState, recursive: bool) {
         let path: PathBuf = entry.path();
-        if let Ok(meta) = entry.metadata() {
-            if self.debug {
-                eprintln!("  entry: {} ", path.display())
-            };
-
-            if meta.is_dir() {
-                self.insert(&path, NodeType::Directory, Some(meta));
-                state.num_d.inc1();
-                if recursive {
-                    match state.parallel && !state.sync {
-                        true => self.populate_par(&path, recursive, state),
-                        false => self.populate(&path, recursive, state),
+        match entry.file_type() {
+            Ok(entry_t) => {
+                if self.debug {
+                    eprintln!("  entry: {} ", path.display())
+                };
+                if entry_t.is_dir() {
+                    self.insert(&path, NodeType::Directory, Some(entry.ino()));
+                    state.num_d.inc1();
+                    if recursive {
+                        match state.parallel && !state.sync {
+                            true => self.populate_par(&path, recursive, state),
+                            false => self.populate(&path, recursive, state),
+                        }
                     }
+                } else if entry_t.is_file() {
+                    if state.size {
+                        //FIXME: add error handling
+                        state.fsize.fetch_add(entry.metadata().ok().unwrap().len());
+                    }
+                    if self.dirsonly {
+                        self.insert(&path, NodeType::Name, None);
+                    } else {
+                        self.insert(&path, NodeType::File, Some(entry.ino()));
+                    }
+                    state.num_f.inc1();
                 }
-            } else if meta.is_file() {
-                if state.verbose {
-                    state.fsize.fetch_add(meta.len());
-                }
-                if self.dirsonly {
-                    self.insert(&path, NodeType::Name, None);
-                } else {
-                    self.insert(&path, NodeType::File, Some(meta));
-                }
-                state.num_f.inc1();
             }
-        } else {
-            if self.debug {
-                eprintln!("Error reading metadata: {}", path.display());
+            Err(e) => {
+                if self.debug {
+                    eprintln!("Error with {}: {e}", path.display());
+                }
             }
         }
     }
@@ -879,7 +888,7 @@ impl DirTree {
 
     /// Inserts a path into the trie. The path must be an absolute filesystem path.
     /// The path is split on forward slash ("/") and the first empty string discarded.
-    pub fn insert(&self, path: &PathBuf, node_t: NodeType, meta: Option<Metadata>) {
+    pub fn insert(&self, path: &PathBuf, node_t: NodeType, inode: Option<u64>) {
         let mut current: Arc<Node> = self.root();
         let p_unicode = path.to_string_lossy();
         let parts: Vec<&str> = path_parts_vec(&p_unicode);
@@ -916,7 +925,7 @@ impl DirTree {
                 } else {
                     new.node_t = node_t.clone();
                     if node_t == NodeType::Directory {
-                        let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, &meta).unwrap());
+                        let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, inode).unwrap());
                         itm.set_dir_name(part);
                         new.item.set(itm).ok();
                         self.counts.nodes.fetch_add(1, Relaxed);
@@ -952,7 +961,7 @@ impl DirTree {
 
         match node_t {
             NodeType::Directory => {
-                let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, &meta).unwrap());
+                let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, inode).unwrap());
                 itm.set_dir_name(&path.file_name().unwrap().to_string_lossy());
                 current.item.set(itm).ok();
                 self.counts.nodes.fetch_add(1, Relaxed);
@@ -961,7 +970,7 @@ impl DirTree {
             NodeType::File => {
                 current
                     .item
-                    .set(NodeItem::File(Entry::<File>::new(path, &meta).unwrap()))
+                    .set(NodeItem::File(Entry::<File>::new(path, inode).unwrap()))
                     .ok();
                 self.counts.nodes.fetch_add(1, Relaxed);
                 self.counts.files.fetch_add(1, Relaxed);
