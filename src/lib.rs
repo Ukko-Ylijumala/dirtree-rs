@@ -310,6 +310,8 @@ pub enum NodeType {
     Root,
     Directory,
     File,
+    /// Signifies a node with a name but no data.
+    Name,
     #[default]
     Uninitialized,
 }
@@ -847,7 +849,11 @@ impl DirTree {
                 if state.verbose {
                     state.fsize.fetch_add(meta.len());
                 }
-                self.insert(&path, NodeType::File, Some(meta));
+                if self.dirsonly {
+                    self.insert(&path, NodeType::Name, None);
+                } else {
+                    self.insert(&path, NodeType::File, Some(meta));
+                }
                 state.num_f.inc1();
             }
         } else {
@@ -903,7 +909,7 @@ impl DirTree {
                         new.item.set(itm).ok();
                         self.counts.nodes.fetch_add(1, Relaxed);
                         self.counts.dirs.fetch_add(1, Relaxed);
-                    } else if node_t == NodeType::File && self.dirsonly {
+                    } else if node_t == NodeType::Name {
                         // optimization: don't create file Nodes at all, just
                         // record the fact that a file exists in the directory
                         // NOTE: total node count is not incremented in this case
