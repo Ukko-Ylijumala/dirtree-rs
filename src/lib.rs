@@ -1,6 +1,7 @@
 // Copyright (c) 2024 Mikko Tanner. All rights reserved.
 
-#![allow(dead_code)]
+// non_snake_case added due to `instrument` macro causing a false positive for `dtor`
+#![allow(dead_code, non_snake_case)]
 
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
@@ -16,6 +17,7 @@ use std::{
     os::unix::fs::DirEntryExt,
     sync::OnceLock,
 };
+use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
 
 const PATH_SEP: char = '/';
 const META_FAIL: &str = "Failed to get metadata";
@@ -76,15 +78,22 @@ trait DirectoryEntry {
         };
     }
 
+    #[instrument(level = "debug", skip(self))]
     fn rescan(&mut self, path: &PathBuf) -> Result<Metadata, Error> {
         let meta: Metadata = match self.stat(path) {
             Some(m) => m,
             // failed to get metadata, likely deleted in the meantime
-            None => return Err(Error::new(ErrorKind::NotFound, META_FAIL)),
+            None => {
+                let mut msg: String = String::from(META_FAIL);
+                msg.push_str(format!(": {}", path.display()).as_str());
+                error!(msg);
+                return Err(Error::new(ErrorKind::NotFound, META_FAIL));
+            }
         };
         if self.data().inode != meta.ino() {
             // inode changed, file/dir was replaced and we're out of sync
             // this case must be handled by the caller
+            error!("Inode changed: {} ({} -> {})", path.display(), self.data().inode, meta.ino());
             return Err(Error::new(ErrorKind::AlreadyExists, "Inode changed"));
         }
         self.data_mut().when = SecondsSinceEpoch::new();
@@ -126,12 +135,18 @@ impl AsRef<Data> for dyn DirectoryEntry {
 pub struct Entry<T>(Data, T);
 
 impl<T: Default> Entry<T> {
+    #[instrument(level = "trace")]
     pub fn new(path: &PathBuf, inode: Option<u64>) -> Result<Self, Error> {
         let inode: u64 = match inode {
             Some(i) => i,
             None => match metadata(path) {
                 Ok(meta) => meta.ino(),
-                Err(_) => return Err(Error::new(ErrorKind::NotFound, META_FAIL)),
+                Err(_) => {
+                    let mut msg: String = String::from(META_FAIL);
+                    msg.push_str(format!(": {}", path.display()).as_str());
+                    error!(msg);
+                    return Err(Error::new(ErrorKind::NotFound, META_FAIL));
+                }
             },
         };
         Ok(Self(
@@ -166,6 +181,7 @@ pub struct Directory {
 }
 
 impl Directory {
+    #[instrument(level = "trace")]
     pub fn new(name: &str) -> Self {
         Directory {
             name: name.to_owned(),
@@ -193,6 +209,7 @@ impl Directory {
     }
 
     /// Add a child node to this item's children.
+    #[instrument(level = "trace", skip(self))]
     #[inline]
     fn add_child(&self, name: &str, node: Option<Arc<Node>>) {
         self.write().insert(name.to_owned(), node);
@@ -207,6 +224,7 @@ impl Directory {
     }
 
     /// Remove a child node (or a file name entry) by name.
+    #[instrument(level = "trace", skip(self))]
     fn remove_child(&self, name: &str) {
         self.write().remove(name);
     }
@@ -460,6 +478,7 @@ pub struct Node {
 impl Node {
     /// Returns a new node with the given item.
     /// NOTE: children are initialized only for containers (directories and root).
+    #[instrument(level = "debug")]
     pub fn new(item: NodeItem, parent: Option<Arc<Node>>) -> Self {
         let node_t: NodeType = match item {
             NodeItem::Root(_) => NodeType::Root,
@@ -556,7 +575,9 @@ impl Node {
                 if self.node_t == NodeType::Root {
                     return Ok("/".to_string());
                 }
-                Err(Error::new(ErrorKind::NotFound, "Stale parent reference"))
+                let msg: &str = "Stale parent reference";
+                error!(node = ?self, msg);
+                Err(Error::new(ErrorKind::NotFound, msg))
             }
         }
     }
@@ -601,16 +622,18 @@ impl Node {
     /// its own name and reference in the parent node's `children` HashMap.
     #[inline]
     fn get_child_byref(&self, child: &Node) -> Option<(String, Arc<Node>)> {
-        match self
-            .children()
-            .unwrap()
-            .read()
-            .par_iter()
-            .find_any(|entry| entry.1 == child)
-        {
-            Some((name, child)) => Some((name.to_owned(), child.clone()?)),
-            None => None,
-        }
+        trace_span!("get_child_byref", ?child).in_scope(|| {
+            match self
+                .children()
+                .unwrap()
+                .read()
+                .par_iter()
+                .find_any(|entry| entry.1 == child)
+            {
+                Some((name, child)) => Some((name.to_owned(), child.clone()?)),
+                None => None,
+            }
+        })
     }
 }
 
@@ -734,7 +757,6 @@ pub struct DirTree {
     created: SecondsSinceEpoch,
     root: Arc<Node>,
     dirsonly: bool,
-    debug: bool,
 }
 
 impl DirTree {
@@ -767,10 +789,9 @@ impl DirTree {
     }
 
     /// Creates a new empty directory tree (internally a Trie structure).
-    pub fn new(debug: bool, dirsonly: bool) -> Self {
+    pub fn new(dirsonly: bool) -> Self {
         DirTree {
             root: Node::new(NodeItem::Root(Directory::new("ROOT")), None).into(),
-            debug,
             dirsonly,
             ..Default::default()
         }
@@ -783,8 +804,9 @@ impl DirTree {
     /// and inserting each found path into the tree.
     ///
     /// If `dirsonly` is true, only directory items are fully initialized during creation.
+    #[instrument(skip(state, recursive, dirsonly))]
     pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, dirsonly: bool) -> Self {
-        let mut tree: DirTree = Self::new(state.debug, dirsonly);
+        let mut tree: DirTree = Self::new(dirsonly);
         tree.set_from(PathBuf::from(path));
         // Technically we've not yet scanned the root directory, but this place
         // is the most logical one to do the increment to keep the counter in
@@ -792,9 +814,7 @@ impl DirTree {
         // productive. Besides, this counter is only for display for now.
         state.num_d.inc1();
 
-        if state.debug {
-            eprintln!("<TREE> : {:?}", tree)
-        };
+        debug!(target: "TREE", "{tree:?}");
 
         if recursive {
             match state.parallel && !state.sync {
@@ -807,6 +827,7 @@ impl DirTree {
 
     /// Populate a leaf node in the trie with the contents of a directory.
     /// NOTE: single threaded, potentially slow with large directory trees.
+    #[instrument(level = "debug", skip(self, state, recursive))]
     #[inline]
     pub fn populate(&self, path: &PathBuf, recursive: bool, state: &ScanState) {
         match self.get_entries(path) {
@@ -818,6 +839,7 @@ impl DirTree {
     }
 
     /// Parallel version of `populate()` using Rayon's `par_bridge()`.
+    #[instrument(level = "debug", skip(self, state, recursive))]
     #[inline]
     pub fn populate_par(&self, path: &PathBuf, recursive: bool, state: &ScanState) {
         match self.get_entries(path) {
@@ -836,9 +858,7 @@ impl DirTree {
     /// Get the entries in a directory as a `ReadDir` iterator.
     #[inline]
     fn get_entries(&self, path: &PathBuf) -> Option<ReadDir> {
-        if self.debug {
-            eprintln!(" -> DIR: {}", path.display())
-        };
+        trace!(target: "get_entries", "{}", path.display());
         match path.read_dir() {
             Ok(entries) => Some(entries),
             Err(_) => None,
@@ -846,14 +866,13 @@ impl DirTree {
     }
 
     /// Process a directory entry and insert it into the trie.
+    #[instrument(level = "trace", skip_all)]
     #[inline]
     fn process_entry(&self, entry: DirEntry, state: &ScanState, recursive: bool) {
         let path: PathBuf = entry.path();
         match entry.file_type() {
             Ok(entry_t) => {
-                if self.debug {
-                    eprintln!("  entry: {} ", path.display())
-                };
+                trace!(target: "DirEntry", "{}", path.display());
                 if entry_t.is_dir() {
                     self.insert(&path, NodeType::Directory, Some(entry.ino()));
                     state.num_d.inc1();
@@ -877,9 +896,7 @@ impl DirTree {
                 }
             }
             Err(e) => {
-                if self.debug {
-                    eprintln!("Error with {}: {e}", path.display());
-                }
+                debug!("Error with {}: {e}", path.display());
             }
         }
     }
@@ -888,6 +905,7 @@ impl DirTree {
 
     /// Inserts a path into the trie. The path must be an absolute filesystem path.
     /// The path is split on forward slash ("/") and the first empty string discarded.
+    #[instrument(level = "debug", skip(self))]
     pub fn insert(&self, path: &PathBuf, node_t: NodeType, inode: Option<u64>) {
         let mut current: Arc<Node> = self.root();
         let p_unicode = path.to_string_lossy();
@@ -900,17 +918,13 @@ impl DirTree {
         for part in parts {
             depth += 1;
             if !current.has_child(part) {
-                if self.debug {
-                    eprintln!("<NODE> : {:?}", &current);
-                }
+                trace!(target: "CURRENT_NODE", "{}", &current.name().ok().unwrap());
                 // we don't have an item for this node yet, hence NodeItem::None
                 // also node_t must be set here since later the Node will be in
                 // an Arc and we can't change that field anymore
                 let mut new: Node = Node::new(NodeItem::None, Some(current.clone()));
                 if depth < len {
-                    if self.debug {
-                        eprintln!("\n<---- {part} ----> depth: {depth} len: {len}");
-                    }
+                    trace!(target: "intermediate", "{part} --> depth: {depth}/{len}");
                     // must be a container (directory) so let's create the basic structure
                     new.node_t = NodeType::Directory;
                     let mut itm = NodeItem::Dir(Entry::<Directory>::default());
@@ -937,18 +951,18 @@ impl DirTree {
                         drop(new);
                         current.as_dir().map(|dir| dir.add_child(part, None));
                         self.counts.files.fetch_add(1, Relaxed);
+                        debug!(target: "FILENAME", "{part} (dirsonly)");
                         return;
                     }
                 }
-                if self.debug {
-                    eprintln!("  + new: {part} ::: {:?}", &new);
-                }
+                debug!(target: "CREATED_NODE", "{part} ::: {:?}", &new);
                 current.add_child(part, new.into());
             }
             current = match current.get_child(part) {
                 Some(node) => node,
                 None => {
-                    panic!("\n*** Child {part} missing from HashMap: {:?}\n\n{:?}", current, self)
+                    error!("Child {part} missing from HashMap: {current:?}");
+                    return; // should never happen
                 }
             }
         }
@@ -956,6 +970,7 @@ impl DirTree {
         if !matches!(current.item.get(), None) {
             // for now we don't overwrite existing nodes, but
             // this may change in the future to allow for updates
+            trace!(target: "SKIP_EXISTING", "{:?} ({:?}) ::: {:?}", current.name().ok().unwrap(), current.node_t, current.path());
             return;
         }
 
@@ -977,10 +992,7 @@ impl DirTree {
             }
             _ => return,
         };
-
-        if self.debug {
-            eprintln!(" ++ INS: {:?}", current)
-        };
+        debug!(target: "INSERT_NODE", "{current:?}");
     }
 
     /// Remove a Node (or a leaf) from the trie. Expects an absolute path.
@@ -989,19 +1001,20 @@ impl DirTree {
     /// if the path was not found. The root node cannot be removed.
     ///
     /// WARNING: implementation is WIP and may yet contain bugs.
+    #[instrument(level = "debug", skip(self))]
     pub fn remove(&self, path: &str) -> Result<Option<(u32, u32, u32)>, Error> {
         match self.get_node(path) {
             Some(node) => {
                 if node.node_t == NodeType::Root {
-                    return Err(Error::new(ErrorKind::InvalidInput, "Cannot remove root node"));
+                    let msg: &str = "Cannot remove root node";
+                    error!(msg);
+                    return Err(Error::new(ErrorKind::InvalidInput, msg));
                 };
 
                 match node.parent() {
                     Some(parent) => {
                         let (nodes, dirs, files) = self.count_from(node.clone());
-                        if self.debug {
-                            eprintln!("*** Removing: {}", node.path().display());
-                        }
+                        debug!(target: "REMOVE_NODE", "{}", node.path().display());
                         let (name, c) = parent.get_child_byref(&node).unwrap();
                         assert_eq!(node, c, "Node should be the same as the one in parent");
                         parent.remove_child(&name);
@@ -1013,18 +1026,14 @@ impl DirTree {
 
                     None => {
                         let msg: String = format!("Stale parent reference: {:?}", node.path());
-                        if self.debug {
-                            eprintln!("ERROR: {msg}");
-                        };
+                        error!(msg);
                         return Err(Error::new(ErrorKind::NotFound, msg));
                     }
                 }
             }
 
             None => {
-                if self.debug {
-                    eprintln!("WARN: node not found: {path}")
-                };
+                warn!("Node not found: {path}");
                 return Ok(None);
             }
         }
@@ -1097,23 +1106,24 @@ impl DirTree {
     /// Walks the full tree and returns a Vec of all Nodes. WARNING: this can be
     /// slow and memory intensive for large trees. Prefer using `DirTree::iter()`.
     pub fn nodes(&self) -> Vec<Arc<Node>> {
-        self.walk(self.root(), true, true).lock().to_vec()
+        trace_span!("walk:nodes").in_scope(|| self.walk(self.root(), true, true).lock().to_vec())
     }
 
     /// Returns a Vec of all `Directory` nodes in the tree.
     pub fn dirs(&self) -> Vec<Arc<Node>> {
-        self.walk(self.root(), true, false).lock().to_vec()
+        trace_span!("walk:dirs").in_scope(|| self.walk(self.root(), true, false).lock().to_vec())
     }
 
     /// Returns a Vec of all `File` nodes in the tree.
     pub fn files(&self) -> Vec<Arc<Node>> {
-        self.walk(self.root(), false, true).lock().to_vec()
+        trace_span!("walk:files").in_scope(|| self.walk(self.root(), false, true).lock().to_vec())
     }
 
     /* --------------------------------- */
 
     /// Creates an iterator to iterate through the tree starting from a Node.
     /// The iterator is depth-first and includes the starting Node.
+    #[instrument(level = "trace", skip(self))]
     pub fn iter_from(&self, node: Arc<Node>) -> DirTreeIterator {
         DirTreeIterator(VecDeque::from(vec![node]))
     }
@@ -1195,6 +1205,7 @@ impl DirTree {
     where
         F: Fn(Arc<Node>) + Send + Sync,
     {
+        trace!(target: "traverse_par", "{}", node.path().display());
         f(node.clone());
         if node.is_traversable() && node.children().is_some() {
             node.children()
@@ -1224,6 +1235,7 @@ impl DirTree {
     where
         F: FnMut(Arc<Node>),
     {
+        trace!(target: "traverse_from", "{}", node.path().display());
         f(node.clone());
         if node.is_traversable() && node.children().is_some() {
             node.children()
@@ -1300,13 +1312,13 @@ impl DirTree {
 
     /// Print the full contents of the tree recursively. This is a debugging function.
     pub fn print_debug(&self) {
-        eprintln!("\n{:#?}\n", self);
+        eprintln!("\n{:?}\n", self);
         self.traverse(|node: Arc<Node>| {
             if node.node_t.has_data() {
-                if self.debug {
-                    println!("{:?}", &node.construct_path());
+                if tracing::level_enabled!(Level::DEBUG) {
+                    debug!("{:?}", &node.construct_path());
                 } else {
-                    println!("{}", &node.path().to_string_lossy());
+                    info!("{}", &node.path().to_string_lossy());
                 }
             }
         });
@@ -1399,6 +1411,7 @@ impl Iterator for DirTreeIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.pop_front().map(|node: Arc<Node>| {
+            trace!(target: "DirTreeIterator", "{}", node.path().display());
             if node.children().is_none() {
                 return node;
             }
@@ -1481,7 +1494,7 @@ mod tests {
     #[test]
     fn test_create_empty_tree() {
         unsafe { setup_tests() }
-        let tree: DirTree = DirTree::new(true, false);
+        let tree: DirTree = DirTree::new(false);
         let (nodes, dirs, files, depth) = counts(&tree);
 
         assert_eq!(tree.root.node_t, NodeType::Root);
@@ -1500,7 +1513,7 @@ mod tests {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
 
-        let mut tree: DirTree = DirTree::new(true, false);
+        let mut tree: DirTree = DirTree::new(false);
         tree.set_from(PathBuf::from(path));
         let (nodes, dirs, files, depth) = counts(&tree);
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
