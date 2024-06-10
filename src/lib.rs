@@ -8,6 +8,7 @@ use super::{
     DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, Instant, Metadata, MetadataExt, PathBuf,
     ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak,
 };
+use crate::args::FileMode;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
@@ -120,7 +121,7 @@ impl AsRef<Data> for dyn DirectoryEntry {
 ///
 /// You can use the struct like this:
 /// ```rust
-/// use statter::tree::{Directory, Entry, File};
+/// use statter::tree::{Directory, Entry, FileEntry};
 /// use std::fs::{metadata, Metadata};
 /// use std::os::unix::fs::MetadataExt;
 /// use std::path::PathBuf;
@@ -130,7 +131,7 @@ impl AsRef<Data> for dyn DirectoryEntry {
 /// let pwmeta: Metadata = metadata(&pwfile).ok().expect("Metadata should be returned");
 ///
 /// let d = Entry::<Directory>::new(&root.join("systemd"), None).unwrap();
-/// let f = Entry::<File>::new(&pwfile, Some(pwmeta.ino())).unwrap();
+/// let f = Entry::<FileEntry>::new(&pwfile, Some(pwmeta.ino())).unwrap();
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Entry<T>(Data, T);
 
@@ -756,7 +757,7 @@ pub struct DirTree {
     counts: Arc<Counts>,
     created: SecondsSinceEpoch,
     root: Arc<Node>,
-    dirsonly: bool,
+    filemode: FileMode,
 }
 
 impl DirTree {
@@ -789,10 +790,10 @@ impl DirTree {
     }
 
     /// Creates a new empty directory tree (internally a Trie structure).
-    pub fn new(dirsonly: bool) -> Self {
+    pub fn new(filemode: FileMode) -> Self {
         DirTree {
             root: Node::new(NodeItem::Root(Directory::new("ROOT")), None).into(),
-            dirsonly,
+            filemode,
             ..Default::default()
         }
     }
@@ -804,9 +805,9 @@ impl DirTree {
     /// and inserting each found path into the tree.
     ///
     /// If `dirsonly` is true, only directory items are fully initialized during creation.
-    #[instrument(skip(state, recursive, dirsonly))]
-    pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, dirsonly: bool) -> Self {
-        let mut tree: DirTree = Self::new(dirsonly);
+    #[instrument(skip(state, recursive))]
+    pub fn new_from_path(path: &str, state: &ScanState, recursive: bool) -> Self {
+        let mut tree: DirTree = Self::new(state.filemode);
         tree.set_from(PathBuf::from(path));
         // Technically we've not yet scanned the root directory, but this place
         // is the most logical one to do the increment to keep the counter in
@@ -883,13 +884,13 @@ impl DirTree {
                         }
                     }
                 } else if entry_t.is_file() {
-                    if state.size {
+                    if self.filemode.is_with_size() {
                         //FIXME: add error handling
                         state.fsize.fetch_add(entry.metadata().ok().unwrap().len());
                     }
-                    if self.dirsonly {
+                    if self.filemode.is_name() {
                         self.insert(&path, NodeType::Name, None);
-                    } else {
+                    } else if self.filemode.is_node() {
                         self.insert(&path, NodeType::File, Some(entry.ino()));
                     }
                     state.num_f.inc1();
@@ -1343,7 +1344,7 @@ impl DirTree {
         let want_d: u32 = self.counts.dirs.load(Relaxed);
         let want_f: u32 = self.counts.files.load(Relaxed);
         let d_o: &str = "[dirsonly]";
-        if self.dirsonly {
+        if self.filemode == FileMode::Name {
             assert_eq!(want_n, want_d, "master node count != dirs {d_o}")
         } else {
             assert_eq!(want_n, want_d + want_f, "master node count != dirs+files")
@@ -1354,7 +1355,7 @@ impl DirTree {
         let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.count_from(self.root());
         let n: &str = "count_from()";
-        if self.dirsonly {
+        if self.filemode == FileMode::Name {
             assert_eq!(nodes, dirs, "{n} node count != dirs {d_o}");
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
@@ -1370,7 +1371,7 @@ impl DirTree {
         let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.iter_count();
         let n: &str = "iter_count()";
-        if self.dirsonly {
+        if self.filemode == FileMode::Name {
             assert_eq!(nodes, dirs, "{n} node count != dirs {d_o}");
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
@@ -1393,7 +1394,7 @@ impl DirTree {
         eprintln!(" --> {n} files = {:#?}", start.elapsed());
 
         assert_eq!(want_d, dirs, "{n} dirs do not match");
-        if self.dirsonly {
+        if self.filemode == FileMode::Name {
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
             assert_eq!(want_f, files, "{n} files do not match");
@@ -1471,7 +1472,10 @@ mod tests {
             return;
         }
         CONF = Some(Config::default());
-        STATE = Some(ScanState::default());
+        STATE = Some(ScanState {
+            filemode: FileMode::Node,
+            ..Default::default()
+        });
         TESTDIR = Some(create_test_dirs_for_tree_test());
         *init = true;
     }
@@ -1494,7 +1498,7 @@ mod tests {
     #[test]
     fn test_create_empty_tree() {
         unsafe { setup_tests() }
-        let tree: DirTree = DirTree::new(false);
+        let tree: DirTree = DirTree::new(FileMode::Unspecified);
         let (nodes, dirs, files, depth) = counts(&tree);
 
         assert_eq!(tree.root.node_t, NodeType::Root);
@@ -1513,7 +1517,7 @@ mod tests {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
 
-        let mut tree: DirTree = DirTree::new(false);
+        let mut tree: DirTree = DirTree::new(FileMode::Node);
         tree.set_from(PathBuf::from(path));
         let (nodes, dirs, files, depth) = counts(&tree);
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
@@ -1685,7 +1689,7 @@ mod tests {
         let (path, state) = unsafe {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
-        let tree: DirTree = DirTree::new_from_path(path, state, recursive, false);
+        let tree: DirTree = DirTree::new_from_path(path, state, recursive);
         assert_eq!(tree.root.node_t, NodeType::Root);
         assert_eq!(*tree.from(), PathBuf::from(path));
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
