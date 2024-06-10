@@ -311,11 +311,11 @@ impl DerefMut for Directory {
 
 /// An empty struct, used as a type parameter T for `Entry`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct File;
+pub struct FileEntry;
 
-impl Default for File {
+impl Default for FileEntry {
     fn default() -> Self {
-        File
+        FileEntry
     }
 }
 
@@ -373,7 +373,7 @@ impl NodeType {
 pub enum NodeItem {
     Root(Directory),
     Dir(Entry<Directory>),
-    File(Entry<File>),
+    File(Entry<FileEntry>),
     #[default]
     None,
 }
@@ -432,8 +432,8 @@ impl NodeItem {
         }
     }
 
-    /// Returns a reference to the inner [`File`] if the node item is [`File`].
-    pub fn as_file(&self) -> Option<&File> {
+    /// Returns a reference to the inner [`FileEntry`] if the node item is [`File`].
+    pub fn as_file(&self) -> Option<&FileEntry> {
         if let Self::File(v) = self {
             Some(&v.1)
         } else {
@@ -459,8 +459,8 @@ impl From<Entry<Directory>> for NodeItem {
 }
 
 // Implement `From` for converting `File` into `NodeItem`.
-impl From<Entry<File>> for NodeItem {
-    fn from(v: Entry<File>) -> Self {
+impl From<Entry<FileEntry>> for NodeItem {
+    fn from(v: Entry<FileEntry>) -> Self {
         Self::File(v)
     }
 }
@@ -985,7 +985,7 @@ impl DirTree {
             NodeType::File => {
                 current
                     .item
-                    .set(NodeItem::File(Entry::<File>::new(path, inode).unwrap()))
+                    .set(NodeItem::File(Entry::<FileEntry>::new(path, inode).unwrap()))
                     .ok();
                 self.counts.nodes.fetch_add(1, Relaxed);
                 self.counts.files.fetch_add(1, Relaxed);
@@ -1140,7 +1140,7 @@ impl DirTree {
     }
 
     /// An iterator over all `File` items in the tree.
-    pub fn iter_files(&self) -> impl Iterator<Item = File> {
+    pub fn iter_files(&self) -> impl Iterator<Item = FileEntry> {
         self.iter()
             .filter_map(|node: Arc<Node>| node.as_file().cloned())
     }
