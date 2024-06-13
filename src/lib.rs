@@ -5,10 +5,11 @@
 
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
-    DirEntry, DirTreeHashMap, DirTreeXxh3Hasher, HashMap, Instant, Metadata, MetadataExt, PathBuf,
-    ReadDir, Relaxed, RwLock, ScanState, SecondsSinceEpoch, VecDeque, Weak,
+    DirEntry, HashMap, Instant, Metadata, MetadataExt, PathBuf, ReadDir, Relaxed, RwLock,
+    ScanState, SecondsSinceEpoch, VecDeque, Weak,
 };
 use crate::args::FileMode;
+use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
