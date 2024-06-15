@@ -6,7 +6,7 @@
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, Deref, DerefMut,
     DirEntry, HashMap, Instant, Metadata, MetadataExt, PathBuf, ReadDir, Relaxed, RwLock,
-    ScanState, SecondsSinceEpoch, VecDeque, Weak,
+    ScanState, SecondsSinceEpoch, SegQueue, VecDeque, Weak,
 };
 use crate::args::FileMode;
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
@@ -18,6 +18,7 @@ use std::{
     io::{Error, ErrorKind},
     os::unix::fs::DirEntryExt,
     sync::OnceLock,
+    thread,
 };
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
 
@@ -725,6 +726,53 @@ impl PartialEq<Node> for NodeItem {
 
 /* ######################################################################### */
 
+/// The current operation being performed on the tree.
+#[derive(Default, Debug, Clone, Eq, PartialEq, Hash)]
+pub enum TreeOperation {
+    #[default]
+    None,
+    /// The tree is being built.
+    Build,
+    /// A node (or leaf) is being inserted into the tree.
+    Insert,
+    /// A node (or leaf) is being removed from the tree.
+    Remove,
+    /// The tree is being updated.
+    Update,
+    /// A background scan is running for the tree.
+    Scan,
+    /// The tree is being serialized. TODO.
+    Serialize,
+    /// The tree is being deserialized. TODO.
+    Deserialize,
+}
+
+/// The current state of the tree.
+#[derive(Default, Debug, Clone, Hash)]
+pub enum TreeState {
+    /// Initial state, no nodes.
+    #[default]
+    Uninitialized,
+    /// The tree is ready for use.
+    Ready,
+    /// The tree is being actively used.
+    Active(TreeOperation),
+    /// The tree is in an inconsistent state.
+    Inconsistent(Description),
+    /// The tree is in an error state.
+    Error(Description),
+    /// The tree is being torn down.
+    Quitting,
+}
+
+/// A description of inconsistent or error states.
+#[derive(Default, Debug, Clone, Hash)]
+pub struct Description {
+    pub msg: String,
+    pub path: Option<PathBuf>,
+    pub node: Option<Arc<Node>>,
+}
+
 /// Atomic counters for tracking the number of nodes, directories, and files.
 /// Using a separate counter struct allows us to not have to lock the entire
 /// tree f.ex. when inserting or removing nodes.
@@ -757,8 +805,11 @@ pub struct DirTree {
     from: Arc<PathBuf>,
     counts: Arc<Counts>,
     created: SecondsSinceEpoch,
-    root: Arc<Node>,
     filemode: FileMode,
+    state: Arc<RwLock<TreeState>>,
+    root: Arc<Node>,
+    worker: Option<thread::JoinHandle<()>>,
+    workq: Arc<SegQueue<TreeOperation>>,
 }
 
 impl DirTree {
@@ -782,6 +833,11 @@ impl DirTree {
     /// Returns a reference to the tree's creation time.
     pub fn created(&self) -> &SecondsSinceEpoch {
         &self.created
+    }
+
+    /// Returns the current tree state.
+    pub fn state(&self) -> TreeState {
+        self.state.read().clone()
     }
 
     /// Returns an Arc reference to the tree's root node.
