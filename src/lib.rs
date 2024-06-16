@@ -10,6 +10,7 @@ use super::{
 };
 use crate::args::FileMode;
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
+use crate::resident::{DirHandle, EntryExt};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
@@ -888,12 +889,42 @@ impl DirTree {
     #[instrument(level = "debug", skip(self, state, recursive))]
     #[inline]
     pub fn populate(&self, path: &PathBuf, recursive: bool, state: &ScanState) {
-        match self.get_entries(path) {
-            Some(entries) => entries.filter_map(Result::ok).for_each(|entry: DirEntry| {
-                self.process_entry(entry, state, recursive);
-            }),
-            None => return,
-        };
+        trace!(target: "DirHandle::new", "{}", path.display());
+        match DirHandle::new(path) {
+            Ok(handle) => {
+                handle.into_iter().for_each(|entry: EntryExt| {
+                    let entry_p: PathBuf = path.join(entry.name());
+                    match entry.file_type() {
+                        Some(_) => {
+                            trace!(target: "ENTRY", "{:?}", entry);
+                            if entry.is_dir() {
+                                self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
+                                state.num_d.inc1();
+                                if recursive {
+                                    self.populate(&entry_p, recursive, state);
+                                }
+                            } else if entry.is_file() {
+                                if self.filemode.is_with_size() {
+                                    state.fsize.fetch_add(entry.len());
+                                }
+                                if self.filemode.is_name() {
+                                    self.insert(&entry_p, NodeType::Name, None);
+                                } else if self.filemode.is_node() {
+                                    self.insert(&entry_p, NodeType::File, Some(entry.ino()));
+                                }
+                                state.num_f.inc1();
+                            }
+                        }
+                        None => {
+                            debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                debug!(target: "ERR", "Cannot read directory: {}", e);
+            }
+        }
     }
 
     /// Parallel version of `populate()` using Rayon's `par_bridge()`.
