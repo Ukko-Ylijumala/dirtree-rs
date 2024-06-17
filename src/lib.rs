@@ -9,8 +9,8 @@ use super::{
     ScanState, SecondsSinceEpoch, SegQueue, VecDeque, Weak,
 };
 use crate::args::FileMode;
+use crate::dirhandle::{DirHandle, EntryExt};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
-use crate::resident::{DirHandle, EntryExt};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::{
