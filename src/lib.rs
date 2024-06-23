@@ -969,6 +969,16 @@ impl DirTree {
                         }
                     }
                 });
+
+                #[cfg(debug_assertions)]
+                {
+                    let cur = handle.state_current();
+                    let old = handle.state();
+                    debug!(target: "HANDLE_STATE", "equal: {}", old == &cur);
+                    debug!(target: "HANDLE_STATE", "old: {old:?}");
+                    debug!(target: "HANDLE_STATE", "cur: {cur:?}");
+                } // END DEBUG -- TODO: remove
+
             }
             Err(e) => {
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
