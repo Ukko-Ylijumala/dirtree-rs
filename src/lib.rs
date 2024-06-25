@@ -182,6 +182,7 @@ impl<T> DirectoryEntry for Entry<T> {
 #[derive(Debug)]
 pub struct Directory {
     name: String,
+    handle: Arc<Mutex<Option<DirHandle>>>, // libc readdir may not be thread-safe
     children: RwLock<DirTreeHashMap<String, Option<Arc<Node>>>>,
 }
 
@@ -200,6 +201,15 @@ impl Directory {
 
     fn set_name(&mut self, name: String) {
         self.name = name;
+    }
+
+    /// Returns the [[DirHandle]] for this [[Directory]] item.
+    fn handle(&self) -> Arc<Mutex<Option<DirHandle>>> {
+        self.handle.clone()
+    }
+
+    fn set_handle(&self, handle: DirHandle) {
+        *self.handle.lock() = Some(handle);
     }
 
     #[inline]
@@ -239,7 +249,8 @@ impl Default for Directory {
     fn default() -> Self {
         Directory {
             name: "".to_string(),
-            children: RwLock::new(HashMap::with_hasher(DirTreeXxh3Hasher)),
+            handle: Arc::new(None.into()),
+            children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
     }
 }
@@ -248,6 +259,7 @@ impl Clone for Directory {
     fn clone(&self) -> Self {
         Directory {
             name: self.name.clone(),
+            handle: self.handle.clone(), // can't clone the handle but pointer is ok
             children: self.children.read().clone().into(),
         }
     }
@@ -587,6 +599,11 @@ impl Node {
                 Err(Error::new(ErrorKind::NotFound, msg))
             }
         }
+    }
+
+    /// Returns the [[DirHandle]] for this node if it's a directory.
+    pub fn handle(&self) -> Option<Arc<Mutex<Option<DirHandle>>>> {
+        self.as_dir().map(|x| x.handle())
     }
 
     #[inline]
@@ -977,6 +994,7 @@ impl DirTree {
                     debug!(target: "HANDLE_STATE", "equal: {}", old == &cur);
                     debug!(target: "HANDLE_STATE", "old: {old:?}");
                     debug!(target: "HANDLE_STATE", "cur: {cur:?}");
+                    self.add_handle(path, handle);
                 } // END DEBUG -- TODO: remove
 
             }
@@ -984,6 +1002,12 @@ impl DirTree {
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
             }
         }
+    }
+
+    /// Add a [[DirHandle]] object to a directory node's [[Directory]] item.
+    pub fn add_handle(&self, path: &PathBuf, handle: DirHandle) {
+        self.get_node(path.to_string_lossy().as_ref())
+            .map(|node| node.as_dir().map(|dir| dir.set_handle(handle)));
     }
 
     /* --------------------------------- */
