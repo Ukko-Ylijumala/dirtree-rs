@@ -209,8 +209,8 @@ impl Directory {
     }
 
     /// Returns the [[DirHandle]] for this [[Directory]] item.
-    fn handle(&self) -> Arc<Mutex<Option<DirHandle>>> {
-        self.handle.clone()
+    pub fn handle(&self) -> &Arc<Mutex<Option<DirHandle>>> {
+        &self.handle
     }
 
     fn set_handle(&self, handle: DirHandle) {
@@ -605,7 +605,7 @@ impl Node {
     }
 
     /// Returns the [[DirHandle]] for this node if it's a directory.
-    pub fn handle(&self) -> Option<Arc<Mutex<Option<DirHandle>>>> {
+    pub fn handle(&self) -> Option<&Arc<Mutex<Option<DirHandle>>>> {
         self.as_dir().map(|x| x.handle())
     }
 
