@@ -1327,10 +1327,10 @@ impl DirTree {
     /// since the overhead of moving stuff between threads can be significant.
     pub fn traverse_par<F>(&self, node: &Arc<Node>, f: &F)
     where
-        F: Fn(Arc<Node>) + Send + Sync,
+        F: Fn(&Arc<Node>) + Send + Sync,
     {
         trace!(target: "traverse_par", "{}", node.path().display());
-        f(node.clone());
+        f(&node);
         if node.is_traversable() && node.children().is_some() {
             node.children()
                 .unwrap()
@@ -1345,7 +1345,7 @@ impl DirTree {
                                 // traverse directories first (depth-first search)
                                 self.traverse_par(&child, f);
                             } else {
-                                f(child.clone());
+                                f(&child);
                             }
                         }
                     }
@@ -1357,10 +1357,10 @@ impl DirTree {
     /// child node, AND the starting node itself.
     pub fn traverse_from<F>(&self, node: &Arc<Node>, f: &mut F)
     where
-        F: FnMut(Arc<Node>),
+        F: FnMut(&Arc<Node>),
     {
         trace!(target: "traverse_from", "{}", node.path().display());
-        f(node.clone());
+        f(&node);
         if node.is_traversable() && node.children().is_some() {
             node.children()
                 .unwrap()
@@ -1374,7 +1374,7 @@ impl DirTree {
                                 // traverse directories first (depth-first search)
                                 self.traverse_from(&child, f);
                             } else {
-                                f(child.clone());
+                                f(&child);
                             }
                         }
                     }
@@ -1385,7 +1385,7 @@ impl DirTree {
     /// Traverses the tree from root and applies function `f` to each [[Node]].
     pub fn traverse<F>(&self, mut f: F)
     where
-        F: FnMut(Arc<Node>),
+        F: FnMut(&Arc<Node>),
     {
         self.traverse_from(&self.root(), &mut f);
     }
@@ -1406,7 +1406,7 @@ impl DirTree {
         Likely the overhead from moving stuff between threads and having
         to use Atomic versions of counters is the main reason.
         */
-        self.traverse_from(&node, &mut |n: Arc<Node>| {
+        self.traverse_from(&node, &mut |n: &Arc<Node>| {
             nodes += 1;
             if n.node_t.is_dir() {
                 dirs += 1;
@@ -1438,7 +1438,7 @@ impl DirTree {
     /// Print the full contents of the tree recursively. This is a debugging function.
     pub fn print_debug(&self) {
         eprintln!("\n{:?}\n", self);
-        self.traverse(|node: Arc<Node>| {
+        self.traverse(|node: &Arc<Node>| {
             if node.node_t.has_data() {
                 if tracing::level_enabled!(Level::DEBUG) {
                     debug!("{:?}", &node.construct_path());
@@ -1693,7 +1693,7 @@ mod tests {
             .map(|n: &Arc<Node>| n.path().to_string_lossy().to_string())
             .collect();
         let mut p_trav: HashSet<String> = HashSet::new();
-        tree.traverse(|n: Arc<Node>| {
+        tree.traverse(|n: &Arc<Node>| {
             p_trav.insert(n.path().to_string_lossy().to_string());
         });
 
