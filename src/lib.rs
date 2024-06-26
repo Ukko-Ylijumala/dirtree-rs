@@ -27,6 +27,11 @@ use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
 const PATH_SEP: char = '/';
 const META_FAIL: &str = "Failed to get metadata";
 
+// Convenience aliases
+type MaybeNode = Option<Arc<Node>>;
+type Children = RwLock<DirTreeHashMap<String, MaybeNode>>;
+type NodeVec = Vec<Arc<Node>>;
+
 #[derive(Default, Debug, Clone, Eq)]
 struct Data {
     inode: u64,
@@ -183,7 +188,7 @@ impl<T> DirectoryEntry for Entry<T> {
 pub struct Directory {
     name: String,
     handle: Arc<Mutex<Option<DirHandle>>>, // libc readdir may not be thread-safe
-    children: RwLock<DirTreeHashMap<String, Option<Arc<Node>>>>,
+    children: Children,
 }
 
 impl Directory {
@@ -213,7 +218,7 @@ impl Directory {
     }
 
     #[inline]
-    fn children(&self) -> &RwLock<DirTreeHashMap<String, Option<Arc<Node>>>> {
+    fn children(&self) -> &Children {
         &self.children
     }
 
@@ -226,16 +231,16 @@ impl Directory {
     /// Add a child node to this item's children.
     #[instrument(level = "trace", skip(self))]
     #[inline]
-    fn add_child(&self, name: &str, node: Option<Arc<Node>>) {
+    fn add_child(&self, name: &str, node: MaybeNode) {
         self.write().insert(name.to_owned(), node);
     }
 
     /// Get a child node by name.
     #[inline]
-    pub fn get_child(&self, name: &str) -> Option<Arc<Node>> {
+    pub fn get_child(&self, name: &str) -> MaybeNode {
         self.read()
             .get(name)
-            .map(|v: &Option<Arc<Node>>| v.clone())?
+            .map(|v: &MaybeNode| v.clone())?
     }
 
     /// Remove a child node (or a file name entry) by name.
@@ -268,7 +273,7 @@ impl Clone for Directory {
 impl Hash for Directory {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.name().hash(state);
-        let mut children: Vec<(String, Option<Arc<Node>>)> = self
+        let mut children: Vec<(String, MaybeNode)> = self
             .children
             .read()
             .iter()
@@ -291,7 +296,7 @@ impl PartialEq for Directory {
                     .children
                     .read()
                     .get(name)
-                    .map_or(false, |ov: &Option<Arc<Node>>| *child == *ov)
+                    .map_or(false, |ov: &MaybeNode| *child == *ov)
             })
     }
 }
@@ -312,7 +317,7 @@ impl PartialOrd for Directory {
 
 // Implement Deref for Directory to allow read access through RwLock to children.
 impl Deref for Directory {
-    type Target = RwLock<DirTreeHashMap<String, Option<Arc<Node>>>>;
+    type Target = Children;
 
     fn deref(&self) -> &Self::Target {
         &self.children
@@ -498,7 +503,7 @@ impl Node {
     /// Returns a new node with the given item.
     /// NOTE: children are initialized only for containers (directories and root).
     #[instrument(level = "debug")]
-    pub fn new(item: NodeItem, parent: Option<Arc<Node>>) -> Self {
+    pub fn new(item: NodeItem, parent: MaybeNode) -> Self {
         let node_t: NodeType = match item {
             NodeItem::Root(_) => NodeType::Root,
             NodeItem::Dir(_) => NodeType::Directory,
@@ -530,7 +535,7 @@ impl Node {
 
     /// Resolve the weak reference to this node's parent node.
     #[inline]
-    fn parent(&self) -> Option<Arc<Node>> {
+    fn parent(&self) -> MaybeNode {
         match self.parent.upgrade() {
             Some(parent) => parent.clone().into(),
             None => None,
@@ -607,7 +612,7 @@ impl Node {
     }
 
     #[inline]
-    pub fn children(&self) -> Option<&RwLock<DirTreeHashMap<String, Option<Arc<Node>>>>> {
+    pub fn children(&self) -> Option<&Children> {
         match self.item.get() {
             Some(item) => item.as_dir()?.children().into(),
             // catch uninitialized nodes
@@ -631,7 +636,7 @@ impl Node {
 
     /// Get a child [[Node]] by name.
     #[inline]
-    pub fn get_child(&self, name: &str) -> Option<Arc<Node>> {
+    pub fn get_child(&self, name: &str) -> MaybeNode {
         self.as_dir()
             .map_or(None, |dir: &Directory| dir.get_child(name))
     }
@@ -712,7 +717,7 @@ impl PartialEq for Node {
 }
 
 // Implement <Node> == Option<Arc<Node>> comparisons
-impl PartialEq<Option<Arc<Node>>> for Node {
+impl PartialEq<MaybeNode> for Node {
     fn eq(&self, other: &Option<Arc<Self>>) -> bool {
         match other {
             Some(other) => &self.item == &other.item,
@@ -722,7 +727,7 @@ impl PartialEq<Option<Arc<Node>>> for Node {
 }
 
 // Implement Option<Arc<Node>> == <Node> comparisons
-impl PartialEq<Node> for Option<Arc<Node>> {
+impl PartialEq<Node> for MaybeNode {
     fn eq(&self, other: &Node) -> bool {
         match self {
             Some(node) => &node.item == &other.item,
@@ -791,7 +796,7 @@ pub enum TreeState {
 pub struct Description {
     pub msg: String,
     pub path: Option<PathBuf>,
-    pub node: Option<Arc<Node>>,
+    pub node: MaybeNode,
 }
 
 /// Atomic counters for tracking the number of nodes, directories, and files.
@@ -1165,7 +1170,7 @@ impl DirTree {
     /* --------------------------------- */
 
     /// Get a [[Node]] from the trie. Expects an absolute path.
-    pub fn get_node(&self, path: &str) -> Option<Arc<Node>> {
+    pub fn get_node(&self, path: &str) -> MaybeNode {
         // short circuit if the path is not absolute or does not look like a path
         if !path.starts_with(PATH_SEP) || !path.contains(PATH_SEP) {
             return None;
@@ -1197,18 +1202,18 @@ impl DirTree {
 
     /// Walk the tree recursively from a [[Node]] and return a [Vec] of child nodes. The
     /// `dirs` and `files` flags control whether to include directory and/or file nodes.
-    fn walk(&self, node: Arc<Node>, dirs: bool, files: bool) -> Arc<Mutex<Vec<Arc<Node>>>> {
-        let result: Arc<Mutex<Vec<Arc<Node>>>> = Mutex::new(Vec::new()).into();
+    fn walk(&self, node: &Arc<Node>, dirs: bool, files: bool) -> Arc<Mutex<NodeVec>> {
+        let result: Arc<Mutex<NodeVec>> = Mutex::new(Vec::new()).into();
         if node.is_traversable() && node.children().is_some() {
             node.children()
                 .unwrap()
                 .read()
                 .values()
                 .par_bridge()
-                .for_each(|c: &Option<Arc<Node>>| match c {
+                .for_each(|c: &MaybeNode| match c {
                     None => return,
                     Some(child) => {
-                        let mut nodes_shard: Vec<Arc<Node>> = Vec::new();
+                        let mut nodes_shard: NodeVec = Vec::new();
                         if dirs && child.node_t.is_dir() {
                             nodes_shard.push(child.clone());
                         } else if files && child.node_t.is_file() {
@@ -1216,7 +1221,7 @@ impl DirTree {
                         }
                         if child.is_traversable() {
                             nodes_shard.extend(
-                                self.walk(child.clone(), dirs, files).lock().iter().cloned(),
+                                self.walk(&child, dirs, files).lock().iter().cloned(),
                             );
                         }
                         result.lock().extend(nodes_shard);
@@ -1228,18 +1233,18 @@ impl DirTree {
 
     /// Walks the full tree and returns a [Vec] of all nodes. WARNING: this can be
     /// slow and memory intensive for large trees. Prefer using [DirTree::iter].
-    pub fn nodes(&self) -> Vec<Arc<Node>> {
-        trace_span!("walk:nodes").in_scope(|| self.walk(self.root(), true, true).lock().to_vec())
+    pub fn nodes(&self) -> NodeVec {
+        trace_span!("walk:nodes").in_scope(|| self.walk(&self.root(), true, true).lock().to_vec())
     }
 
     /// Returns a [Vec] of all [[Directory]] nodes in the tree.
-    pub fn dirs(&self) -> Vec<Arc<Node>> {
-        trace_span!("walk:dirs").in_scope(|| self.walk(self.root(), true, false).lock().to_vec())
+    pub fn dirs(&self) -> NodeVec {
+        trace_span!("walk:dirs").in_scope(|| self.walk(&self.root(), true, false).lock().to_vec())
     }
 
     /// Returns a [Vec] of all [[FileEntry]] nodes in the tree.
-    pub fn files(&self) -> Vec<Arc<Node>> {
-        trace_span!("walk:files").in_scope(|| self.walk(self.root(), false, true).lock().to_vec())
+    pub fn files(&self) -> NodeVec {
+        trace_span!("walk:files").in_scope(|| self.walk(&self.root(), false, true).lock().to_vec())
     }
 
     /* --------------------------------- */
@@ -1337,7 +1342,7 @@ impl DirTree {
                 .read()
                 .values()
                 .par_bridge()
-                .for_each(|c: &Option<Arc<Node>>| {
+                .for_each(|c: &MaybeNode| {
                     match c {
                         None => return,
                         Some(child) => {
@@ -1366,7 +1371,7 @@ impl DirTree {
                 .unwrap()
                 .read()
                 .values()
-                .for_each(|c: &Option<Arc<Node>>| {
+                .for_each(|c: &MaybeNode| {
                     match c {
                         None => return,
                         Some(child) => {
@@ -1545,7 +1550,7 @@ impl Iterator for DirTreeIterator {
                 .unwrap()
                 .read()
                 .values()
-                .for_each(|c: &Option<Arc<Node>>| {
+                .for_each(|c: &MaybeNode| {
                     match c {
                         None => return,
                         Some(child) => {
