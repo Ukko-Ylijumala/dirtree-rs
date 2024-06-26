@@ -997,8 +997,9 @@ impl DirTree {
                     debug!(target: "HANDLE_STATE", "equal: {}", old == &cur);
                     debug!(target: "HANDLE_STATE", "old: {old:?}");
                     debug!(target: "HANDLE_STATE", "cur: {cur:?}");
-                    self.add_handle(path, handle);
                 } // END DEBUG -- TODO: remove
+
+                self.add_handle(path, handle);
             }
             Err(e) => {
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
