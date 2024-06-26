@@ -238,9 +238,7 @@ impl Directory {
     /// Get a child node by name.
     #[inline]
     pub fn get_child(&self, name: &str) -> MaybeNode {
-        self.read()
-            .get(name)
-            .map(|v: &MaybeNode| v.clone())?
+        self.read().get(name).map(|v: &MaybeNode| v.clone())?
     }
 
     /// Remove a child node (or a file name entry) by name.
@@ -1001,7 +999,6 @@ impl DirTree {
                     debug!(target: "HANDLE_STATE", "cur: {cur:?}");
                     self.add_handle(path, handle);
                 } // END DEBUG -- TODO: remove
-
             }
             Err(e) => {
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
@@ -1210,9 +1207,8 @@ impl DirTree {
                 .read()
                 .values()
                 .par_bridge()
-                .for_each(|c: &MaybeNode| match c {
-                    None => return,
-                    Some(child) => {
+                .for_each(|c: &MaybeNode| {
+                    c.as_ref().map(|child: &Arc<Node>| {
                         let mut nodes_shard: NodeVec = Vec::new();
                         if dirs && child.node_t.is_dir() {
                             nodes_shard.push(child.clone());
@@ -1220,12 +1216,11 @@ impl DirTree {
                             nodes_shard.push(child.clone());
                         }
                         if child.is_traversable() {
-                            nodes_shard.extend(
-                                self.walk(&child, dirs, files).lock().iter().cloned(),
-                            );
+                            nodes_shard
+                                .extend(self.walk(child, dirs, files).lock().iter().cloned());
                         }
                         result.lock().extend(nodes_shard);
-                    }
+                    });
                 });
         }
         result
@@ -1335,7 +1330,7 @@ impl DirTree {
         F: Fn(&Arc<Node>) + Send + Sync,
     {
         trace!(target: "traverse_par", "{}", node.path().display());
-        f(&node);
+        f(node);
         if node.is_traversable() && node.children().is_some() {
             node.children()
                 .unwrap()
@@ -1343,17 +1338,14 @@ impl DirTree {
                 .values()
                 .par_bridge()
                 .for_each(|c: &MaybeNode| {
-                    match c {
-                        None => return,
-                        Some(child) => {
-                            if child.is_traversable() {
-                                // traverse directories first (depth-first search)
-                                self.traverse_par(&child, f);
-                            } else {
-                                f(&child);
-                            }
+                    c.as_ref().map(|child: &Arc<Node>| {
+                        if child.is_traversable() {
+                            // traverse directories first (depth-first search)
+                            self.traverse_par(child, f);
+                        } else {
+                            f(child);
                         }
-                    }
+                    });
                 });
         }
     }
@@ -1365,24 +1357,21 @@ impl DirTree {
         F: FnMut(&Arc<Node>),
     {
         trace!(target: "traverse_from", "{}", node.path().display());
-        f(&node);
+        f(node);
         if node.is_traversable() && node.children().is_some() {
             node.children()
                 .unwrap()
                 .read()
                 .values()
                 .for_each(|c: &MaybeNode| {
-                    match c {
-                        None => return,
-                        Some(child) => {
-                            if child.is_traversable() {
-                                // traverse directories first (depth-first search)
-                                self.traverse_from(&child, f);
-                            } else {
-                                f(&child);
-                            }
+                    c.as_ref().map(|child: &Arc<Node>| {
+                        if child.is_traversable() {
+                            // traverse directories first (depth-first search)
+                            self.traverse_from(child, f);
+                        } else {
+                            f(child);
                         }
-                    }
+                    });
                 });
         }
     }
@@ -1413,10 +1402,10 @@ impl DirTree {
         */
         self.traverse_from(&node, &mut |n: &Arc<Node>| {
             nodes += 1;
-            if n.node_t.is_dir() {
-                dirs += 1;
-            } else if n.node_t.is_file() {
-                files += 1;
+            match n.node_t {
+                NodeType::Directory => dirs += 1,
+                NodeType::File => files += 1,
+                _ => (),
             }
         });
 
@@ -1446,9 +1435,9 @@ impl DirTree {
         self.traverse(|node: &Arc<Node>| {
             if node.node_t.has_data() {
                 if tracing::level_enabled!(Level::DEBUG) {
-                    debug!("{:?}", &node.construct_path());
+                    debug!("{:?}", node.construct_path());
                 } else {
-                    info!("{}", &node.path().to_string_lossy());
+                    info!("{}", node.path().to_string_lossy());
                 }
             }
         });
@@ -1545,24 +1534,22 @@ impl Iterator for DirTreeIterator {
             if node.children().is_none() {
                 return node;
             }
+
             // Push all found children to the stack
             node.children()
                 .unwrap()
                 .read()
                 .values()
                 .for_each(|c: &MaybeNode| {
-                    match c {
-                        None => return,
-                        Some(child) => {
-                            if child.is_traversable() {
-                                // push directories to the front of the queue...
-                                self.0.push_front(child.clone());
-                            } else {
-                                // ...and files to the back
-                                self.0.push_back(child.clone());
-                            }
+                    c.as_ref().map(|child: &Arc<Node>| {
+                        if child.is_traversable() {
+                            // push directories to the front of the queue...
+                            self.0.push_front(child.clone());
+                        } else {
+                            // ...and files to the back
+                            self.0.push_back(child.clone());
                         }
-                    }
+                    });
                 });
             node
         })
