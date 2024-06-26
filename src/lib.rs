@@ -6,7 +6,7 @@
 use super::{
     make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, DirEntry,
     HashMap, Instant, Metadata, MetadataExt, PathBuf, Relaxed, RwLock, ScanState,
-    SecondsSinceEpoch, SegQueue, VecDeque, Weak,
+    SecondsSinceEpoch, SegQueue, TimeSinceEpoch, VecDeque, Weak,
 };
 use crate::args::FileMode;
 use crate::dirhandle::{DirHandle, EntryExt};
@@ -782,19 +782,68 @@ pub enum TreeState {
     /// The tree is being actively used.
     Active(TreeOperation),
     /// The tree is in an inconsistent state.
-    Inconsistent(Description),
+    Inconsistent(TreeEvent),
     /// The tree is in an error state.
-    Error(Description),
+    Error(TreeEvent),
     /// The tree is being torn down.
     Quitting,
 }
 
-/// A description of inconsistent or error states.
+/// A [DirTree] event. Could be an error, warning, or just a notice.
 #[derive(Default, Debug, Clone, Hash)]
-pub struct Description {
+pub struct TreeEvent {
     pub msg: String,
-    pub path: Option<PathBuf>,
+    pub oper: Option<TreeOperation>,
+    pub path: Option<String>,
     pub node: MaybeNode,
+    pub when: TimeSinceEpoch,
+}
+
+impl TreeEvent {
+    /// Create a new tree event with the given message. Details can be provided
+    /// by chaining with the `path()`, `node()`, and `oper()` methods.
+    fn new(msg: &str) -> Self {
+        Self {
+            msg: msg.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Specify a path for the event.
+    fn path(mut self, path: &str) -> Self {
+        self.path = Some(path.to_owned());
+        self
+    }
+
+    /// Specify a [Node] for the event.
+    fn node(mut self, node: &Arc<Node>) -> Self {
+        self.node = Some(node.to_owned());
+        self
+    }
+
+    /// Specify a [TreeOperation] for the event.
+    fn oper(mut self, oper: TreeOperation) -> Self {
+        self.oper = Some(oper);
+        self
+    }
+
+    /// Mark the start of an operation.
+    fn op_beg(op: &TreeOperation) -> Self {
+        Self {
+            msg: "begin".to_string(),
+            oper: Some(op.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// Mark the end of an operation.
+    fn op_end(op: TreeOperation) -> Self {
+        Self {
+            msg: "end".to_string(),
+            oper: Some(op),
+            ..Default::default()
+        }
+    }
 }
 
 /// Atomic counters for tracking the number of nodes, directories, and files.
@@ -808,6 +857,7 @@ pub struct Counts {
     pub files: AtomicU32,
     /// Maximum depth of the tree. Root is at depth 0.
     pub depth: AtomicU8,
+    pub errors: AtomicU32,
 }
 
 /// Trie structure for storing a directory tree.
@@ -834,6 +884,7 @@ pub struct DirTree {
     root: Arc<Node>,
     worker: Option<thread::JoinHandle<()>>,
     workq: Arc<SegQueue<TreeOperation>>,
+    events: Arc<RwLock<Vec<TreeEvent>>>,
 }
 
 impl DirTree {
@@ -862,6 +913,64 @@ impl DirTree {
     /// Returns the current [[TreeState]].
     pub fn state(&self) -> TreeState {
         self.state.read().clone()
+    }
+
+    /// Set the tree to the given state. Also records the end of the previous
+    /// operation if the tree was in an active state.
+    #[inline]
+    fn set_state(&self, state: TreeState) {
+        match self.active_op() {
+            Some(op) => self.add_event(TreeEvent::op_end(op)),
+            _ => {},
+        }
+        *self.state.write() = state;
+    }
+
+    /// Record a new event in the tree's event log.
+    #[inline]
+    fn add_event(&self, event: TreeEvent) {
+        self.events.write().push(event);
+    }
+
+    /// Returns `true` if the tree is idle.
+    #[inline]
+    pub fn is_idle(&self) -> bool {
+        !matches!(self.state(), TreeState::Quitting)
+            && matches!(self.state(), TreeState::Ready | TreeState::Uninitialized)
+    }
+
+    /// Returns `true` if the tree is in an active state.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        matches!(self.state(), TreeState::Active(_))
+    }
+
+    /// Returns `true` if the tree is in a quitting state.
+    #[inline]
+    pub fn is_quitting(&self) -> bool {
+        matches!(self.state(), TreeState::Quitting)
+    }
+
+    /// Returns `true` if the tree is in an error state.
+    #[inline]
+    pub fn is_error(&self) -> bool {
+        matches!(self.state(), TreeState::Error(_) | TreeState::Inconsistent(_))
+    }
+
+    /// Returns the error state of the tree, if any.
+    pub fn error_state(&self) -> Option<TreeEvent> {
+        match self.state() {
+            TreeState::Error(e) | TreeState::Inconsistent(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Returns the current active operation on the tree, if any.
+    pub fn active_op(&self) -> Option<TreeOperation> {
+        match self.state() {
+            TreeState::Active(op) => Some(op),
+            _ => None,
+        }
     }
 
     /// Returns an Arc reference to the tree's root [[Node]].
@@ -898,11 +1007,14 @@ impl DirTree {
         state.num_d.inc1();
         debug!(target: "TREE", "{tree:?}");
         if recursive {
+            tree.set_state(TreeState::Active(TreeOperation::Build));
+            tree.add_event(TreeEvent::op_beg(&TreeOperation::Build).path(path));
             match state.parallel && !state.sync {
                 true => tree.populate_par(&tree.from, true, state),
                 false => tree.populate(&tree.from, true, state),
             }
         };
+        tree.set_state(TreeState::Ready);
         tree
     }
 
@@ -941,6 +1053,7 @@ impl DirTree {
                             }
                         }
                         Err(e) => {
+                            self.counts.errors.fetch_add(1, Relaxed);
                             debug!("Error with {}: {e}", path.display());
                         }
                     }
@@ -988,6 +1101,7 @@ impl DirTree {
                             debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
                         }
                     }
+                    drop(entry);
                 });
 
                 #[cfg(debug_assertions)]
@@ -1002,6 +1116,7 @@ impl DirTree {
                 self.add_handle(path, handle);
             }
             Err(e) => {
+                self.counts.errors.fetch_add(1, Relaxed);
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
             }
         }
