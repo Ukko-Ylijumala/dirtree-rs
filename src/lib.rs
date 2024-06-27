@@ -3,24 +3,29 @@
 // non_snake_case added due to `instrument` macro causing a false positive for `dtor`
 #![allow(dead_code, non_snake_case)]
 
-use super::{
-    make_weak_ref, metadata, path_parts, path_parts_vec, Arc, AtomicU32, AtomicU8, DirEntry,
-    HashMap, Instant, Metadata, MetadataExt, PathBuf, Relaxed, RwLock, ScanState,
-    SecondsSinceEpoch, SegQueue, TimeSinceEpoch, VecDeque, Weak,
-};
+use super::{make_weak_ref, path_parts, path_parts_vec, ScanState};
 use crate::args::FileMode;
 use crate::dirhandle::{DirHandle, EntryExt};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
-use parking_lot::Mutex;
+use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
+use crossbeam::queue::SegQueue;
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use std::{
     cmp::Ordering,
+    collections::{HashMap, VecDeque},
+    fs::{metadata, DirEntry, Metadata},
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
     ops::{Deref, DerefMut},
-    os::unix::fs::DirEntryExt,
-    sync::OnceLock,
+    os::unix::fs::{DirEntryExt, MetadataExt},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU32, AtomicU8, Ordering::Relaxed},
+        Arc, OnceLock, Weak,
+    },
     thread,
+    time::Instant,
 };
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
 
