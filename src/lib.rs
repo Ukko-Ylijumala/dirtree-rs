@@ -1009,9 +1009,9 @@ impl DirTree {
         if recursive {
             tree.set_state(TreeState::Active(TreeOperation::Build));
             tree.add_event(TreeEvent::op_beg(&TreeOperation::Build).path(path));
-            match state.parallel && !state.sync {
-                true => tree.populate_par(&tree.from, true, state),
-                false => tree.populate(&tree.from, true, state),
+            match state.sync {
+                false => tree.populate_par(&tree.from, true, state),
+                true => tree.populate(&tree.from, true, state),
             }
         };
         tree.set_state(TreeState::Ready);
@@ -1578,7 +1578,7 @@ impl DirTree {
         let want_d: u32 = self.counts.dirs.load(Relaxed);
         let want_f: u32 = self.counts.files.load(Relaxed);
         let d_o: &str = "[dirsonly]";
-        if self.filemode == FileMode::Name {
+        if self.filemode.is_name() {
             assert_eq!(want_n, want_d, "master node count != dirs {d_o}")
         } else {
             assert_eq!(want_n, want_d + want_f, "master node count != dirs+files")
@@ -1589,7 +1589,7 @@ impl DirTree {
         let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.count_from(self.root());
         let n: &str = "count_from()";
-        if self.filemode == FileMode::Name {
+        if self.filemode.is_name() {
             assert_eq!(nodes, dirs, "{n} node count != dirs {d_o}");
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
@@ -1605,7 +1605,7 @@ impl DirTree {
         let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.iter_count();
         let n: &str = "iter_count()";
-        if self.filemode == FileMode::Name {
+        if self.filemode.is_name() {
             assert_eq!(nodes, dirs, "{n} node count != dirs {d_o}");
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
@@ -1628,7 +1628,7 @@ impl DirTree {
         eprintln!(" --> {n} files = {:#?}", start.elapsed());
 
         assert_eq!(want_d, dirs, "{n} dirs do not match");
-        if self.filemode == FileMode::Name {
+        if self.filemode.is_name() {
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
             assert_eq!(want_f, files, "{n} files do not match");
@@ -1705,7 +1705,7 @@ mod tests {
         }
         CONF = Some(Config::default());
         STATE = Some(ScanState {
-            filemode: FileMode::Node,
+            filemode: FileMode::NODE,
             ..Default::default()
         });
         TESTDIR = Some(create_test_dirs_for_tree_test());
@@ -1730,7 +1730,7 @@ mod tests {
     #[test]
     fn test_create_empty_tree() {
         unsafe { setup_tests() }
-        let tree: DirTree = DirTree::new(FileMode::Unspecified);
+        let tree: DirTree = DirTree::new(FileMode::default());
         let (nodes, dirs, files, depth) = counts(&tree);
 
         assert_eq!(tree.root.node_t, NodeType::Root);
@@ -1749,7 +1749,7 @@ mod tests {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
 
-        let mut tree: DirTree = DirTree::new(FileMode::Node);
+        let mut tree: DirTree = DirTree::new(FileMode::NODE);
         tree.set_from(PathBuf::from(path));
         let (nodes, dirs, files, depth) = counts(&tree);
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
