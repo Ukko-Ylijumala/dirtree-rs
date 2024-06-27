@@ -187,7 +187,7 @@ impl<T> DirectoryEntry for Entry<T> {
 #[derive(Debug)]
 pub struct Directory {
     name: String,
-    handle: Mutex<Option<DirHandle>>, // libc readdir may not be thread-safe
+    handle: Arc<Mutex<Option<DirHandle>>>, // libc readdir may not be thread-safe
     children: Children,
 }
 
@@ -209,7 +209,7 @@ impl Directory {
     }
 
     /// Returns the [[DirHandle]] for this [[Directory]] item.
-    pub fn handle(&self) -> &Mutex<Option<DirHandle>> {
+    pub fn handle(&self) -> &Arc<Mutex<Option<DirHandle>>> {
         &self.handle
     }
 
@@ -256,7 +256,7 @@ impl Default for Directory {
     fn default() -> Self {
         Directory {
             name: "".to_string(),
-            handle: None.into(),
+            handle: Arc::new(None.into()),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
     }
@@ -267,7 +267,7 @@ impl Clone for Directory {
     fn clone(&self) -> Self {
         Directory {
             name: self.name.clone(),
-            handle: None.into(), // can't clone the handle
+            handle: self.handle.clone(), // can't clone the handle but the ptr is ok
             children: self.children.read().clone().into(),
         }
     }
@@ -610,7 +610,7 @@ impl Node {
     }
 
     /// Returns the [[DirHandle]] for this node if it's a directory.
-    pub fn handle(&self) -> Option<&Mutex<Option<DirHandle>>> {
+    pub fn handle(&self) -> Option<&Arc<Mutex<Option<DirHandle>>>> {
         self.as_dir().map(|x| x.handle())
     }
 
