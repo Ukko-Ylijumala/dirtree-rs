@@ -187,7 +187,7 @@ impl<T> DirectoryEntry for Entry<T> {
 #[derive(Debug)]
 pub struct Directory {
     name: String,
-    handle: Arc<Mutex<Option<DirHandle>>>, // libc readdir may not be thread-safe
+    handle: Mutex<Option<DirHandle>>, // libc readdir may not be thread-safe
     children: Children,
 }
 
@@ -209,12 +209,16 @@ impl Directory {
     }
 
     /// Returns the [[DirHandle]] for this [[Directory]] item.
-    pub fn handle(&self) -> &Arc<Mutex<Option<DirHandle>>> {
+    pub fn handle(&self) -> &Mutex<Option<DirHandle>> {
         &self.handle
     }
 
-    fn set_handle(&self, handle: DirHandle) {
+    fn handle_set(&self, handle: DirHandle) {
         *self.handle.lock() = Some(handle);
+    }
+
+    fn handle_close(&self) {
+        *self.handle.lock() = None;
     }
 
     #[inline]
@@ -252,17 +256,18 @@ impl Default for Directory {
     fn default() -> Self {
         Directory {
             name: "".to_string(),
-            handle: Arc::new(None.into()),
+            handle: None.into(),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
     }
 }
 
 impl Clone for Directory {
+    /// NOTE: a clone of a [Directory] does **not** clone the [DirHandle].
     fn clone(&self) -> Self {
         Directory {
             name: self.name.clone(),
-            handle: self.handle.clone(), // can't clone the handle but pointer is ok
+            handle: None.into(), // can't clone the handle
             children: self.children.read().clone().into(),
         }
     }
@@ -605,7 +610,7 @@ impl Node {
     }
 
     /// Returns the [[DirHandle]] for this node if it's a directory.
-    pub fn handle(&self) -> Option<&Arc<Mutex<Option<DirHandle>>>> {
+    pub fn handle(&self) -> Option<&Mutex<Option<DirHandle>>> {
         self.as_dir().map(|x| x.handle())
     }
 
@@ -857,6 +862,8 @@ pub struct Counts {
     pub files: AtomicU32,
     /// Maximum depth of the tree. Root is at depth 0.
     pub depth: AtomicU8,
+    /// Number of open directory handles.
+    pub handles: AtomicU32,
     pub errors: AtomicU32,
 }
 
@@ -921,7 +928,7 @@ impl DirTree {
     fn set_state(&self, state: TreeState) {
         match self.active_op() {
             Some(op) => self.add_event(TreeEvent::op_end(op)),
-            _ => {},
+            _ => {}
         }
         *self.state.write() = state;
     }
@@ -1124,8 +1131,12 @@ impl DirTree {
 
     /// Add a [[DirHandle]] object to a directory node's [[Directory]] item.
     pub fn add_handle(&self, path: &PathBuf, handle: DirHandle) {
-        self.get_node(path.to_string_lossy().as_ref())
-            .map(|node| node.as_dir().map(|dir| dir.set_handle(handle)));
+        self.get_node(path.to_string_lossy().as_ref()).map(|node| {
+            node.as_dir().map(|dir| {
+                dir.handle_set(handle);
+                self.counts.handles.fetch_add(1, Relaxed);
+            })
+        });
     }
 
     /* --------------------------------- */
