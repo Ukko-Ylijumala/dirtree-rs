@@ -5,7 +5,7 @@
 
 use super::{make_weak_ref, path_parts, path_parts_vec, ScanState};
 use crate::args::FileMode;
-use crate::dirhandle::{DirHandle, EntryExt};
+use crate::dirhandle::{DirHandle, EntryExt, OpenHandles};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
 use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
@@ -888,7 +888,7 @@ pub struct Counts {
 /// tree.print_info(); // print basic tree info (nodes, dirs, files etc)
 #[derive(Default, Debug)]
 pub struct DirTree {
-    from: Arc<PathBuf>,
+    from: OnceLock<PathBuf>,
     counts: Arc<Counts>,
     created: SecondsSinceEpoch,
     filemode: FileMode,
@@ -903,13 +903,13 @@ impl DirTree {
     /// Tree root path (in the filesystem) from which the tree is built.
     /// NOTE: internally stored paths are relative to this.
     pub fn from(&self) -> &PathBuf {
-        &self.from
+        &self.from.get().expect("Tree should have a root path")
     }
 
     /// Set the root (filesystem) path of the tree.
-    fn set_from(&mut self, from: PathBuf) {
-        self.from = from.into();
-        self.insert(&self.from, NodeType::Directory, None);
+    fn set_from(&self, from: PathBuf) {
+        self.from.set(from).ok();
+        self.insert(self.from(), NodeType::Directory, None);
     }
 
     /// Returns a reference to the tree's [[Counts]] struct.
@@ -1008,7 +1008,7 @@ impl DirTree {
     #[instrument(name = "DirTree", skip_all)]
     pub fn new_from_path(path: &str, state: &ScanState, recursive: bool) -> Self {
         debug!(target: "path", "{path}");
-        let mut tree: DirTree = Self::new(state.filemode);
+        let tree: DirTree = Self::new(state.filemode);
         tree.set_from(PathBuf::from(path));
         /*
         Technically we've not yet scanned the root directory, but this place
@@ -1022,8 +1022,8 @@ impl DirTree {
             tree.set_state(TreeState::Active(TreeOperation::Build));
             tree.add_event(TreeEvent::op_beg(&TreeOperation::Build).path(path));
             match state.sync {
-                false => tree.populate_par(&tree.from, true, state),
-                true => tree.populate(&tree.from, true, state),
+                false => tree.populate_par(tree.from(), true, state),
+                true => tree.populate(tree.from(), true, state),
             }
         };
         tree.set_state(TreeState::Ready);
@@ -1765,7 +1765,7 @@ mod tests {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
 
-        let mut tree: DirTree = DirTree::new(FileMode::NODE);
+        let tree: DirTree = DirTree::new(FileMode::NODE);
         tree.set_from(PathBuf::from(path));
         let (nodes, dirs, files, depth) = counts(&tree);
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
