@@ -5,7 +5,7 @@
 
 use super::{make_weak_ref, path_parts, path_parts_vec, ScanState};
 use crate::args::FileMode;
-use crate::dirhandle::{DirHandle, EntryExt}; // OpenHandles
+use crate::dirhandle::{DirHandle, EntryExt, OpenHandles};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
 use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
@@ -19,6 +19,7 @@ use std::{
     hint,
     io::{Error, ErrorKind},
     ops::{Deref, DerefMut},
+    os::fd::{AsRawFd, RawFd},
     os::unix::fs::{DirEntryExt, MetadataExt},
     path::PathBuf,
     sync::{
@@ -193,7 +194,7 @@ impl<T> DirectoryEntry for Entry<T> {
 #[derive(Debug)]
 pub struct Directory {
     name: String,
-    handle: Arc<Mutex<Option<DirHandle>>>, // libc readdir may not be thread-safe
+    fd: OnceLock<RawFd>,
     children: Children,
 }
 
@@ -214,17 +215,17 @@ impl Directory {
         self.name = name;
     }
 
-    /// Returns the [[DirHandle]] for this [[Directory]] item.
-    pub fn handle(&self) -> &Arc<Mutex<Option<DirHandle>>> {
-        &self.handle
+    /// Returns the [[RawFd]] for this [[Directory]] item, if we have it open.
+    pub fn fd(&self) -> Option<RawFd> {
+        self.fd.get().copied()
     }
 
-    fn handle_set(&self, handle: DirHandle) {
-        *self.handle.lock() = Some(handle);
+    fn fd_set(&self, fd: RawFd) -> Result<(), RawFd> {
+        self.fd.set(fd)
     }
 
-    fn handle_close(&self) {
-        *self.handle.lock() = None;
+    fn fd_close(&mut self) {
+        self.fd.take();
     }
 
     #[inline]
@@ -262,18 +263,18 @@ impl Default for Directory {
     fn default() -> Self {
         Directory {
             name: "".to_string(),
-            handle: Arc::new(None.into()),
+            fd: OnceLock::new(),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
     }
 }
 
 impl Clone for Directory {
-    /// NOTE: a clone of a [Directory] does **not** clone the [DirHandle].
+    /// NOTE: a clone of a [Directory] has the same [RawFd], but it may become stale.
     fn clone(&self) -> Self {
         Directory {
             name: self.name.clone(),
-            handle: self.handle.clone(), // can't clone the handle but the ptr is ok
+            fd: self.fd.clone(),
             children: self.children.read().clone().into(),
         }
     }
@@ -615,9 +616,9 @@ impl Node {
         }
     }
 
-    /// Returns the [[DirHandle]] for this node if it's a directory.
-    pub fn handle(&self) -> Option<&Arc<Mutex<Option<DirHandle>>>> {
-        self.as_dir().map(|x| x.handle())
+    /// Returns the [[RawFd]] for this node if it's a directory and if we have a fd.
+    pub fn fd(&self) -> Option<RawFd> {
+        self.as_dir().map(|dir: &Directory| dir.fd())?
     }
 
     #[inline]
@@ -763,7 +764,7 @@ impl PartialEq<Node> for NodeItem {
 
 /// The current operation being performed on the [[DirTree]].
 #[derive(Default, Debug, Clone, Eq, PartialEq, Hash)]
-pub enum TreeOperation {
+pub enum TreeOp {
     #[default]
     None,
     /// The tree is being built.
@@ -795,7 +796,7 @@ pub enum TreeState {
     /// The tree is ready for use.
     Ready,
     /// The tree is being actively used.
-    Active(TreeOperation),
+    Active(TreeOp),
     /// The tree is in an inconsistent state.
     Inconsistent(TreeEvent),
     /// The tree is in an error state.
@@ -808,7 +809,7 @@ pub enum TreeState {
 #[derive(Default, Debug, Clone, Hash, PartialEq)]
 pub struct TreeEvent {
     pub msg: String,
-    pub oper: Option<TreeOperation>,
+    pub oper: Option<TreeOp>,
     pub path: Option<String>,
     pub node: MaybeNode,
     pub when: TimeSinceEpoch,
@@ -816,7 +817,7 @@ pub struct TreeEvent {
 
 impl TreeEvent {
     /// Create a new tree event with the given message. Details can be provided
-    /// by chaining with the `path()`, `node()`, and `oper()` methods.
+    /// by chaining with the `path()`, `node()`, and `op()` methods.
     fn new(msg: &str) -> Self {
         Self {
             msg: msg.to_string(),
@@ -837,13 +838,13 @@ impl TreeEvent {
     }
 
     /// Specify a [TreeOperation] for the event.
-    fn oper(mut self, oper: TreeOperation) -> Self {
+    fn op(mut self, oper: TreeOp) -> Self {
         self.oper = Some(oper);
         self
     }
 
     /// Mark the start of an operation.
-    fn op_beg(op: &TreeOperation) -> Self {
+    fn op_beg(op: &TreeOp) -> Self {
         Self {
             msg: "begin".to_string(),
             oper: Some(op.to_owned()),
@@ -852,9 +853,18 @@ impl TreeEvent {
     }
 
     /// Mark the end of an operation.
-    fn op_end(op: TreeOperation) -> Self {
+    fn op_end(op: TreeOp) -> Self {
         Self {
             msg: "end".to_string(),
+            oper: Some(op),
+            ..Default::default()
+        }
+    }
+
+    /// Create an error event.
+    fn error(msg: &str, op: TreeOp) -> Self {
+        Self {
+            msg: format!("ERROR: {msg}").to_string(),
             oper: Some(op),
             ..Default::default()
         }
@@ -872,8 +882,6 @@ pub struct Counts {
     pub files: AtomicU32,
     /// Maximum depth of the tree. Root is at depth 0.
     pub depth: AtomicU8,
-    /// Number of open directory handles.
-    pub handles: AtomicU32,
     pub errors: AtomicU32,
 }
 
@@ -905,35 +913,35 @@ fn tree_worker(t: Arc<DirTree>, state: ScanState) {
             }
             Some(op) => {
                 match op {
-                    TreeOperation::Quit => {
+                    TreeOp::Quit => {
                         t.set_state(TreeState::Quitting);
                         break;
                     }
-                    TreeOperation::Scan(ref path) => {
+                    TreeOp::Scan(ref path) => {
                         let p: PathBuf = path.clone();
                         t.add_event(TreeEvent::op_beg(&op));
                         t.set_state(TreeState::Active(op));
                         t.populate(&p, true, &state);
                     }
-                    TreeOperation::Remove(ref path) => {
+                    TreeOp::Remove(ref path) => {
                         let p: String = path.clone();
                         t.add_event(TreeEvent::op_beg(&op));
                         t.set_state(TreeState::Active(op.clone()));
                         t.remove(&p).err().map(|e| {
                             t.counts.errors.fetch_add(1, Relaxed);
-                            t.add_event(TreeEvent::new(&e.to_string()).path(&p).oper(op));
+                            t.add_event(TreeEvent::new(&e.to_string()).path(&p).op(op));
                         });
                     }
-                    TreeOperation::Update(ref _path) => {
+                    TreeOp::Update(ref _path) => {
                         //let p: PathBuf = path.clone();
                         t.add_event(TreeEvent::op_beg(&op));
                         t.set_state(TreeState::Active(op));
                         //tree.update(&p);
                     }
-                    TreeOperation::Build => {}
-                    TreeOperation::Insert => {}
-                    TreeOperation::Serialize => {}   // TODO
-                    TreeOperation::Deserialize => {} // TODO
+                    TreeOp::Build => {}
+                    TreeOp::Insert => {}
+                    TreeOp::Serialize => {}   // TODO
+                    TreeOp::Deserialize => {} // TODO
                     _ => {}
                 };
                 t.set_state(TreeState::Ready);
@@ -964,14 +972,21 @@ pub struct DirTree {
     counts: Arc<Counts>,
     created: SecondsSinceEpoch,
     filemode: FileMode,
-    state: Arc<RwLock<TreeState>>,
+    state: RwLock<TreeState>,
     root: Arc<Node>,
+    handles: OpenHandles,
     worker: OnceLock<thread::JoinHandle<()>>,
-    workq: Arc<SegQueue<TreeOperation>>,
-    events: Arc<RwLock<Vec<TreeEvent>>>,
+    workq: SegQueue<TreeOp>,
+    events: RwLock<Vec<TreeEvent>>,
 }
 
 impl DirTree {
+    /// Returns an Arc reference to the tree's root [[Node]].
+    #[inline]
+    pub fn root(&self) -> Arc<Node> {
+        self.root.clone()
+    }
+
     /// Tree root path (in the filesystem) from which the tree is built.
     /// NOTE: internally stored paths are relative to this.
     pub fn from(&self) -> &PathBuf {
@@ -981,6 +996,11 @@ impl DirTree {
     /// Returns a reference to the tree's [[Counts]] struct.
     pub fn counts(&self) -> Arc<Counts> {
         self.counts.clone()
+    }
+
+    /// The number of open directory handles.
+    pub fn num_handles(&self) -> usize {
+        self.handles.len()
     }
 
     /// Returns a reference to the tree's creation time.
@@ -1010,21 +1030,28 @@ impl DirTree {
         self.events.write().push(event);
     }
 
+    /// Add an error event to the event log and increase the error count.
+    fn add_error(&self, event: TreeEvent) {
+        error!("{event:?}");
+        self.add_event(event);
+        self.counts.errors.fetch_add(1, Relaxed);
+    }
+
     /// Add an operation to the tree's work queue.
-    fn add_op(&self, op: TreeOperation) {
+    fn add_op(&self, op: TreeOp) {
         self.workq.push(op);
     }
 
     /// Tell the background worker thread to quit.
     fn quit_worker(&self) {
-        self.add_op(TreeOperation::Quit);
+        self.add_op(TreeOp::Quit);
     }
 
     /// Tell the background worker thread to scan (populate) the given path.
     ///
     /// NOTE: non-blocking, the actual scan is done in the background.
     pub fn scan(&self, path: &str) {
-        self.add_op(TreeOperation::Scan(PathBuf::from(path)));
+        self.add_op(TreeOp::Scan(PathBuf::from(path)));
     }
 
     /// Returns `true` if the tree is uninitialized.
@@ -1066,17 +1093,11 @@ impl DirTree {
     }
 
     /// Returns the current active operation on the tree, if any.
-    pub fn active_op(&self) -> Option<TreeOperation> {
+    pub fn active_op(&self) -> Option<TreeOp> {
         match self.state() {
             TreeState::Active(op) => Some(op),
             _ => None,
         }
-    }
-
-    /// Returns an Arc reference to the tree's root [[Node]].
-    #[inline]
-    pub fn root(&self) -> Arc<Node> {
-        self.root.clone()
     }
 
     /// Creates a new empty directory tree (internally a Trie structure).
@@ -1132,8 +1153,8 @@ impl DirTree {
         state.num_d.inc1();
         debug!(target: "TREE", "{tree:?}");
         if recursive {
-            tree.set_state(TreeState::Active(TreeOperation::Build));
-            tree.add_event(TreeEvent::op_beg(&TreeOperation::Build).path(path));
+            tree.set_state(TreeState::Active(TreeOp::Build));
+            tree.add_event(TreeEvent::op_beg(&TreeOp::Build).path(path));
             match state.sync {
                 false => tree.populate_par(tree.from(), true, resident, state),
                 true => tree.populate(tree.from(), true, state),
@@ -1196,9 +1217,9 @@ impl DirTree {
     /// buffer to look ahead in the directory stream.
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
     pub fn populate_par(&self, path: &PathBuf, recursive: bool, resident: bool, state: &ScanState) {
-        trace!(target: "DirHandle", "{:?}", path.display());
         match DirHandle::new(path) {
             Ok(mut handle) => {
+                trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
                 handle.iter().par_bridge().for_each(|entry: EntryExt| {
                     let entry_p: PathBuf = path.join(entry.name());
                     match entry.file_type() {
@@ -1223,6 +1244,11 @@ impl DirTree {
                             }
                         }
                         None => {
+                            self.add_event(
+                                TreeEvent::new("Unknown entry type")
+                                    .path(&entry_p.to_string_lossy().clone())
+                                    .op(TreeOp::Scan(path.into())),
+                            );
                             debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
                         }
                     }
@@ -1238,23 +1264,26 @@ impl DirTree {
                     debug!(target: "HANDLE_STATE", "cur: {cur:?}");
                 } // END DEBUG -- TODO: remove
 
+                // shall we keep the directory handle (file descriptor) open?
                 if resident {
-                    self.add_handle(path, handle);
+                    self.add_fd(path, handle.as_raw_fd());
+                    self.handles.insert(handle);
+                } else {
+                    drop(handle); // unnecessary, but explicit
                 }
             }
             Err(e) => {
-                self.counts.errors.fetch_add(1, Relaxed);
+                self.add_error(TreeEvent::error(&e.to_string(), TreeOp::Scan(path.into())));
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
             }
         }
     }
 
-    /// Add a [[DirHandle]] object to a directory node's [[Directory]] item.
-    pub fn add_handle(&self, path: &PathBuf, handle: DirHandle) {
+    /// Add a [[RawFd]] to a directory node's [[Directory]] item.
+    fn add_fd(&self, path: &PathBuf, fd: RawFd) {
         self.get_node(path.to_string_lossy().as_ref()).map(|node| {
             node.as_dir().map(|dir| {
-                dir.handle_set(handle);
-                self.counts.handles.fetch_add(1, Relaxed);
+                dir.fd_set(fd).ok();
             })
         });
     }
@@ -1331,7 +1360,10 @@ impl DirTree {
                         return;
                     } else {
                         // should never happen
-                        error!("Child {part:?} missing from HashMap: {current:?}");
+                        self.add_error(TreeEvent::error(
+                            &format!("Child {part:?} missing from HashMap: {current:?}"),
+                            TreeOp::Insert,
+                        ));
                         return;
                     }
                 }
@@ -1378,7 +1410,7 @@ impl DirTree {
             Some(node) => {
                 if node.node_t == NodeType::Root {
                     let msg: &str = "Cannot remove root node";
-                    error!(msg);
+                    self.add_error(TreeEvent::error(msg, TreeOp::Remove(path.into())));
                     return Err(Error::new(ErrorKind::InvalidInput, msg));
                 };
 
@@ -1398,7 +1430,9 @@ impl DirTree {
 
                     None => {
                         let msg: String = format!("Stale parent reference: {:?}", node.path());
-                        error!(msg);
+                        self.add_error(
+                            TreeEvent::error(&msg, TreeOp::Remove(path.into())).node(&node),
+                        );
                         return Err(Error::new(ErrorKind::NotFound, msg));
                     }
                 }
