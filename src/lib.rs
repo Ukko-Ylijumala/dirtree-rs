@@ -5,7 +5,7 @@
 
 use super::{make_weak_ref, path_parts, path_parts_vec, ScanState};
 use crate::args::FileMode;
-use crate::dirhandle::{DirHandle, EntryExt, OpenHandles};
+use crate::dirhandle::{DirHandle, EntryExt}; // OpenHandles
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
 use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
@@ -16,6 +16,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::{metadata, DirEntry, Metadata},
     hash::{Hash, Hasher},
+    hint,
     io::{Error, ErrorKind},
     ops::{Deref, DerefMut},
     os::unix::fs::{DirEntryExt, MetadataExt},
@@ -25,7 +26,7 @@ use std::{
         Arc, OnceLock, Weak,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
 
@@ -767,26 +768,30 @@ pub enum TreeOperation {
     None,
     /// The tree is being built.
     Build,
+    /// Scan a directory and process it into the tree.
+    Scan(PathBuf),
     /// A node (or leaf) is being inserted into the tree.
     Insert,
     /// A node (or leaf) is being removed from the tree.
-    Remove,
+    Remove(String),
     /// The tree is being updated.
-    Update,
-    /// A background scan is running for the tree.
-    Scan,
+    Update(PathBuf),
     /// The tree is being serialized. TODO.
     Serialize,
     /// The tree is being deserialized. TODO.
     Deserialize,
+    /// Signals the background worker thread that it should quit.
+    Quit,
 }
 
 /// The current state of the [[DirTree]].
-#[derive(Default, Debug, Clone, Hash)]
+#[derive(Default, Debug, Clone, Hash, PartialEq)]
 pub enum TreeState {
     /// Initial state, no nodes.
     #[default]
     Uninitialized,
+    /// Initialized but empty.
+    Empty,
     /// The tree is ready for use.
     Ready,
     /// The tree is being actively used.
@@ -800,7 +805,7 @@ pub enum TreeState {
 }
 
 /// A [DirTree] event. Could be an error, warning, or just a notice.
-#[derive(Default, Debug, Clone, Hash)]
+#[derive(Default, Debug, Clone, Hash, PartialEq)]
 pub struct TreeEvent {
     pub msg: String,
     pub oper: Option<TreeOperation>,
@@ -872,6 +877,73 @@ pub struct Counts {
     pub errors: AtomicU32,
 }
 
+/// Background worker thread for handling [TreeOperation]s.
+fn tree_worker(t: Arc<DirTree>, state: ScanState) {
+    let mut spin_ctr: u8 = 0;
+    loop {
+        if t.is_quitting() {
+            break;
+        }
+
+        if t.workq.is_empty() {
+            // wait for work in a spin loop
+            while t.workq.is_empty() {
+                if spin_ctr < 10 {
+                    spin_ctr += 1;
+                    hint::spin_loop();
+                } else {
+                    thread::sleep(Duration::from_micros(10));
+                    spin_ctr = 0;
+                    break;
+                }
+            }
+        }
+
+        match t.workq.pop() {
+            None => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Some(op) => {
+                match op {
+                    TreeOperation::Quit => {
+                        t.set_state(TreeState::Quitting);
+                        break;
+                    }
+                    TreeOperation::Scan(ref path) => {
+                        let p: PathBuf = path.clone();
+                        t.add_event(TreeEvent::op_beg(&op));
+                        t.set_state(TreeState::Active(op));
+                        t.populate(&p, true, &state);
+                    }
+                    TreeOperation::Remove(ref path) => {
+                        let p: String = path.clone();
+                        t.add_event(TreeEvent::op_beg(&op));
+                        t.set_state(TreeState::Active(op.clone()));
+                        t.remove(&p).err().map(|e| {
+                            t.counts.errors.fetch_add(1, Relaxed);
+                            t.add_event(TreeEvent::new(&e.to_string()).path(&p).oper(op));
+                        });
+                    }
+                    TreeOperation::Update(ref _path) => {
+                        //let p: PathBuf = path.clone();
+                        t.add_event(TreeEvent::op_beg(&op));
+                        t.set_state(TreeState::Active(op));
+                        //tree.update(&p);
+                    }
+                    TreeOperation::Build => {}
+                    TreeOperation::Insert => {}
+                    TreeOperation::Serialize => {}   // TODO
+                    TreeOperation::Deserialize => {} // TODO
+                    _ => {}
+                };
+                t.set_state(TreeState::Ready);
+            }
+        }
+    }
+}
+
+/* ######################################################################### */
+
 /// Trie structure for storing a directory tree.
 ///
 /// You can use it f.ex. like this:
@@ -894,7 +966,7 @@ pub struct DirTree {
     filemode: FileMode,
     state: Arc<RwLock<TreeState>>,
     root: Arc<Node>,
-    worker: Option<thread::JoinHandle<()>>,
+    worker: OnceLock<thread::JoinHandle<()>>,
     workq: Arc<SegQueue<TreeOperation>>,
     events: Arc<RwLock<Vec<TreeEvent>>>,
 }
@@ -903,13 +975,7 @@ impl DirTree {
     /// Tree root path (in the filesystem) from which the tree is built.
     /// NOTE: internally stored paths are relative to this.
     pub fn from(&self) -> &PathBuf {
-        &self.from.get().expect("Tree should have a root path")
-    }
-
-    /// Set the root (filesystem) path of the tree.
-    fn set_from(&self, from: PathBuf) {
-        self.from.set(from).ok();
-        self.insert(self.from(), NodeType::Directory, None);
+        &self.from.get().expect("Tree must be initialized")
     }
 
     /// Returns a reference to the tree's [[Counts]] struct.
@@ -944,11 +1010,33 @@ impl DirTree {
         self.events.write().push(event);
     }
 
-    /// Returns `true` if the tree is idle.
+    /// Add an operation to the tree's work queue.
+    fn add_op(&self, op: TreeOperation) {
+        self.workq.push(op);
+    }
+
+    /// Tell the background worker thread to quit.
+    fn quit_worker(&self) {
+        self.add_op(TreeOperation::Quit);
+    }
+
+    /// Tell the background worker thread to scan (populate) the given path.
+    ///
+    /// NOTE: non-blocking, the actual scan is done in the background.
+    pub fn scan(&self, path: &str) {
+        self.add_op(TreeOperation::Scan(PathBuf::from(path)));
+    }
+
+    /// Returns `true` if the tree is uninitialized.
     #[inline]
-    pub fn is_idle(&self) -> bool {
-        !matches!(self.state(), TreeState::Quitting)
-            && matches!(self.state(), TreeState::Ready | TreeState::Uninitialized)
+    pub fn is_uninit(&self) -> bool {
+        matches!(self.state(), TreeState::Uninitialized)
+    }
+
+    /// Returns `true` if the tree is ready (has no active operation).
+    #[inline]
+    pub fn is_ready(&self) -> bool {
+        matches!(self.state(), TreeState::Ready) && !self.is_quitting()
     }
 
     /// Returns `true` if the tree is in an active state.
@@ -1000,6 +1088,32 @@ impl DirTree {
         }
     }
 
+    /// Set the root (filesystem) path of the tree.
+    pub fn from_path(self, path: &str) -> Self {
+        self.from.set(PathBuf::from(path)).ok();
+        self.insert(self.from(), NodeType::Directory, None);
+        self.set_state(TreeState::Empty);
+        self
+    }
+
+    /// Build a new [[DirTree]] with the given options and start the worker thread.
+    ///
+    /// NOTE: must be chained with `from_path()` to set the root path.
+    pub fn build(self, state: &ScanState) -> Arc<DirTree> {
+        if self.from.get().is_none() {
+            panic!("Root path must be set before building the tree");
+        }
+        let tree: Arc<DirTree> = self.into();
+        let tree_c: Arc<DirTree> = tree.clone();
+        let state: ScanState = state.clone();
+        let worker: thread::JoinHandle<()> = thread::Builder::new()
+            .name("tree_worker".into())
+            .spawn(|| tree_worker(tree_c, state))
+            .expect("Failed to start DirTree worker thread");
+        tree.worker.set(worker).ok();
+        tree
+    }
+
     /// Creates a new [[DirTree]] with the given path as root.
     ///
     /// If `recursive` is true, also populates the tree by recursively walking
@@ -1008,8 +1122,7 @@ impl DirTree {
     #[instrument(name = "DirTree", skip_all)]
     pub fn new_from_path(path: &str, state: &ScanState, recursive: bool) -> Self {
         debug!(target: "path", "{path}");
-        let tree: DirTree = Self::new(state.filemode);
-        tree.set_from(PathBuf::from(path));
+        let tree: DirTree = Self::new(state.filemode).from_path(path);
         /*
         Technically we've not yet scanned the root directory, but this place
         is the most logical one to do the increment to keep the counter in
@@ -1750,12 +1863,16 @@ mod tests {
         let (nodes, dirs, files, depth) = counts(&tree);
 
         assert_eq!(tree.root.node_t, NodeType::Root);
-        assert_eq!(*tree.from(), PathBuf::default());
+        assert_eq!(tree.from, OnceLock::default());
+        assert_eq!(tree.state(), TreeState::Uninitialized);
+        assert!(tree.is_uninit(), "Tree is not uninitialized");
         tree.validate_counts();
         assert_eq!(nodes, 0, "nodes mismatch");
         assert_eq!(dirs, 0, "dirs mismatch");
         assert_eq!(files, 0, "files mismatch");
         assert_eq!(depth, 0, "depth mismatch");
+        tree.from.set(PathBuf::from("/foo")).ok();
+        assert_eq!(tree.from(), &PathBuf::from("/foo"));
     }
 
     #[test]
@@ -1765,12 +1882,12 @@ mod tests {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
 
-        let tree: DirTree = DirTree::new(FileMode::NODE);
-        tree.set_from(PathBuf::from(path));
+        let tree: DirTree = DirTree::new(FileMode::NODE).from_path(path);
         let (nodes, dirs, files, depth) = counts(&tree);
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
 
         tree.validate_counts();
+        assert_eq!(tree.state(), TreeState::Empty);
         assert_eq!(nodes, root_depth.into(), "nodes mismatch");
         assert_eq!(dirs, root_depth.into(), "dirs mismatch");
         assert_eq!(files, 0, "files mismatch");
@@ -1782,6 +1899,28 @@ mod tests {
         let (_, tree, root_depth) = create_test_tree(true);
         let (nodes, dirs, files, depth) = counts(&tree);
         check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
+    }
+
+    #[test]
+    fn test_tree_build_thread() {
+        unsafe { setup_tests() }
+        let (path, state) = unsafe {
+            (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
+        };
+
+        let tree: Arc<DirTree> = DirTree::new(FileMode::NODE).from_path(path).build(state);
+        assert!(tree.worker.get().is_some(), "Worker not initialized");
+
+        tree.scan(path); // non-blocking, so we must wait for it to finish
+        while !tree.is_ready() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        tree.validate_counts();
+        let (nodes, dirs, files, depth) = counts(&tree);
+        let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
+        check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
+        tree.quit_worker();
     }
 
     #[test]
@@ -1940,6 +2079,8 @@ mod tests {
         let tree: DirTree = DirTree::new_from_path(path, state, recursive);
         assert_eq!(tree.root.node_t, NodeType::Root);
         assert_eq!(*tree.from(), PathBuf::from(path));
+        assert_eq!(tree.state(), TreeState::Ready);
+        assert!(tree.is_ready(), "Tree is not ready");
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
         tree.validate_counts();
         (path, tree, root_depth)
