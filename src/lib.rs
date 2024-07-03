@@ -1120,7 +1120,7 @@ impl DirTree {
     /// the full directory structure (starting from from the given directory)
     /// and inserting each found path into the tree.
     #[instrument(name = "DirTree", skip_all)]
-    pub fn new_from_path(path: &str, state: &ScanState, recursive: bool) -> Self {
+    pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, resident: bool) -> Self {
         debug!(target: "path", "{path}");
         let tree: DirTree = Self::new(state.filemode).from_path(path);
         /*
@@ -1135,7 +1135,7 @@ impl DirTree {
             tree.set_state(TreeState::Active(TreeOperation::Build));
             tree.add_event(TreeEvent::op_beg(&TreeOperation::Build).path(path));
             match state.sync {
-                false => tree.populate_par(tree.from(), true, state),
+                false => tree.populate_par(tree.from(), true, resident, state),
                 true => tree.populate(tree.from(), true, state),
             }
         };
@@ -1195,7 +1195,7 @@ impl DirTree {
     /// method, which tries to return the directory entries first using a small
     /// buffer to look ahead in the directory stream.
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
-    pub fn populate_par(&self, path: &PathBuf, recursive: bool, state: &ScanState) {
+    pub fn populate_par(&self, path: &PathBuf, recursive: bool, resident: bool, state: &ScanState) {
         trace!(target: "DirHandle", "{:?}", path.display());
         match DirHandle::new(path) {
             Ok(mut handle) => {
@@ -1208,7 +1208,7 @@ impl DirTree {
                                 self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
                                 if recursive {
-                                    self.populate_par(&entry_p, recursive, state);
+                                    self.populate_par(&entry_p, recursive, resident, state);
                                 }
                             } else if entry.is_file() {
                                 if self.filemode.is_with_size() {
@@ -1238,7 +1238,9 @@ impl DirTree {
                     debug!(target: "HANDLE_STATE", "cur: {cur:?}");
                 } // END DEBUG -- TODO: remove
 
-                self.add_handle(path, handle);
+                if resident {
+                    self.add_handle(path, handle);
+                }
             }
             Err(e) => {
                 self.counts.errors.fetch_add(1, Relaxed);
@@ -2076,7 +2078,7 @@ mod tests {
         let (path, state) = unsafe {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
-        let tree: DirTree = DirTree::new_from_path(path, state, recursive);
+        let tree: DirTree = DirTree::new_from_path(path, state, recursive, false);
         assert_eq!(tree.root.node_t, NodeType::Root);
         assert_eq!(*tree.from(), PathBuf::from(path));
         assert_eq!(tree.state(), TreeState::Ready);
