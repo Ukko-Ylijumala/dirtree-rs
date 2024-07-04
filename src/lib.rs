@@ -1128,6 +1128,7 @@ impl DirTree {
         let tree_c: Arc<DirTree> = tree.clone();
         let state: ScanState = state.clone();
         let worker: thread::JoinHandle<()> = thread::Builder::new()
+            .stack_size(256 * 1024) // 256 KiB
             .name("tree_worker".into())
             .spawn(|| tree_worker(tree_c, state))
             .expect("Failed to start DirTree worker thread");
