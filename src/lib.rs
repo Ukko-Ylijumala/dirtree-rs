@@ -3,7 +3,7 @@
 // non_snake_case added due to `instrument` macro causing a false positive for `dtor`
 #![allow(dead_code, non_snake_case)]
 
-use super::{make_weak_ref, path_parts, path_parts_vec, ScanState};
+use super::{make_weak_ref, path_parts, path_parts_vec, ScanState, ToDebug, ToDisplay};
 use crate::args::FileMode;
 use crate::dirhandle::{DirHandle, EntryExt, OpenHandles};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
+    fmt::{self, Debug, Display, Formatter},
     fs::{metadata, DirEntry, Metadata},
     hash::{Hash, Hasher},
     hint,
@@ -806,7 +807,7 @@ pub enum TreeState {
 }
 
 /// A [DirTree] event. Could be an error, warning, or just a notice.
-#[derive(Default, Debug, Clone, Hash, PartialEq)]
+#[derive(Default, Clone, Hash, PartialEq)]
 pub struct TreeEvent {
     pub msg: String,
     pub oper: Option<TreeOp>,
@@ -868,6 +869,38 @@ impl TreeEvent {
             oper: Some(op),
             ..Default::default()
         }
+    }
+}
+
+#[rustfmt::skip]
+impl Debug for TreeEvent {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let d: String = "None".into();
+        write!(
+            f,
+            "TreeEvent {{ {when} UTC: {msg:?}, oper: {oper}, path: {path}, node: {node} }}",
+            msg = self.msg,
+            when = self.when.to_display(),
+            path = self.path.as_deref().unwrap_or(&d),
+            oper = self.oper.as_ref().map_or(d.clone(), |o| o.to_debug()),
+            node = self.node.as_ref().map_or(d.clone(), |n| n.name().unwrap_or("<unnamed>".to_owned())),
+        )
+    }
+}
+
+#[rustfmt::skip]
+impl Display for TreeEvent {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let d: String = "".into();
+        write!(
+            f,
+            "{when} UTC: {msg:?}, op: {oper} {path} {node}",
+            msg = self.msg,
+            when = self.when.to_display(),
+            path = self.path.as_deref().unwrap_or(&d),
+            oper = self.oper.as_ref().map_or("None".to_owned(), |o| o.to_debug()),
+            node = self.node.as_ref().map_or(d.clone(), |n| n.name().unwrap_or(d.clone())),
+        )
     }
 }
 
