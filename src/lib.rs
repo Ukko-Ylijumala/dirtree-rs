@@ -5,7 +5,7 @@
 
 use super::{make_weak_ref, path_parts, path_parts_vec, ScanState, ToDebug, ToDisplay};
 use crate::args::FileMode;
-use crate::dirhandle::{DirHandle, EntryExt, OpenHandles};
+use crate::dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
 use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
@@ -195,7 +195,7 @@ impl<T> DirectoryEntry for Entry<T> {
 #[derive(Debug)]
 pub struct Directory {
     name: String,
-    fd: OnceLock<RawFd>,
+    fd: DirFd,
     children: Children,
 }
 
@@ -212,21 +212,29 @@ impl Directory {
         &self.name
     }
 
-    fn set_name(&mut self, name: String) {
+    fn name_set(&mut self, name: String) {
         self.name = name;
     }
 
-    /// Returns the [[RawFd]] for this [[Directory]] item, if we have it open.
-    pub fn fd(&self) -> Option<RawFd> {
-        self.fd.get().copied()
+    /// Returns the [[DirFd]] for this [[Directory]] item.
+    pub fn fd(&self) -> &DirFd {
+        &self.fd
     }
 
-    fn fd_set(&self, fd: RawFd) -> Result<(), RawFd> {
+    /// Set the file descriptor for this directory.
+    ///
+    /// Returns the file descriptor if it was set successfully.
+    /// If the fd is already set, returns an error with the existing fd.
+    fn fd_set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
         self.fd.set(fd)
     }
 
-    fn fd_close(&mut self) {
-        self.fd.take();
+    /// Clear the file descriptor for this directory.
+    ///
+    /// If the fd is set, we "store" the negative value of the fd.
+    /// If the fd is already cleared (negative), we set it to 0.
+    fn fd_clear(&self) {
+        self.fd.clear();
     }
 
     #[inline]
@@ -264,7 +272,7 @@ impl Default for Directory {
     fn default() -> Self {
         Directory {
             name: "".to_string(),
-            fd: OnceLock::new(),
+            fd: DirFd::default(),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
     }
@@ -442,7 +450,15 @@ impl NodeItem {
     /// Set the name of the inner [[Directory]] if the node item is [NodeItem::Dir].
     fn set_dir_name(&mut self, name: &str) {
         if let Self::Dir(v) = self {
-            v.1.set_name(name.to_owned());
+            v.1.name_set(name.to_owned());
+        }
+    }
+
+    /// Clear the file descriptor of the inner [[Directory]]
+    /// if the node item is [NodeItem::Dir].
+    fn clear_fd(&mut self) {
+        if let Self::Dir(v) = self {
+            v.1.fd_clear();
         }
     }
 
@@ -503,10 +519,10 @@ impl From<Entry<FileEntry>> for NodeItem {
 /* ######################################################################### */
 
 /// Node in the trie structure for storing paths and items, respectively.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
     pub node_t: NodeType,
-    item: Arc<OnceLock<NodeItem>>,
+    item: OnceLock<NodeItem>,
     parent: Weak<Node>,
 }
 
@@ -523,8 +539,8 @@ impl Node {
         };
         Self {
             item: match node_t {
-                NodeType::Uninitialized => OnceLock::new().into(),
-                _ => Arc::new(item.into()),
+                NodeType::Uninitialized => OnceLock::new(),
+                _ => item.into(),
             },
             node_t,
             parent: parent.map_or_else(|| Weak::new(), |p: Arc<Node>| make_weak_ref(p)),
@@ -617,9 +633,9 @@ impl Node {
         }
     }
 
-    /// Returns the [[RawFd]] for this node if it's a directory and if we have a fd.
-    pub fn fd(&self) -> Option<RawFd> {
-        self.as_dir().map(|dir: &Directory| dir.fd())?
+    /// Returns the [[DirFd]] for this node if it's a directory.
+    pub fn dirfd(&self) -> Option<&DirFd> {
+        self.as_dir().map(|dir: &Directory| dir.fd())
     }
 
     #[inline]
@@ -681,19 +697,8 @@ impl Default for Node {
     fn default() -> Self {
         Node {
             node_t: NodeType::Uninitialized,
-            item: OnceLock::new().into(),
+            item: OnceLock::new(),
             parent: Weak::new(),
-        }
-    }
-}
-
-impl Clone for Node {
-    /// Clones the [[Node]] and its children.
-    fn clone(&self) -> Self {
-        Self {
-            node_t: self.node_t.clone(),
-            item: self.item.clone(),
-            parent: self.parent.clone(),
         }
     }
 }
@@ -1507,6 +1512,51 @@ impl DirTree {
         match node.node_t.has_data() {
             true => Some(node.path()),
             false => None,
+        }
+    }
+
+    /* --------------------------------- */
+
+    /// If we have a directory handle for a path, return its file descriptor.
+    pub fn dirfd(&self, path: &str) -> Option<DirFd> {
+        self.get_node(path).and_then(|node: Arc<Node>| {
+            node.as_dir()
+                .and_then(|dir: &Directory| Some(dir.fd().clone()))
+        })
+    }
+
+    /**
+    If we have a directory handle for a path, return its [CheckedOutHandle].
+    If we don't have an open handle, but we have a [Node] for such directory,
+    we try opening a handle and returning it.
+    */
+    pub fn handle(&self, path: &str) -> Option<CheckedOutHandle> {
+        let node: Arc<Node> = self.get_node(path)?;
+        node.as_dir().and_then(|dir: &Directory| {
+            let fd: RawFd = dir.fd().fd();
+            if fd > 0 {
+                self.handles.get(fd)
+            } else {
+                if let Ok(handle) = self.handles.open(&node.path()) {
+                    dir.fd_set(handle.as_raw_fd()).ok();
+                    Some(handle)
+                } else {
+                    None
+                }
+            }
+        })
+    }
+
+    /// Remove a handle for a directory path and clear the [DirFd] in the [Directory].
+    pub fn handle_close(&self, path: &str) {
+        if let Some(node) = self.get_node(path) {
+            if node.is_dir() {
+                let fd: RawFd = node.dirfd().unwrap().fd();
+                if fd > 0 {
+                    self.handles.close(fd);
+                    node.dirfd().unwrap().clear();
+                }
+            }
         }
     }
 
