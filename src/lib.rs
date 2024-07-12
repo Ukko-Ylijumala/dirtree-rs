@@ -24,7 +24,7 @@ use std::{
     os::unix::fs::{DirEntryExt, MetadataExt},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, AtomicU8, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::Relaxed},
         Arc, OnceLock, Weak,
     },
     thread,
@@ -261,7 +261,8 @@ impl Directory {
         self.read().get(name).map(|v: &MaybeNode| v.clone())?
     }
 
-    /// Remove a child node (or a file name entry) by name.
+    /// Remove a child node (or a file name entry) by name. The removal is
+    /// cascading (all descendants of the child node are removed as well).
     #[instrument(level = "trace", skip(self))]
     fn remove_child(&self, name: &str) {
         self.write().remove(name);
@@ -668,7 +669,15 @@ impl Node {
             .map_or(None, |dir: &Directory| dir.get_child(name))
     }
 
-    /// Remove a child [[Node]] by name.
+    /**
+    Remove a child [[Node]] by name.
+
+    NOTE: due to the way the tree is structured, as soon as we drop a child,
+    all its descendants are also dropped in a cascading manner. This happens
+    because each child is stored in an `Arc` and most likely only the parent
+    has a reference to it. When the last reference to a node is dropped,
+    the node is dropped as well due to refcounting.
+    */
     fn remove_child(&self, name: &str) {
         self.as_dir().map(|dir: &Directory| dir.remove_child(name));
     }
@@ -775,8 +784,8 @@ pub enum TreeOp {
     None,
     /// The tree is being built.
     Build,
-    /// Scan a directory and process it into the tree.
-    Scan(PathBuf),
+    /// Scan a directory and process it into the tree, optionally recursively.
+    Scan(PathBuf, Option<bool>),
     /// A node (or leaf) is being inserted into the tree.
     Insert,
     /// A node (or leaf) is being removed from the tree.
@@ -909,18 +918,114 @@ impl Display for TreeEvent {
     }
 }
 
-/// Atomic counters for tracking the number of nodes, directories, and files.
-/// Using a separate counter struct allows us to not have to lock the entire
-/// tree f.ex. when inserting or removing nodes.
+/**
+Atomic counters for tracking the number of nodes, directories, and files.
+Using a separate counter struct allows us to not have to lock the entire
+tree f.ex. when inserting or removing nodes. Also stores tree configuration.
+*/
 #[derive(Default, Debug)]
-pub struct Counts {
+pub struct TreeConf {
+    from: OnceLock<PathBuf>,
+    ctime: SecondsSinceEpoch,
     /// Does not include the root node.
-    pub nodes: AtomicU32,
-    pub dirs: AtomicU32,
-    pub files: AtomicU32,
+    nodes: AtomicU32,
+    dirs: AtomicU32,
+    files: AtomicU32,
     /// Maximum depth of the tree. Root is at depth 0.
-    pub depth: AtomicU8,
-    pub errors: AtomicU32,
+    depth: AtomicU8,
+    errors: AtomicU32,
+    filemode: FileMode,
+    recursive: AtomicBool,
+    resident: AtomicBool,
+    sync: AtomicBool,
+}
+
+impl TreeConf {
+    fn new(filemode: FileMode) -> Self {
+        Self {
+            filemode,
+            ..Default::default()
+        }
+    }
+
+    fn from(&self) -> &PathBuf {
+        self.from.get().expect("Tree must be initialized")
+    }
+    fn set_from(&self, path: &str) {
+        self.from.set(PathBuf::from(path)).ok();
+    }
+
+    fn nodes(&self) -> u32 {
+        self.nodes.load(Relaxed)
+    }
+    fn dirs(&self) -> u32 {
+        self.dirs.load(Relaxed)
+    }
+    fn files(&self) -> u32 {
+        self.files.load(Relaxed)
+    }
+    fn depth(&self) -> u8 {
+        self.depth.load(Relaxed)
+    }
+    fn errors(&self) -> u32 {
+        self.errors.load(Relaxed)
+    }
+
+    fn recursive(&self) -> bool {
+        self.recursive.load(Relaxed)
+    }
+    fn resident(&self) -> bool {
+        self.resident.load(Relaxed)
+    }
+    fn sync(&self) -> bool {
+        self.sync.load(Relaxed)
+    }
+
+    fn set_recursive(&self, val: bool) {
+        self.recursive.store(val, Relaxed);
+    }
+    fn set_resident(&self, val: bool) {
+        self.resident.store(val, Relaxed);
+    }
+    fn set_sync(&self, val: bool) {
+        self.sync.store(val, Relaxed);
+    }
+
+    /// Increment or decrement the node counter.
+    #[inline]
+    fn nodes_mod(&self, n: i32) {
+        mod_atom_u32(&self.nodes, n);
+    }
+    /// Increment or decrement the dirs counter.
+    #[inline]
+    fn dirs_mod(&self, n: i32) {
+        mod_atom_u32(&self.dirs, n);
+    }
+    /// Increment or decrement the files counter.
+    #[inline]
+    fn files_mod(&self, n: i32) {
+        mod_atom_u32(&self.files, n);
+    }
+
+    /// Increment the error counter by 1.
+    fn errors_inc(&self) {
+        self.errors.fetch_add(1, Relaxed);
+    }
+
+    /// Compare the current depth with the given depth and set the maximum.
+    fn depth_compare(&self, d: u8) {
+        self.depth.fetch_max(d, Relaxed);
+    }
+}
+
+/// Increment or decrement an [AtomicU32] value in Relaxed mode.
+#[inline]
+fn mod_atom_u32(a: &AtomicU32, n: i32) {
+    if n > 0 {
+        a.fetch_add(n as u32, Relaxed);
+    } else if n < 0 {
+        a.fetch_sub(n.abs() as u32, Relaxed);
+    }
 }
 
 /// Background worker thread for handling [TreeOperation]s.
@@ -955,18 +1060,18 @@ fn tree_worker(t: Arc<DirTree>, state: ScanState) {
                         t.set_state(TreeState::Quitting);
                         break;
                     }
-                    TreeOp::Scan(ref path) => {
+                    TreeOp::Scan(ref path, recursive) => {
                         let p: PathBuf = path.clone();
                         t.add_event(TreeEvent::op_beg(&op));
                         t.set_state(TreeState::Active(op));
-                        t.populate(&p, true, &state);
+                        t.populate(&p, &state, recursive);
                     }
                     TreeOp::Remove(ref path) => {
                         let p: String = path.clone();
                         t.add_event(TreeEvent::op_beg(&op));
                         t.set_state(TreeState::Active(op.clone()));
-                        t.remove(&p).err().map(|e| {
-                            t.counts.errors.fetch_add(1, Relaxed);
+                        t.remove(&p).err().map(|e: Error| {
+                            t.conf.errors_inc();
                             t.add_event(TreeEvent::new(&e.to_string()).path(&p).op(op));
                         });
                     }
@@ -982,7 +1087,9 @@ fn tree_worker(t: Arc<DirTree>, state: ScanState) {
                     TreeOp::Deserialize => {} // TODO
                     _ => {}
                 };
-                t.set_state(TreeState::Ready);
+                if t.workq.is_empty() {
+                    t.set_state(TreeState::Ready);
+                }
             }
         }
     }
@@ -1006,14 +1113,11 @@ fn tree_worker(t: Arc<DirTree>, state: ScanState) {
 /// tree.print_info(); // print basic tree info (nodes, dirs, files etc)
 #[derive(Default, Debug)]
 pub struct DirTree {
-    from: OnceLock<PathBuf>,
-    counts: Arc<Counts>,
-    created: SecondsSinceEpoch,
-    filemode: FileMode,
+    conf: Arc<TreeConf>,
     state: RwLock<TreeState>,
     root: Arc<Node>,
     handles: OpenHandles,
-    worker: OnceLock<thread::JoinHandle<()>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
     workq: SegQueue<TreeOp>,
     events: RwLock<Vec<TreeEvent>>,
 }
@@ -1028,12 +1132,16 @@ impl DirTree {
     /// Tree root path (in the filesystem) from which the tree is built.
     /// NOTE: internally stored paths are relative to this.
     pub fn from(&self) -> &PathBuf {
-        &self.from.get().expect("Tree must be initialized")
+        self.conf.from()
     }
 
-    /// Returns a reference to the tree's [[Counts]] struct.
-    pub fn counts(&self) -> Arc<Counts> {
-        self.counts.clone()
+    /// Returns a reference to the tree's [[TreeConf]] struct.
+    pub fn conf(&self) -> Arc<TreeConf> {
+        self.conf.clone()
+    }
+
+    pub fn filemode(&self) -> &FileMode {
+        &self.conf.filemode
     }
 
     /// The number of open directory handles.
@@ -1043,7 +1151,7 @@ impl DirTree {
 
     /// Returns a reference to the tree's creation time.
     pub fn created(&self) -> &SecondsSinceEpoch {
-        &self.created
+        &self.conf.ctime
     }
 
     /// Returns the current [[TreeState]].
@@ -1072,7 +1180,7 @@ impl DirTree {
     fn add_error(&self, event: TreeEvent) {
         error!("{event:?}");
         self.add_event(event);
-        self.counts.errors.fetch_add(1, Relaxed);
+        self.conf.errors_inc();
     }
 
     /// Add an operation to the tree's work queue.
@@ -1087,9 +1195,13 @@ impl DirTree {
 
     /// Tell the background worker thread to scan (populate) the given path.
     ///
-    /// NOTE: non-blocking, the actual scan is done in the background.
-    pub fn scan(&self, path: &str) {
-        self.add_op(TreeOp::Scan(PathBuf::from(path)));
+    /// NOTE: If `recursive` is `None`, the tree's default is used.
+    ///
+    /// NOTE: non-blocking, the actual scan is done in the background. The scan
+    /// is finished when [TreeState::Ready]. This can also be checked with the
+    /// `is_ready()` method.
+    pub fn scan(&self, path: &str, recursive: Option<bool>) {
+        self.add_op(TreeOp::Scan(PathBuf::from(path), recursive));
     }
 
     /// Returns `true` if the tree is uninitialized.
@@ -1107,7 +1219,7 @@ impl DirTree {
     /// Returns `true` if the tree is in an active state.
     #[inline]
     pub fn is_active(&self) -> bool {
-        matches!(self.state(), TreeState::Active(_))
+        matches!(self.state(), TreeState::Active(_)) || self.workq.len() > 0
     }
 
     /// Returns `true` if the tree is in a quitting state.
@@ -1142,14 +1254,14 @@ impl DirTree {
     pub fn new(filemode: FileMode) -> Self {
         DirTree {
             root: Node::new(NodeItem::Root(Directory::new("ROOT")), None).into(),
-            filemode,
+            conf: TreeConf::new(filemode).into(),
             ..Default::default()
         }
     }
 
     /// Set the root (filesystem) path of the tree.
     pub fn from_path(self, path: &str) -> Self {
-        self.from.set(PathBuf::from(path)).ok();
+        self.conf.set_from(path);
         self.insert(self.from(), NodeType::Directory, None);
         self.set_state(TreeState::Empty);
         self
@@ -1159,9 +1271,10 @@ impl DirTree {
     ///
     /// NOTE: must be chained with `from_path()` to set the root path.
     pub fn build(self, state: &ScanState) -> Arc<DirTree> {
-        if self.from.get().is_none() {
+        if self.conf.from.get().is_none() {
             panic!("Root path must be set before building the tree");
         }
+        self.conf.set_sync(state.sync);
         let tree: Arc<DirTree> = self.into();
         let tree_c: Arc<DirTree> = tree.clone();
         let state: ScanState = state.clone();
@@ -1170,7 +1283,7 @@ impl DirTree {
             .name("tree_worker".into())
             .spawn(|| tree_worker(tree_c, state))
             .expect("Failed to start DirTree worker thread");
-        tree.worker.set(worker).ok();
+        *tree.worker.lock() = Some(worker);
         tree
     }
 
@@ -1183,11 +1296,14 @@ impl DirTree {
     pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, resident: bool) -> Self {
         debug!(target: "path", "{path}");
         let tree: DirTree = Self::new(state.filemode).from_path(path);
+        tree.conf.set_recursive(recursive);
+        tree.conf.set_resident(resident);
+        tree.conf.set_sync(state.sync);
         /*
         Technically we've not yet scanned the root directory, but this place
         is the most logical one to do the increment to keep the counter in
         sync as adding more logic to `populate*()` methods would be counter-
-        productive. Besides, this counter is only for display for now.
+        productive. Besides, this counter is only for display.
         */
         state.num_d.inc1();
         debug!(target: "TREE", "{tree:?}");
@@ -1195,8 +1311,8 @@ impl DirTree {
             tree.set_state(TreeState::Active(TreeOp::Build));
             tree.add_event(TreeEvent::op_beg(&TreeOp::Build).path(path));
             match state.sync {
-                false => tree.populate_par(tree.from(), true, resident, state),
-                true => tree.populate(tree.from(), true, state),
+                true => tree.populate(tree.from(), state, Some(recursive)),
+                false => tree.populate_par(tree.from(), state),
             }
         };
         tree.set_state(TreeState::Ready);
@@ -1208,7 +1324,7 @@ impl DirTree {
     ///
     /// NOTE: single threaded, potentially slow with large directory trees.
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
-    pub fn populate(&self, path: &PathBuf, recursive: bool, state: &ScanState) {
+    pub fn populate(&self, path: &PathBuf, state: &ScanState, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
         match path.read_dir().ok() {
             Some(entries) => {
@@ -1220,25 +1336,28 @@ impl DirTree {
                             if entry_t.is_dir() {
                                 self.insert(&path, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
-                                if recursive {
-                                    //rayon::spawn(move || self.populate(&path, recursive, state));
-                                    self.populate(&path, recursive, state);
+                                if recursive.is_some_and(|r: bool| r) || self.conf.recursive() {
+                                    //rayon::spawn(move || self.populate(&path, state, recursive));
+                                    self.populate(&path, state, recursive);
                                 }
                             } else if entry_t.is_file() {
-                                if self.filemode.is_with_size() {
+                                if self.filemode().is_with_size() {
                                     //FIXME: add error handling
                                     state.fsize.fetch_add(entry.metadata().ok().unwrap().len());
                                 }
-                                if self.filemode.is_name() {
+                                if self.filemode().is_name() {
                                     self.insert(&path, NodeType::Name, None);
-                                } else if self.filemode.is_node() {
+                                } else if self.filemode().is_node() {
                                     self.insert(&path, NodeType::File, Some(entry.ino()));
                                 }
                                 state.num_f.inc1();
                             }
                         }
                         Err(e) => {
-                            self.counts.errors.fetch_add(1, Relaxed);
+                            self.add_error(TreeEvent::error(
+                                &e.to_string(),
+                                TreeOp::Scan(path.clone(), recursive),
+                            ));
                             debug!("Error with {}: {e}", path.display());
                         }
                     }
@@ -1255,7 +1374,7 @@ impl DirTree {
     /// method, which tries to return the directory entries first using a small
     /// buffer to look ahead in the directory stream.
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
-    pub fn populate_par(&self, path: &PathBuf, recursive: bool, resident: bool, state: &ScanState) {
+    pub fn populate_par(&self, path: &PathBuf, state: &ScanState) {
         match DirHandle::new(path) {
             Ok(mut handle) => {
                 trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
@@ -1267,16 +1386,16 @@ impl DirTree {
                             if entry.is_dir() {
                                 self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
-                                if recursive {
-                                    self.populate_par(&entry_p, recursive, resident, state);
+                                if self.conf.recursive() {
+                                    self.populate_par(&entry_p, state);
                                 }
                             } else if entry.is_file() {
-                                if self.filemode.is_with_size() {
+                                if self.filemode().is_with_size() {
                                     state.fsize.fetch_add(entry.len());
                                 }
-                                if self.filemode.is_name() {
+                                if self.filemode().is_name() {
                                     self.insert(&entry_p, NodeType::Name, None);
-                                } else if self.filemode.is_node() {
+                                } else if self.filemode().is_node() {
                                     self.insert(&entry_p, NodeType::File, Some(entry.ino()));
                                 }
                                 state.num_f.inc1();
@@ -1286,7 +1405,7 @@ impl DirTree {
                             self.add_event(
                                 TreeEvent::new("Unknown entry type")
                                     .path(&entry_p.to_string_lossy().clone())
-                                    .op(TreeOp::Scan(path.into())),
+                                    .op(TreeOp::Scan(path.into(), Some(self.conf.recursive()))),
                             );
                             debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
                         }
@@ -1304,7 +1423,7 @@ impl DirTree {
                 } // END DEBUG -- TODO: remove
 
                 // shall we keep the directory handle (file descriptor) open?
-                if resident {
+                if self.conf.resident() {
                     self.add_fd(path, handle.as_raw_fd());
                     self.handles.insert(handle);
                 } else {
@@ -1312,7 +1431,10 @@ impl DirTree {
                 }
             }
             Err(e) => {
-                self.add_error(TreeEvent::error(&e.to_string(), TreeOp::Scan(path.into())));
+                self.add_error(TreeEvent::error(
+                    &e.to_string(),
+                    TreeOp::Scan(path.into(), Some(self.conf.recursive())),
+                ));
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
             }
         }
@@ -1338,7 +1460,7 @@ impl DirTree {
         let parts: Vec<&str> = path_parts_vec(&p_unicode);
         let len: usize = parts.len();
         let mut depth: usize = 0; // root node is at depth 0
-        self.counts.depth.fetch_max(len as u8, Relaxed);
+        self.conf.depth_compare(len as u8);
         // max depth can just as well be updated at this point
 
         for part in parts {
@@ -1363,16 +1485,16 @@ impl DirTree {
                     not reached the leaf node yet and we shouldn't do a
                     full initialization for an intermediate node
                     */
-                    self.counts.nodes.fetch_add(1, Relaxed);
-                    self.counts.dirs.fetch_add(1, Relaxed);
+                    self.conf.nodes_mod(1);
+                    self.conf.dirs_mod(1);
                 } else {
                     new.node_t = node_t.clone();
                     if node_t == NodeType::Directory {
                         let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, inode).unwrap());
                         itm.set_dir_name(part);
                         new.item.set(itm).ok();
-                        self.counts.nodes.fetch_add(1, Relaxed);
-                        self.counts.dirs.fetch_add(1, Relaxed);
+                        self.conf.nodes_mod(1);
+                        self.conf.dirs_mod(1);
                     } else if node_t == NodeType::Name {
                         /*
                         optimization: don't create file Nodes at all, just
@@ -1381,7 +1503,7 @@ impl DirTree {
                         */
                         drop(new);
                         current.as_dir().map(|dir| dir.add_child(part, None));
-                        self.counts.files.fetch_add(1, Relaxed);
+                        self.conf.files_mod(1);
                         debug!(target: "FILENAME_ADD", "{part:?} (store name only)");
                         return;
                     }
@@ -1421,19 +1543,18 @@ impl DirTree {
                 let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, inode).unwrap());
                 itm.set_dir_name(&path.file_name().unwrap().to_string_lossy());
                 current.item.set(itm).ok();
-                self.counts.nodes.fetch_add(1, Relaxed);
-                self.counts.dirs.fetch_add(1, Relaxed);
+                self.conf.dirs_mod(1);
             }
             NodeType::File => {
                 current
                     .item
                     .set(NodeItem::File(Entry::<FileEntry>::new(path, inode).unwrap()))
                     .ok();
-                self.counts.nodes.fetch_add(1, Relaxed);
-                self.counts.files.fetch_add(1, Relaxed);
+                self.conf.files_mod(1);
             }
             _ => return,
         };
+        self.conf.nodes_mod(1);
         debug!(target: "INSERT_CHILD", "{current:?}");
     }
 
@@ -1460,10 +1581,18 @@ impl DirTree {
                         debug!(target: "REMOVE_NODE", "{:?}", node.path().display());
                         assert_eq!(node, c, "Node should be the same as the one in parent");
 
+                        /*
+                        We're potentially removing a branch instead of a leaf,
+                        but since the tree consists of nested Arc<Node> refs,
+                        as soon as we drop a node, its descendant nodes should
+                        also be dropped in a cascading manner since they are no
+                        longer referenced anywhere else. Ahh, the beauty of
+                        automatic reference counting.
+                        */
                         parent.remove_child(&name);
-                        self.counts.nodes.fetch_sub(nodes, Relaxed);
-                        self.counts.dirs.fetch_sub(dirs, Relaxed);
-                        self.counts.files.fetch_sub(files, Relaxed);
+                        self.conf.nodes_mod(-(nodes as i32));
+                        self.conf.dirs_mod(-(dirs as i32));
+                        self.conf.files_mod(-(files as i32));
                         return Ok(Some((nodes, dirs, files)));
                     }
 
@@ -1786,10 +1915,10 @@ impl DirTree {
     pub fn print_info(&self) {
         eprintln!(
             "Tree info : nodes {}, dirs {}, files {}, depth {}, ctime {} UTC",
-            self.counts().nodes.load(Relaxed),
-            self.counts().dirs.load(Relaxed),
-            self.counts().files.load(Relaxed),
-            self.counts().depth.load(Relaxed),
+            self.conf().nodes.load(Relaxed),
+            self.conf().dirs.load(Relaxed),
+            self.conf().files.load(Relaxed),
+            self.conf().depth.load(Relaxed),
             self.created(),
         );
     }
@@ -1823,11 +1952,11 @@ impl DirTree {
     /// This is a debugging function using asserts, hence it will panic if the
     /// counts do not match.
     pub fn validate_counts(&self) {
-        let want_n: u32 = self.counts.nodes.load(Relaxed);
-        let want_d: u32 = self.counts.dirs.load(Relaxed);
-        let want_f: u32 = self.counts.files.load(Relaxed);
+        let want_n: u32 = self.conf.nodes();
+        let want_d: u32 = self.conf.dirs();
+        let want_f: u32 = self.conf.files();
         let d_o: &str = "[dirsonly]";
-        if self.filemode.is_name() {
+        if self.filemode().is_name() {
             assert_eq!(want_n, want_d, "master node count != dirs {d_o}")
         } else {
             assert_eq!(want_n, want_d + want_f, "master node count != dirs+files")
@@ -1838,7 +1967,7 @@ impl DirTree {
         let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.count_from(self.root());
         let n: &str = "count_from()";
-        if self.filemode.is_name() {
+        if self.filemode().is_name() {
             assert_eq!(nodes, dirs, "{n} node count != dirs {d_o}");
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
@@ -1854,7 +1983,7 @@ impl DirTree {
         let start: Instant = Instant::now();
         let (nodes, dirs, files) = self.iter_count();
         let n: &str = "iter_count()";
-        if self.filemode.is_name() {
+        if self.filemode().is_name() {
             assert_eq!(nodes, dirs, "{n} node count != dirs {d_o}");
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
@@ -1877,7 +2006,7 @@ impl DirTree {
         eprintln!(" --> {n} files = {:#?}", start.elapsed());
 
         assert_eq!(want_d, dirs, "{n} dirs do not match");
-        if self.filemode.is_name() {
+        if self.filemode().is_name() {
             assert_eq!(files, 0, "{n} files != 0 {d_o}");
         } else {
             assert_eq!(want_f, files, "{n} files do not match");
@@ -1983,7 +2112,7 @@ mod tests {
         let (nodes, dirs, files, depth) = counts(&tree);
 
         assert_eq!(tree.root.node_t, NodeType::Root);
-        assert_eq!(tree.from, OnceLock::default());
+        assert_eq!(tree.conf.from, OnceLock::default());
         assert_eq!(tree.state(), TreeState::Uninitialized);
         assert!(tree.is_uninit(), "Tree is not uninitialized");
         tree.validate_counts();
@@ -1991,7 +2120,7 @@ mod tests {
         assert_eq!(dirs, 0, "dirs mismatch");
         assert_eq!(files, 0, "files mismatch");
         assert_eq!(depth, 0, "depth mismatch");
-        tree.from.set(PathBuf::from("/foo")).ok();
+        tree.conf.from.set(PathBuf::from("/foo")).ok();
         assert_eq!(tree.from(), &PathBuf::from("/foo"));
     }
 
@@ -2029,9 +2158,10 @@ mod tests {
         };
 
         let tree: Arc<DirTree> = DirTree::new(FileMode::NODE).from_path(path).build(state);
-        assert!(tree.worker.get().is_some(), "Worker not initialized");
+        assert!(tree.worker.lock().is_some(), "Worker not initialized");
 
-        tree.scan(path); // non-blocking, so we must wait for it to finish
+        // scan is non-blocking, so we must wait for it to finish
+        tree.scan(path, Some(true));
         while !tree.is_ready() {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2151,10 +2281,11 @@ mod tests {
                 tree.validate_counts();
                 nodes -= 1;
                 files -= 1;
+                let (n_now, d_now, f_now, _) = counts(&tree);
                 assert!(!tree.contains(&file), "File found after removal: {file}");
-                assert_eq!(tree.counts().nodes.load(Relaxed), nodes, "Node count mismatch [file]");
-                assert_eq!(tree.counts().dirs.load(Relaxed), dirs, "Dir count not equal [file]");
-                assert_eq!(tree.counts().files.load(Relaxed), files, "File count mismatch [file]");
+                assert_eq!(n_now, nodes, "Node count mismatch [file]");
+                assert_eq!(d_now, dirs, "Dir count not equal [file]");
+                assert_eq!(f_now, files, "File count mismatch [file]");
             }
             Err(e) => panic!("Error removing file: {e}"),
         }
@@ -2165,10 +2296,11 @@ mod tests {
                 nodes -= l2_n as u32;
                 dirs -= l2_d as u32;
                 files -= l2_f as u32;
+                let (n_now, d_now, f_now, _) = counts(&tree);
                 assert!(!tree.contains(&l2_p), "L2 dir found after removal: {l2_p}");
-                assert_eq!(tree.counts().nodes.load(Relaxed), nodes, "Node count mismatch [L2]");
-                assert_eq!(tree.counts().dirs.load(Relaxed), dirs, "Dir count mismatch [L2]");
-                assert_eq!(tree.counts().files.load(Relaxed), files, "File count mismatch [L2]");
+                assert_eq!(n_now, nodes, "Node count mismatch [L2]");
+                assert_eq!(d_now, dirs, "Dir count mismatch [L2]");
+                assert_eq!(f_now, files, "File count mismatch [L2]");
             }
             Err(e) => panic!("Error removing L2 dir {l2_p}: {e}"),
         }
@@ -2179,10 +2311,11 @@ mod tests {
                 nodes -= l1_n as u32;
                 dirs -= l1_d as u32;
                 files -= l1_f as u32;
+                let (n_now, d_now, f_now, _) = counts(&tree);
                 assert!(!tree.contains(&l1_p), "L1 dir found after removal: {l1_p}");
-                assert_eq!(tree.counts().nodes.load(Relaxed), nodes, "Node count mismatch [L1]");
-                assert_eq!(tree.counts().dirs.load(Relaxed), dirs, "Dir count mismatch [L1]");
-                assert_eq!(tree.counts().files.load(Relaxed), files, "File count mismatch [L1]");
+                assert_eq!(n_now, nodes, "Node count mismatch [L1]");
+                assert_eq!(d_now, dirs, "Dir count mismatch [L1]");
+                assert_eq!(f_now, files, "File count mismatch [L1]");
             }
             Err(e) => panic!("Error removing L1 dir {l1_p}: {e}"),
         }
@@ -2207,12 +2340,13 @@ mod tests {
     }
 
     /// Return the node, dir and file counts from a DirTree.
+    #[rustfmt::skip]
     fn counts(tree: &DirTree) -> (u32, u32, u32, u8) {
         (
-            tree.counts().nodes.load(Relaxed),
-            tree.counts().dirs.load(Relaxed),
-            tree.counts().files.load(Relaxed),
-            tree.counts().depth.load(Relaxed),
+            tree.conf.nodes(),
+            tree.conf.dirs(),
+            tree.conf.files(),
+            tree.conf.depth(),
         )
     }
 
