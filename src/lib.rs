@@ -1303,13 +1303,11 @@ impl DirTree {
         tree
     }
 
-    /**
-    Creates a new [[DirTree]] with the given path as root.
-
-    If `recursive` is true, also populates the tree by recursively walking
-    the full directory structure (starting from from the given directory)
-    and inserting each found path into the tree.
-    */
+    /// Creates a new [[DirTree]] with the given path as root.
+    ///
+    /// If `recursive` is true, also populates the tree by recursively walking
+    /// the full directory structure (starting from from the given directory)
+    /// and inserting each found path into the tree.
     #[instrument(name = "DirTree", skip_all)]
     pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, resident: bool) -> Self {
         debug!(target: "path", "{path}");
@@ -1337,12 +1335,10 @@ impl DirTree {
         tree
     }
 
-    /**
-    Populate a leaf [[Node]] in the trie with the contents of a directory.
-    Uses the standard [std::fs::read_dir] method to get the directory entries.
-
-    NOTE: single threaded, potentially slow with large directory trees.
-    */
+    /// Populate a leaf [[Node]] in the trie with the contents of a directory.
+    /// Uses the standard [std::fs::read_dir] method to get the directory entries.
+    ///
+    /// NOTE: single threaded, potentially slow with large directory trees.
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
     pub fn populate(&self, path: &PathBuf, state: &ScanState, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
@@ -1390,14 +1386,12 @@ impl DirTree {
         };
     }
 
-    /**
-    Parallel version of [DirTree::populate] using [rayon::iter]
-    to process each dir entry in parallel.
-
-    Uses [[DirHandle]] to read the directory entries, and its [DirHandle::iter]
-    method, which tries to return the directory entries first using a small
-    buffer to look ahead in the directory stream.
-    */
+    /// Parallel version of [DirTree::populate] using [rayon::iter]
+    /// to process each dir entry in parallel.
+    ///
+    /// Uses [[DirHandle]] to read the directory entries, and its [DirHandle::iter]
+    /// method, which tries to return the directory entries first using a small
+    /// buffer to look ahead in the directory stream.
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
     pub fn populate_par(&self, path: &PathBuf, state: &ScanState) {
         match DirHandle::new(path) {
@@ -1583,14 +1577,12 @@ impl DirTree {
         debug!(target: "INSERT_CHILD", "{current:?}");
     }
 
-    /**
-    Remove a [[Node]] (or a leaf) from the trie. Expects an absolute path.
-
-    Returns a tuple of `(nodes, dirs, files)` removed on success and [[None]]
-    if the path was not found. The root node cannot be removed.
-
-    WARNING: implementation is WIP and may yet contain bugs.
-    */
+    /// Remove a [[Node]] (or a leaf) from the trie. Expects an absolute path.
+    ///
+    /// Returns a tuple of `(nodes, dirs, files)` removed on success and [[None]]
+    /// if the path was not found. The root node cannot be removed.
+    ///
+    /// WARNING: implementation is WIP and may yet contain bugs.
     #[instrument(level = "debug", skip(self))]
     pub fn remove(&self, path: &str) -> Result<Option<(u32, u32, u32)>, Error> {
         match self.get_node(path) {
