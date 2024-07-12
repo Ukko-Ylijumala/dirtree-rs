@@ -1198,13 +1198,13 @@ impl DirTree {
     }
 
     /// Add an operation to the tree's work queue.
-    fn add_op(&self, op: TreeOp) {
+    fn queue_op(&self, op: TreeOp) {
         self.workq.push(op);
     }
 
     /// Tell the background worker thread to quit.
     fn quit_worker(&self) {
-        self.add_op(TreeOp::Quit);
+        self.queue_op(TreeOp::Quit);
     }
 
     /**
@@ -1217,7 +1217,7 @@ impl DirTree {
     `is_ready()` method.
     */
     pub fn scan(&self, path: &str, recursive: Option<bool>) {
-        self.add_op(TreeOp::Scan(PathBuf::from(path), recursive));
+        self.queue_op(TreeOp::Scan(PathBuf::from(path), recursive));
     }
 
     /// Returns `true` if the tree is uninitialized.
@@ -1357,8 +1357,11 @@ impl DirTree {
                                 self.insert(&path, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
                                 if recursive.is_some_and(|r: bool| r) || self.conf.recursive() {
-                                    //rayon::spawn(move || self.populate(&path, state, recursive));
-                                    self.populate(&path, state, recursive);
+                                    if self.worker.lock().is_some() {
+                                        self.queue_op(TreeOp::Scan(path, recursive));
+                                    } else {
+                                        self.populate(&path, state, recursive);
+                                    }
                                 }
                             } else if entry_t.is_file() {
                                 if self.filemode().is_with_size() {
