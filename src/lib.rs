@@ -81,10 +81,12 @@ impl PartialOrd for Data {
 
 /* ######################################################################### */
 
-/// A common trait for Directory and File entries.
-///
-/// Used to consolidate common code between [Directory] and [FileEntry] structs
-/// (which themselves are just type placeholders for [Entry] struct).
+/**
+A common trait for Directory and File entries.
+
+Used to consolidate common code between [Directory] and [FileEntry] structs
+(which themselves are just type placeholders for [Entry] struct).
+*/
 trait DirectoryEntry {
     fn data(&self) -> &Data;
     fn data_mut(&mut self) -> &mut Data;
@@ -125,30 +127,32 @@ impl AsRef<Data> for dyn DirectoryEntry {
     }
 }
 
-/// A generic struct wrapping the [Data] struct, with an extra type parameter `T`.
-/// The [Entry] struct's `new()` method is responsible for creating [Directory]
-/// and [File] instances with the given path and metadata.
-///
-/// Two structs [Directory] and [FileEntry] are also defined, which are used
-/// as type parameters for [Entry]. These structs implement the `Default` trait,
-/// which is needed for creating [Entry] instances without additional params.
-///
-/// This approach allows us to share the implementation of [DirectoryEntry]
-/// trait between [Directory] and [FileEntry] without too much code duplication.
-///
-/// You can use the struct like this:
-/// ```rust
-/// use statter::tree::{Directory, Entry, FileEntry};
-/// use std::fs::{metadata, Metadata};
-/// use std::os::unix::fs::MetadataExt;
-/// use std::path::PathBuf;
-///
-/// let root: PathBuf = PathBuf::from("/etc");
-/// let pwfile: PathBuf = root.join("passwd");
-/// let pwmeta: Metadata = metadata(&pwfile).ok().expect("Metadata should be returned");
-///
-/// let d = Entry::<Directory>::new(&root.join("systemd"), None).unwrap();
-/// let f = Entry::<FileEntry>::new(&pwfile, Some(pwmeta.ino())).unwrap();
+/**
+A generic struct wrapping the [Data] struct, with an extra type parameter `T`.
+The [Entry] struct's `new()` method is responsible for creating [Directory]
+and [File] instances with the given path and metadata.
+
+Two structs [Directory] and [FileEntry] are also defined, which are used
+as type parameters for [Entry]. These structs implement the `Default` trait,
+which is needed for creating [Entry] instances without additional params.
+
+This approach allows us to share the implementation of [DirectoryEntry]
+trait between [Directory] and [FileEntry] without too much code duplication.
+
+You can use the struct like this:
+```rust
+use statter::tree::{Directory, Entry, FileEntry};
+use std::fs::{metadata, Metadata};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
+
+let root: PathBuf = PathBuf::from("/etc");
+let pwfile: PathBuf = root.join("passwd");
+let pwmeta: Metadata = metadata(&pwfile).ok().expect("Metadata should be returned");
+
+let d = Entry::<Directory>::new(&root.join("systemd"), None).unwrap();
+let f = Entry::<FileEntry>::new(&pwfile, Some(pwmeta.ino())).unwrap();
+*/
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Entry<T>(Data, T);
 
@@ -177,10 +181,12 @@ impl<T: Default> Entry<T> {
     }
 }
 
-/// Implement trait [DirectoryEntry] for [Entry] struct.
-///
-/// Basically, this allows us to consolidate common code under trait
-/// [DirectoryEntry] since then we can reference the inner [Data] struct there.
+/**
+Implement trait [DirectoryEntry] for [Entry] struct.
+
+Basically, this allows us to consolidate common code under trait
+[DirectoryEntry] since then we can reference the inner [Data] struct there.
+*/
 impl<T> DirectoryEntry for Entry<T> {
     fn data(&self) -> &Data {
         &self.0
@@ -221,18 +227,22 @@ impl Directory {
         &self.fd
     }
 
-    /// Set the file descriptor for this directory.
-    ///
-    /// Returns the file descriptor if it was set successfully.
-    /// If the fd is already set, returns an error with the existing fd.
+    /**
+    Set the file descriptor for this directory.
+
+    Returns the file descriptor if it was set successfully.
+    If the fd is already set, returns an error with the existing fd.
+    */
     fn fd_set(&self, fd: RawFd) -> Result<RawFd, RawFd> {
         self.fd.set(fd)
     }
 
-    /// Clear the file descriptor for this directory.
-    ///
-    /// If the fd is set, we "store" the negative value of the fd.
-    /// If the fd is already cleared (negative), we set it to 0.
+    /**
+    Clear the file descriptor for this directory.
+
+    If the fd is set, we "store" the negative value of the fd.
+    If the fd is already cleared (negative), we set it to 0.
+    */
     fn fd_clear(&self) {
         self.fd.clear();
     }
@@ -609,11 +619,13 @@ impl Node {
         path
     }
 
-    /// For directories, the name is retrieved from the [[Directory]] struct.
-    ///
-    /// For files, the name is retrieved from parent node's `children` HashMap.
-    ///
-    /// Root node always returns `/`.
+    /**
+    For directories, the name is retrieved from the [[Directory]] struct.
+
+    For files, the name is retrieved from parent node's `children` HashMap.
+
+    Root node always returns `/`.
+    */
     pub fn name(&self) -> Result<String, Error> {
         if self.node_t == NodeType::Directory {
             return Ok(self.as_dir().unwrap().name().to_string());
@@ -682,9 +694,11 @@ impl Node {
         self.as_dir().map(|dir: &Directory| dir.remove_child(name));
     }
 
-    /// Get the name of a child [[Node]] and its `Arc<Node>` ptr from a reference
-    /// to the child node itself. The main use case is for a child node to find
-    /// its own name and reference in the parent node's `children` HashMap.
+    /**
+    Get the name of a child [[Node]] and its `Arc<Node>` ptr from a reference
+    to the child node itself. The main use case is for a child node to find
+    its own name and reference in the parent node's `children` HashMap.
+    */
     #[inline]
     fn get_child_byref(&self, child: &Node) -> Option<(String, Arc<Node>)> {
         trace_span!("get_child_byref", ?child).in_scope(|| {
@@ -1097,20 +1111,20 @@ fn tree_worker(t: Arc<DirTree>, state: ScanState) {
 
 /* ######################################################################### */
 
-/// Trie structure for storing a directory tree.
-///
-/// You can use it f.ex. like this:
-/// ```ignore
-/// use statter::args::Config;
-/// use statter::tree::DirTree;
-/// use statter::ScanState;
-///
-/// let conf: Config = Config::parse(); // parse command line args
-/// let state: ScanState = ScanState::new(&conf);
-/// state.start_updates(); // start the progress bars
-///
-/// let tree: DirTree = DirTree::new_from_path("/home", &state, true);
-/// tree.print_info(); // print basic tree info (nodes, dirs, files etc)
+/**
+Trie structure for storing a directory tree.
+
+You can use it f.ex. like this:
+```
+use statter::ScanState;
+use statter::tree::DirTree;
+
+let state: ScanState = ScanState::default();
+state.start_updates(); // start the progress bars
+
+let tree: DirTree = DirTree::new_from_path("/tmp", &state, false, false);
+tree.print_info(); // print basic tree info (nodes, dirs, files etc)
+*/
 #[derive(Default, Debug)]
 pub struct DirTree {
     conf: Arc<TreeConf>,
@@ -1193,13 +1207,15 @@ impl DirTree {
         self.add_op(TreeOp::Quit);
     }
 
-    /// Tell the background worker thread to scan (populate) the given path.
-    ///
-    /// NOTE: If `recursive` is `None`, the tree's default is used.
-    ///
-    /// NOTE: non-blocking, the actual scan is done in the background. The scan
-    /// is finished when [TreeState::Ready]. This can also be checked with the
-    /// `is_ready()` method.
+    /**
+    Tell the background worker thread to scan (populate) the given path.
+
+    NOTE: If `recursive` is `None`, the tree's default is used.
+
+    NOTE: non-blocking, the actual scan is done in the background. The scan
+    is finished when [TreeState::Ready]. This can also be checked with the
+    `is_ready()` method.
+    */
     pub fn scan(&self, path: &str, recursive: Option<bool>) {
         self.add_op(TreeOp::Scan(PathBuf::from(path), recursive));
     }
@@ -1287,11 +1303,13 @@ impl DirTree {
         tree
     }
 
-    /// Creates a new [[DirTree]] with the given path as root.
-    ///
-    /// If `recursive` is true, also populates the tree by recursively walking
-    /// the full directory structure (starting from from the given directory)
-    /// and inserting each found path into the tree.
+    /**
+    Creates a new [[DirTree]] with the given path as root.
+
+    If `recursive` is true, also populates the tree by recursively walking
+    the full directory structure (starting from from the given directory)
+    and inserting each found path into the tree.
+    */
     #[instrument(name = "DirTree", skip_all)]
     pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, resident: bool) -> Self {
         debug!(target: "path", "{path}");
@@ -1319,10 +1337,12 @@ impl DirTree {
         tree
     }
 
-    /// Populate a leaf [[Node]] in the trie with the contents of a directory.
-    /// Uses the standard [std::fs::read_dir] method to get the directory entries.
-    ///
-    /// NOTE: single threaded, potentially slow with large directory trees.
+    /**
+    Populate a leaf [[Node]] in the trie with the contents of a directory.
+    Uses the standard [std::fs::read_dir] method to get the directory entries.
+
+    NOTE: single threaded, potentially slow with large directory trees.
+    */
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
     pub fn populate(&self, path: &PathBuf, state: &ScanState, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
@@ -1367,12 +1387,14 @@ impl DirTree {
         };
     }
 
-    /// Parallel version of [DirTree::populate] using [rayon::iter]
-    /// to process each dir entry in parallel.
-    ///
-    /// Uses [[DirHandle]] to read the directory entries, and its [DirHandle::iter]
-    /// method, which tries to return the directory entries first using a small
-    /// buffer to look ahead in the directory stream.
+    /**
+    Parallel version of [DirTree::populate] using [rayon::iter]
+    to process each dir entry in parallel.
+
+    Uses [[DirHandle]] to read the directory entries, and its [DirHandle::iter]
+    method, which tries to return the directory entries first using a small
+    buffer to look ahead in the directory stream.
+    */
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
     pub fn populate_par(&self, path: &PathBuf, state: &ScanState) {
         match DirHandle::new(path) {
@@ -1558,12 +1580,14 @@ impl DirTree {
         debug!(target: "INSERT_CHILD", "{current:?}");
     }
 
-    /// Remove a [[Node]] (or a leaf) from the trie. Expects an absolute path.
-    ///
-    /// Returns a tuple of `(nodes, dirs, files)` removed on success and [[None]]
-    /// if the path was not found. The root node cannot be removed.
-    ///
-    /// WARNING: implementation is WIP and may yet contain bugs.
+    /**
+    Remove a [[Node]] (or a leaf) from the trie. Expects an absolute path.
+
+    Returns a tuple of `(nodes, dirs, files)` removed on success and [[None]]
+    if the path was not found. The root node cannot be removed.
+
+    WARNING: implementation is WIP and may yet contain bugs.
+    */
     #[instrument(level = "debug", skip(self))]
     pub fn remove(&self, path: &str) -> Result<Option<(u32, u32, u32)>, Error> {
         match self.get_node(path) {
@@ -1806,19 +1830,21 @@ impl DirTree {
 
     /* --------------------------------- */
 
-    /// Traverses recursively from a [[Node]] and applies function `f` to each
-    /// child node, AND the starting node itself. Parallel version.
-    ///
-    /// In contrast to `traverse_from()`, this function requires that the
-    /// fn `f` is `Send` and `Sync` since it will be sent to other threads.
-    ///
-    /// Basically, to make this work you must use Atomic types or other thread-safe
-    /// primitives ([Mutex], [RwLock], [AtomicCell] etc) for any variables in `f`.
-    /// IOW, no interior mutability or shared mutable state.
-    ///
-    /// Testing shows that this traversal is slower than the sequential version
-    /// for `f` which do just a simple operation on each node. This makes sense
-    /// since the overhead of moving stuff between threads can be significant.
+    /**
+    Traverses recursively from a [[Node]] and applies function `f` to each
+    child node, AND the starting node itself. Parallel version.
+
+    In contrast to `traverse_from()`, this function requires that the
+    fn `f` is `Send` and `Sync` since it will be sent to other threads.
+
+    Basically, to make this work you must use Atomic types or other thread-safe
+    primitives ([Mutex], [RwLock], [AtomicCell] etc) for any variables in `f`.
+    IOW, no interior mutability or shared mutable state.
+
+    Testing shows that this traversal is slower than the sequential version
+    for `f` which do just a simple operation on each node. This makes sense
+    since the overhead of moving stuff between threads can be significant.
+    */
     pub fn traverse_par<F>(&self, node: &Arc<Node>, f: &F)
     where
         F: Fn(&Arc<Node>) + Send + Sync,
@@ -1915,10 +1941,10 @@ impl DirTree {
     pub fn print_info(&self) {
         eprintln!(
             "Tree info : nodes {}, dirs {}, files {}, depth {}, ctime {} UTC",
-            self.conf().nodes.load(Relaxed),
-            self.conf().dirs.load(Relaxed),
-            self.conf().files.load(Relaxed),
-            self.conf().depth.load(Relaxed),
+            self.conf.nodes(),
+            self.conf.dirs(),
+            self.conf.files(),
+            self.conf.depth(),
             self.created(),
         );
     }
@@ -1937,20 +1963,22 @@ impl DirTree {
         });
     }
 
-    /// Validate the counts of nodes, dirs, and files in the tree.
-    ///
-    /// We take the counts from the tree's [[Counts]] struct as master data and
-    /// firstly validate that the counts of directories and files add up to the
-    /// total number of nodes. Then we compare those to the counts we get by
-    /// traversing the tree with:
-    /// - `count_from()` (`traverse_from()` -> count)
-    /// - `iter_count()` (`iter()` -> count)
-    /// - `dirs().len()` and `files().len()` (`walk()` -> count)
-    ///
-    /// We will also print the time it took to count the nodes using each method.
-    ///
-    /// This is a debugging function using asserts, hence it will panic if the
-    /// counts do not match.
+    /**
+    Validate the counts of nodes, dirs, and files in the tree.
+
+    We take the counts from the tree's [[Counts]] struct as master data and
+    firstly validate that the counts of directories and files add up to the
+    total number of nodes. Then we compare those to the counts we get by
+    traversing the tree with:
+    - `count_from()` (`traverse_from()` -> count)
+    - `iter_count()` (`iter()` -> count)
+    - `dirs().len()` and `files().len()` (`walk()` -> count)
+
+    We will also print the time it took to count the nodes using each method.
+
+    This is a debugging function using asserts, hence it will panic if the
+    counts do not match.
+    */
     pub fn validate_counts(&self) {
         let want_n: u32 = self.conf.nodes();
         let want_d: u32 = self.conf.dirs();
@@ -2394,9 +2422,11 @@ mod tests {
         paths
     }
 
-    /// Optimally the test directory should be created only once and then
-    /// reused for all tests. The unsafe `setup_tests()` should ensure that
-    /// this fn is called only once.
+    /**
+    Optimally the test directory should be created only once and then
+    reused for all tests. The unsafe `setup_tests()` should ensure that
+    this fn is called only once.
+    */
     fn create_test_dirs_for_tree_test() -> TempDir {
         let temp_dir: TempDir = TempDir::new().unwrap();
         let path: &str = temp_dir.path().to_str().unwrap();
