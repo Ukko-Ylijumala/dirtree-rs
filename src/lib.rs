@@ -37,7 +37,7 @@ const META_FAIL: &str = "Failed to get metadata";
 // Convenience aliases
 type MaybeNode = Option<Arc<Node>>;
 type Children = RwLock<DirTreeHashMap<String, MaybeNode>>;
-type NodeVec = Vec<Arc<Node>>;
+type NodeVec<'a> = Vec<Arc<Node>>;
 
 #[derive(Default, Debug, Clone, Eq)]
 struct Data {
@@ -1622,9 +1622,7 @@ impl DirTree {
 
                     None => {
                         let msg: String = format!("Stale parent reference: {:?}", node.path());
-                        self.add_error(
-                            TreeEvent::error(&msg, &op).node(&node),
-                        );
+                        self.add_error(TreeEvent::error(&msg, &op).node(&node));
                         return Err(Error::new(ErrorKind::NotFound, msg));
                     }
                 }
@@ -1715,49 +1713,20 @@ impl DirTree {
 
     /* --------------------------------- */
 
-    /// Walk the tree recursively from a [[Node]] and return a [Vec] of child nodes. The
-    /// `dirs` and `files` flags control whether to include directory and/or file nodes.
-    fn walk(&self, node: &Arc<Node>, dirs: bool, files: bool) -> Arc<Mutex<NodeVec>> {
-        let result: Arc<Mutex<NodeVec>> = Mutex::new(Vec::new()).into();
-        if node.is_traversable() && node.children().is_some() {
-            node.children()
-                .unwrap()
-                .read()
-                .values()
-                .par_bridge()
-                .for_each(|c: &MaybeNode| {
-                    c.as_ref().map(|child: &Arc<Node>| {
-                        let mut nodes_shard: NodeVec = Vec::new();
-                        if dirs && child.node_t.is_dir() {
-                            nodes_shard.push(child.clone());
-                        } else if files && child.node_t.is_file() {
-                            nodes_shard.push(child.clone());
-                        }
-                        if child.is_traversable() {
-                            nodes_shard
-                                .extend(self.walk(child, dirs, files).lock().iter().cloned());
-                        }
-                        result.lock().extend(nodes_shard);
-                    });
-                });
-        }
-        result
-    }
-
     /// Walks the full tree and returns a [Vec] of all nodes. WARNING: this can be
     /// slow and memory intensive for large trees. Prefer using [DirTree::iter].
-    pub fn nodes(&self) -> NodeVec {
-        trace_span!("walk:nodes").in_scope(|| self.walk(&self.root(), true, true).lock().to_vec())
+    pub fn nodes<'a>(&'a self) -> NodeVec<'a> {
+        trace_span!("walk:nodes").in_scope(|| walk_nodes(&self.root(), true, true).lock().to_vec())
     }
 
     /// Returns a [Vec] of all [[Directory]] nodes in the tree.
-    pub fn dirs(&self) -> NodeVec {
-        trace_span!("walk:dirs").in_scope(|| self.walk(&self.root(), true, false).lock().to_vec())
+    pub fn dirs<'a>(&'a self) -> NodeVec<'a> {
+        trace_span!("walk:dirs").in_scope(|| walk_nodes(&self.root(), true, false).lock().to_vec())
     }
 
     /// Returns a [Vec] of all [[FileEntry]] nodes in the tree.
-    pub fn files(&self) -> NodeVec {
-        trace_span!("walk:files").in_scope(|| self.walk(&self.root(), false, true).lock().to_vec())
+    pub fn files<'a>(&'a self) -> NodeVec<'a> {
+        trace_span!("walk:files").in_scope(|| walk_nodes(&self.root(), false, true).lock().to_vec())
     }
 
     /* --------------------------------- */
@@ -1830,78 +1799,21 @@ impl DirTree {
 
     /* --------------------------------- */
 
-    /**
-    Traverses recursively from a [[Node]] and applies function `f` to each
-    child node, AND the starting node itself. Parallel version.
-
-    In contrast to `traverse_from()`, this function requires that the
-    fn `f` is `Send` and `Sync` since it will be sent to other threads.
-
-    Basically, to make this work you must use Atomic types or other thread-safe
-    primitives ([Mutex], [RwLock], [AtomicCell] etc) for any variables in `f`.
-    IOW, no interior mutability or shared mutable state.
-
-    Testing shows that this traversal is slower than the sequential version
-    for `f` which do just a simple operation on each node. This makes sense
-    since the overhead of moving stuff between threads can be significant.
-    */
-    pub fn traverse_par<F>(&self, node: &Arc<Node>, f: &F)
-    where
-        F: Fn(&Arc<Node>) + Send + Sync,
-    {
-        trace!(target: "traverse_par", "{}", node.path().display());
-        f(node);
-        if node.is_traversable() && node.children().is_some() {
-            node.children()
-                .unwrap()
-                .read()
-                .values()
-                .par_bridge()
-                .for_each(|c: &MaybeNode| {
-                    c.as_ref().map(|child: &Arc<Node>| {
-                        if child.is_traversable() {
-                            // traverse directories first (depth-first search)
-                            self.traverse_par(child, f);
-                        } else {
-                            f(child);
-                        }
-                    });
-                });
-        }
-    }
-
-    /// Traverses recursively from a [[Node]] and applies function `f` to each
-    /// child node, AND the starting node itself.
-    pub fn traverse_from<F>(&self, node: &Arc<Node>, f: &mut F)
-    where
-        F: FnMut(&Arc<Node>),
-    {
-        trace!(target: "traverse_from", "{}", node.path().display());
-        f(node);
-        if node.is_traversable() && node.children().is_some() {
-            node.children()
-                .unwrap()
-                .read()
-                .values()
-                .for_each(|c: &MaybeNode| {
-                    c.as_ref().map(|child: &Arc<Node>| {
-                        if child.is_traversable() {
-                            // traverse directories first (depth-first search)
-                            self.traverse_from(child, f);
-                        } else {
-                            f(child);
-                        }
-                    });
-                });
-        }
-    }
-
     /// Traverses the tree from root and applies function `f` to each [[Node]].
     pub fn traverse<F>(&self, mut f: F)
     where
         F: FnMut(&Arc<Node>),
     {
-        self.traverse_from(&self.root(), &mut f);
+        traverse_from(&self.root(), &mut f);
+    }
+
+    /// Traverses the tree from root in parallel and applies function `f`
+    /// to each [[Node]].
+    pub fn traverse_par<F>(&self, f: F)
+    where
+        F: Fn(&Arc<Node>) + Send + Sync,
+    {
+        traverse_from_par(&self.root(), &f);
     }
 
     /// Count the number of directory and file nodes with `traverse()`. Also counts
@@ -1916,11 +1828,11 @@ impl DirTree {
         let mut dirs: u32 = 0;
         /*
         NOTE: trying to convert this iterating closure to a parallel
-        one with `traverse_par()` makes the counting almost 50% slower.
+        one with `traverse_from_par()` makes the counting almost 50% slower.
         Likely the overhead from moving stuff between threads and having
         to use Atomic versions of counters is the main reason.
         */
-        self.traverse_from(&node, &mut |n: &Arc<Node>| {
+        traverse_from(&node, &mut |n: &Arc<Node>| {
             nodes += 1;
             match n.node_t {
                 NodeType::Directory => dirs += 1,
@@ -1988,6 +1900,103 @@ impl Iterator for DirTreeIterator {
 }
 
 /* ########################### UTILITY FUNCTIONS ########################### */
+
+/**
+Walk a tree's nodes recursively from a [[Node]] and return a [Vec] of child
+nodes encountered. The `dirs` and `files` flags control whether to include
+directory and/or file nodes.
+*/
+pub fn walk_nodes(node: &Arc<Node>, dirs: bool, files: bool) -> Arc<Mutex<NodeVec>> {
+    let result: Arc<Mutex<NodeVec>> = Mutex::new(Vec::new()).into();
+    if node.is_traversable() && node.children().is_some() {
+        node.children()
+            .unwrap()
+            .read()
+            .values()
+            .par_bridge()
+            .for_each(|c: &MaybeNode| {
+                c.as_ref().map(|child: &Arc<Node>| {
+                    let mut nodes_shard: NodeVec = Vec::new();
+                    if dirs && child.node_t.is_dir() {
+                        nodes_shard.push(child.clone());
+                    } else if files && child.node_t.is_file() {
+                        nodes_shard.push(child.clone());
+                    }
+                    if child.is_traversable() {
+                        nodes_shard.extend(walk_nodes(child, dirs, files).lock().iter().cloned());
+                    }
+                    result.lock().extend(nodes_shard);
+                });
+            });
+    }
+    result
+}
+
+/// Traverses a [[DirTree]] recursively from a [[Node]] and applies function `f`
+/// to each child node, AND the starting node itself.
+pub fn traverse_from<F>(node: &Arc<Node>, f: &mut F)
+where
+    F: FnMut(&Arc<Node>),
+{
+    trace!(target: "traverse_from", "{}", node.path().display());
+    f(node);
+    if node.is_traversable() && node.children().is_some() {
+        node.children()
+            .unwrap()
+            .read()
+            .values()
+            .for_each(|c: &MaybeNode| {
+                c.as_ref().map(|child: &Arc<Node>| {
+                    if child.is_traversable() {
+                        // traverse directories first (depth-first search)
+                        traverse_from(child, f);
+                    } else {
+                        f(child);
+                    }
+                });
+            });
+    }
+}
+
+/**
+Traverses a [[DirTree]] recursively from a [[Node]] and applies function `f`
+to each child node, AND the starting node itself. Parallel version.
+
+In contrast to `traverse_from()`, this function requires that the
+fn `f` is `Send` and `Sync` since it will be sent to other threads.
+
+Basically, to make this work you must use Atomic types or other thread-safe
+primitives ([Mutex], [RwLock], [AtomicCell] etc) for any variables in `f`.
+IOW, no interior mutability or shared mutable state.
+
+Testing shows that this traversal is slower than the sequential version
+for `f` which do just a simple operation on each node. This makes sense
+since the overhead of moving stuff between threads can be significant.
+*/
+pub fn traverse_from_par<F>(node: &Arc<Node>, f: &F)
+where
+    F: Fn(&Arc<Node>) + Send + Sync,
+{
+    trace!(target: "traverse_par", "{}", node.path().display());
+    f(node);
+    if node.is_traversable() && node.children().is_some() {
+        node.children()
+            .unwrap()
+            .read()
+            .values()
+            .par_bridge()
+            .for_each(|c: &MaybeNode| {
+                c.as_ref().map(|child: &Arc<Node>| {
+                    if child.is_traversable() {
+                        // traverse directories first (depth-first search)
+                        traverse_from_par(child, f);
+                    } else {
+                        f(child);
+                    }
+                });
+            });
+    }
+}
 
 /// Increment or decrement an [AtomicU32] value in Relaxed mode.
 #[inline]
