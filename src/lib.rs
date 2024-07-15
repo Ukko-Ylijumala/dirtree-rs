@@ -1862,7 +1862,7 @@ impl Display for DirTree {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "DirTree {{ nodes {}, dirs {}, files {}, depth {}, handles {}, ctime {} UTC }}",
+            "DirTree: nodes {}, dirs {}, files {}, depth {}, handles {}, ctime {} UTC",
             self.conf.nodes(),
             self.conf.dirs(),
             self.conf.files(),
