@@ -8,6 +8,7 @@ use crate::args::FileMode;
 use crate::dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
 use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
+use crossbeam::queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use std::{
@@ -37,7 +38,7 @@ const META_FAIL: &str = "Failed to get metadata";
 // Convenience aliases
 type MaybeNode = Option<Arc<Node>>;
 type Children = RwLock<DirTreeHashMap<String, MaybeNode>>;
-type NodeVec<'a> = Vec<Arc<Node>>;
+type NodeIter<'a> = dyn Iterator<Item = Arc<Node>> + 'a;
 
 #[derive(Default, Debug, Clone, Eq)]
 struct Data {
@@ -1713,20 +1714,29 @@ impl DirTree {
 
     /* --------------------------------- */
 
-    /// Walks the full tree and returns a [Vec] of all nodes. WARNING: this can be
-    /// slow and memory intensive for large trees. Prefer using [DirTree::iter].
-    pub fn nodes<'a>(&'a self) -> NodeVec<'a> {
-        trace_span!("walk:nodes").in_scope(|| walk_nodes(&self.root(), true, true).lock().to_vec())
+    /**
+    Walks the full tree and returns an Iterator of all nodes. WARNING: this
+    can be memory intensive for large trees. Prefer using [DirTree::iter],
+    which should be more efficient due to not building a full list beforehand.
+    */
+    pub fn nodes<'a>(&'a self) -> Box<NodeIter<'a>> {
+        let q: SegQueue<Arc<Node>> = SegQueue::new();
+        trace_span!("walk:nodes").in_scope(|| walk_nodes(&self.root(), &q, true, true));
+        Box::new(q.into_iter())
     }
 
-    /// Returns a [Vec] of all [[Directory]] nodes in the tree.
-    pub fn dirs<'a>(&'a self) -> NodeVec<'a> {
-        trace_span!("walk:dirs").in_scope(|| walk_nodes(&self.root(), true, false).lock().to_vec())
+    /// Returns an Iterator of all [[Directory]] nodes in the tree.
+    pub fn dirs<'a>(&'a self) -> Box<NodeIter<'a>> {
+        let q: SegQueue<Arc<Node>> = SegQueue::new();
+        trace_span!("walk:dirs").in_scope(|| walk_nodes(&self.root(), &q, true, false));
+        Box::new(q.into_iter())
     }
 
-    /// Returns a [Vec] of all [[FileEntry]] nodes in the tree.
-    pub fn files<'a>(&'a self) -> NodeVec<'a> {
-        trace_span!("walk:files").in_scope(|| walk_nodes(&self.root(), false, true).lock().to_vec())
+    /// Returns an iterator of all [[FileEntry]] nodes in the tree.
+    pub fn files<'a>(&'a self) -> Box<NodeIter<'a>> {
+        let q: SegQueue<Arc<Node>> = SegQueue::new();
+        trace_span!("walk:files").in_scope(|| walk_nodes(&self.root(), &q, false, true));
+        Box::new(q.into_iter())
     }
 
     /* --------------------------------- */
@@ -1902,12 +1912,11 @@ impl Iterator for DirTreeIterator {
 /* ########################### UTILITY FUNCTIONS ########################### */
 
 /**
-Walk a tree's nodes recursively from a [[Node]] and return a [Vec] of child
-nodes encountered. The `dirs` and `files` flags control whether to include
+Walk a tree's nodes recursively from a [[Node]] and put all found nodes into
+the given [SegQueue]. The `dirs` and `files` flags control whether to include
 directory and/or file nodes.
 */
-pub fn walk_nodes(node: &Arc<Node>, dirs: bool, files: bool) -> Arc<Mutex<NodeVec>> {
-    let result: Arc<Mutex<NodeVec>> = Mutex::new(Vec::new()).into();
+pub fn walk_nodes(node: &Arc<Node>, q: &SegQueue<Arc<Node>>, dirs: bool, files: bool) {
     if node.is_traversable() && node.children().is_some() {
         node.children()
             .unwrap()
@@ -1916,20 +1925,17 @@ pub fn walk_nodes(node: &Arc<Node>, dirs: bool, files: bool) -> Arc<Mutex<NodeVe
             .par_bridge()
             .for_each(|c: &MaybeNode| {
                 c.as_ref().map(|child: &Arc<Node>| {
-                    let mut nodes_shard: NodeVec = Vec::new();
                     if dirs && child.node_t.is_dir() {
-                        nodes_shard.push(child.clone());
+                        q.push(child.clone());
                     } else if files && child.node_t.is_file() {
-                        nodes_shard.push(child.clone());
+                        q.push(child.clone());
                     }
                     if child.is_traversable() {
-                        nodes_shard.extend(walk_nodes(child, dirs, files).lock().iter().cloned());
+                        walk_nodes(child, q, dirs, files);
                     }
-                    result.lock().extend(nodes_shard);
                 });
             });
     }
-    result
 }
 
 /// Traverses a [[DirTree]] recursively from a [[Node]] and applies function `f`
@@ -2162,11 +2168,11 @@ pub fn tree_validate_counts(tree: &DirTree) {
 
     let n: &str = "walk()";
     let start: Instant = Instant::now();
-    let dirs: u32 = tree.dirs().len() as u32;
+    let dirs: u32 = tree.dirs().count() as u32;
     eprintln!(" --> {n} dirs  = {:?}", start.elapsed());
 
     let start: Instant = Instant::now();
-    let files: u32 = tree.files().len() as u32;
+    let files: u32 = tree.files().count() as u32;
     eprintln!(" --> {n} files = {:#?}", start.elapsed());
 
     assert_eq!(want_d, dirs, "{n} dirs do not match");
@@ -2329,8 +2335,7 @@ mod tests {
         let p_iter: HashSet<String> = tree.iter_paths().collect();
         let p_walk: HashSet<String> = tree
             .nodes()
-            .iter()
-            .map(|n: &Arc<Node>| n.path().to_string_lossy().to_string())
+            .map(|n: Arc<Node>| n.path().to_string_lossy().to_string())
             .collect();
         let mut p_trav: HashSet<String> = HashSet::new();
         tree.traverse(|n: &Arc<Node>| {
