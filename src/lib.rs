@@ -11,6 +11,7 @@ use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
+use size_of::SizeOf;
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
@@ -1118,8 +1119,13 @@ impl DirTree {
     }
 
     /// The number of open directory handles.
-    pub fn num_handles(&self) -> usize {
+    pub fn handles_len(&self) -> usize {
         self.handles.len()
+    }
+
+    /// The total size of open directory handles in bytes.
+    pub fn handles_size(&self) -> usize {
+        self.handles.size_of().total_bytes()
     }
 
     /// Returns a reference to the tree's creation time.
@@ -1867,7 +1873,7 @@ impl Display for DirTree {
             self.conf.dirs(),
             self.conf.files(),
             self.conf.depth(),
-            self.num_handles(),
+            self.handles.len(),
             self.created()
         )
     }
