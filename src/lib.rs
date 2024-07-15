@@ -1081,7 +1081,7 @@ let state: ScanState = ScanState::default();
 state.start_updates(); // start the progress bars
 
 let tree: DirTree = DirTree::new_from_path("/tmp", &state, false, false);
-tree.print_info(); // print basic tree info (nodes, dirs, files etc)
+eprintln!("{tree}"); // print basic tree info (nodes, dirs, files etc)
 */
 #[derive(Default, Debug)]
 pub struct DirTree {
@@ -1934,33 +1934,20 @@ impl DirTree {
         };
         (nodes, dirs, files)
     }
+}
 
-    /* --------------------------------- */
-
-    /// Print the tree's info (nodes, dirs, files, depth, ctime) to stderr.
-    pub fn print_info(&self) {
-        eprintln!(
-            "Tree info : nodes {}, dirs {}, files {}, depth {}, ctime {} UTC",
+impl Display for DirTree {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DirTree {{ nodes {}, dirs {}, files {}, depth {}, handles {}, ctime {} UTC }}",
             self.conf.nodes(),
             self.conf.dirs(),
             self.conf.files(),
             self.conf.depth(),
-            self.created(),
-        );
-    }
-
-    /// Print the full contents of the tree recursively. This is a debugging function.
-    pub fn print_debug(&self) {
-        eprintln!("\n{:?}\n", self);
-        self.traverse(|node: &Arc<Node>| {
-            if node.node_t.has_data() {
-                if tracing::level_enabled!(Level::DEBUG) {
-                    debug!("{:?}", node.construct_path());
-                } else {
-                    info!("{}", node.path().to_string_lossy());
-                }
-            }
-        });
+            self.num_handles(),
+            self.created()
+        )
     }
 }
 
@@ -2088,6 +2075,21 @@ fn tree_worker(t: Arc<DirTree>, state: ScanState) {
     }
 }
 
+/// Print the full contents of a [[DirTree]] recursively, using [tracing]'s
+/// facilities. This is a (very verbose) debugging function.
+pub fn tree_print_debug(tree: &DirTree) {
+    eprintln!("\n{tree:?}\n");
+    tree.traverse(|node: &Arc<Node>| {
+        if node.node_t.has_data() {
+            if tracing::level_enabled!(Level::DEBUG) {
+                debug!("{:?}", node.construct_path());
+            } else {
+                info!("{}", node.path().to_string_lossy());
+            }
+        }
+    });
+}
+
 /**
 Validate the counts of nodes, dirs, and files in a [[DirTree]].
 
@@ -2104,7 +2106,7 @@ We will also print the time it took to count the nodes using each method.
 This is a debugging function using asserts, hence it will panic if the
 counts do not match.
 */
-pub fn validate_tree_counts(tree: &DirTree) {
+pub fn tree_validate_counts(tree: &DirTree) {
     let want_n: u32 = tree.conf.nodes();
     let want_d: u32 = tree.conf.dirs();
     let want_f: u32 = tree.conf.files();
@@ -2231,7 +2233,7 @@ mod tests {
         assert_eq!(tree.conf.from, OnceLock::default());
         assert_eq!(tree.state(), TreeState::Uninitialized);
         assert!(tree.is_uninit(), "Tree is not uninitialized");
-        validate_tree_counts(&tree);
+        tree_validate_counts(&tree);
         assert_eq!(nodes, 0, "nodes mismatch");
         assert_eq!(dirs, 0, "dirs mismatch");
         assert_eq!(files, 0, "files mismatch");
@@ -2251,7 +2253,7 @@ mod tests {
         let (nodes, dirs, files, depth) = counts(&tree);
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
 
-        validate_tree_counts(&tree);
+        tree_validate_counts(&tree);
         assert_eq!(tree.state(), TreeState::Empty);
         assert_eq!(nodes, root_depth.into(), "nodes mismatch");
         assert_eq!(dirs, root_depth.into(), "dirs mismatch");
@@ -2282,7 +2284,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        validate_tree_counts(&tree);
+        tree_validate_counts(&tree);
         let (nodes, dirs, files, depth) = counts(&tree);
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
         check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
@@ -2394,7 +2396,7 @@ mod tests {
 
         match tree.remove(&file) {
             Ok(_) => {
-                validate_tree_counts(&tree);
+                tree_validate_counts(&tree);
                 nodes -= 1;
                 files -= 1;
                 let (n_now, d_now, f_now, _) = counts(&tree);
@@ -2408,7 +2410,7 @@ mod tests {
 
         match tree.remove(&l2_p) {
             Ok(_) => {
-                validate_tree_counts(&tree);
+                tree_validate_counts(&tree);
                 nodes -= l2_n as u32;
                 dirs -= l2_d as u32;
                 files -= l2_f as u32;
@@ -2423,7 +2425,7 @@ mod tests {
 
         match tree.remove(&l1_p) {
             Ok(_) => {
-                validate_tree_counts(&tree);
+                tree_validate_counts(&tree);
                 nodes -= l1_n as u32;
                 dirs -= l1_d as u32;
                 files -= l1_f as u32;
@@ -2451,7 +2453,7 @@ mod tests {
         assert_eq!(tree.state(), TreeState::Ready);
         assert!(tree.is_ready(), "Tree is not ready");
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
-        validate_tree_counts(&tree);
+        tree_validate_counts(&tree);
         (path, tree, root_depth)
     }
 
