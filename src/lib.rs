@@ -8,7 +8,6 @@ use crate::args::FileMode;
 use crate::dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
 use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
-use crossbeam::queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use std::{
@@ -796,8 +795,8 @@ impl PartialEq<Node> for NodeItem {
 pub enum TreeOp {
     #[default]
     None,
-    /// The tree is being built.
-    Build,
+    /// The tree is being built. Implicitly recursive.
+    Build(PathBuf),
     /// Scan a directory and process it into the tree, optionally recursively.
     Scan(PathBuf, Option<bool>),
     /// A node (or leaf) is being inserted into the tree.
@@ -834,10 +833,46 @@ pub enum TreeState {
     Quitting,
 }
 
+#[derive(Default, Debug, Clone, Hash, PartialEq)]
+pub enum EventInfo {
+    #[default]
+    None,
+    Begin,
+    End,
+    Err(String),
+    Msg(String),
+}
+
+impl EventInfo {
+    fn msg_from(s: &str) -> Self {
+        Self::Msg(s.to_string())
+    }
+
+    fn err_from(s: &str) -> Self {
+        Self::Err(s.to_string())
+    }
+}
+
+impl Display for EventInfo {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::None => "None".to_string(),
+                Self::Begin => "Begin".to_string(),
+                Self::End => "End".to_string(),
+                Self::Err(s) => s.clone(),
+                Self::Msg(s) => s.clone(),
+            }
+        )
+    }
+}
+
 /// A [DirTree] event. Could be an error, warning, or just a notice.
 #[derive(Default, Clone, Hash, PartialEq)]
 pub struct TreeEvent {
-    pub msg: String,
+    pub info: EventInfo,
     pub oper: Option<TreeOp>,
     pub path: Option<String>,
     pub node: MaybeNode,
@@ -849,7 +884,7 @@ impl TreeEvent {
     /// by chaining with the `path()`, `node()`, and `op()` methods.
     fn new(msg: &str) -> Self {
         Self {
-            msg: msg.to_string(),
+            info: EventInfo::msg_from(msg),
             ..Default::default()
         }
     }
@@ -867,68 +902,68 @@ impl TreeEvent {
     }
 
     /// Specify a [TreeOperation] for the event.
-    fn op(mut self, oper: TreeOp) -> Self {
-        self.oper = Some(oper);
+    fn op(mut self, oper: &TreeOp) -> Self {
+        self.oper = Some(oper.to_owned());
         self
     }
 
     /// Mark the start of an operation.
     fn op_beg(op: &TreeOp) -> Self {
         Self {
-            msg: "begin".to_string(),
+            info: EventInfo::Begin,
             oper: Some(op.to_owned()),
             ..Default::default()
         }
     }
 
     /// Mark the end of an operation.
-    fn op_end(op: TreeOp) -> Self {
+    fn op_end(op: &TreeOp) -> Self {
         Self {
-            msg: "end".to_string(),
-            oper: Some(op),
+            info: EventInfo::End,
+            oper: Some(op.to_owned()),
             ..Default::default()
         }
     }
 
     /// Create an error event.
-    fn error(msg: &str, op: TreeOp) -> Self {
+    fn error(msg: &str, op: &TreeOp) -> Self {
         Self {
-            msg: format!("ERROR: {msg}").to_string(),
-            oper: Some(op),
+            info: EventInfo::err_from(&format!("ERROR: {msg}")),
+            oper: Some(op.to_owned()),
             ..Default::default()
         }
     }
 }
 
-#[rustfmt::skip]
 impl Debug for TreeEvent {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let d: String = "None".into();
-        write!(
-            f,
-            "TreeEvent {{ {when} UTC: {msg:?}, oper: {oper}, path: {path}, node: {node} }}",
-            msg = self.msg,
-            when = self.when.to_display(),
-            path = self.path.as_deref().unwrap_or(&d),
-            oper = self.oper.as_ref().map_or(d.clone(), |o| o.to_debug()),
-            node = self.node.as_ref().map_or(d.clone(), |n| n.name().unwrap_or("<unnamed>".to_owned())),
-        )
+        let mut msg: String = format!("{} UTC: {}", self.when.to_display(), self.info);
+        if let Some(op) = &self.oper {
+            msg.push_str(&format!(", oper: {}", op.to_debug()));
+        }
+        if let Some(path) = &self.path {
+            msg.push_str(&format!(", path: {}", path));
+        }
+        if let Some(node) = &self.node {
+            msg.push_str(&format!(", node: {}", node.name().unwrap_or("<unnamed>".to_owned())));
+        }
+        write!(f, "TreeEvent {{ {msg} }}")
     }
 }
 
-#[rustfmt::skip]
 impl Display for TreeEvent {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let d: String = "".into();
-        write!(
-            f,
-            "{when} UTC: {msg:?}, op: {oper} {path} {node}",
-            msg = self.msg,
-            when = self.when.to_display(),
-            path = self.path.as_deref().unwrap_or(&d),
-            oper = self.oper.as_ref().map_or("None".to_owned(), |o| o.to_debug()),
-            node = self.node.as_ref().map_or(d.clone(), |n| n.name().unwrap_or(d.clone())),
-        )
+        let mut msg: String = format!("{} UTC: {}", self.when, self.info);
+        if let Some(op) = &self.oper {
+            msg.push_str(&format!(", op: {}", op.to_debug()));
+        }
+        if let Some(path) = &self.path {
+            msg.push_str(&format!(" ({})", path));
+        }
+        if let Some(node) = &self.node {
+            msg.push_str(&format!(" [{}]", node.name().unwrap_or("<unnamed>".to_owned())));
+        }
+        write!(f, "{msg}")
     }
 }
 
@@ -1032,83 +1067,6 @@ impl TreeConf {
     }
 }
 
-/// Increment or decrement an [AtomicU32] value in Relaxed mode.
-#[inline]
-fn mod_atom_u32(a: &AtomicU32, n: i32) {
-    if n > 0 {
-        a.fetch_add(n as u32, Relaxed);
-    } else if n < 0 {
-        a.fetch_sub(n.abs() as u32, Relaxed);
-    }
-}
-
-/// Background worker thread for handling [TreeOperation]s.
-fn tree_worker(t: Arc<DirTree>, state: ScanState) {
-    let mut spin_ctr: u8 = 0;
-    loop {
-        if t.is_quitting() {
-            break;
-        }
-
-        if t.workq.is_empty() {
-            // wait for work in a spin loop
-            while t.workq.is_empty() {
-                if spin_ctr < 10 {
-                    spin_ctr += 1;
-                    hint::spin_loop();
-                } else {
-                    thread::sleep(Duration::from_micros(10));
-                    spin_ctr = 0;
-                    break;
-                }
-            }
-        }
-
-        match t.workq.pop() {
-            None => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Some(op) => {
-                match op {
-                    TreeOp::Quit => {
-                        t.set_state(TreeState::Quitting);
-                        break;
-                    }
-                    TreeOp::Scan(ref path, recursive) => {
-                        let p: PathBuf = path.clone();
-                        t.add_event(TreeEvent::op_beg(&op));
-                        t.set_state(TreeState::Active(op));
-                        t.populate(&p, &state, recursive);
-                    }
-                    TreeOp::Remove(ref path) => {
-                        let p: String = path.clone();
-                        t.add_event(TreeEvent::op_beg(&op));
-                        t.set_state(TreeState::Active(op.clone()));
-                        t.remove(&p).err().map(|e: Error| {
-                            t.conf.errors_inc();
-                            t.add_event(TreeEvent::new(&e.to_string()).path(&p).op(op));
-                        });
-                    }
-                    TreeOp::Update(ref _path) => {
-                        //let p: PathBuf = path.clone();
-                        t.add_event(TreeEvent::op_beg(&op));
-                        t.set_state(TreeState::Active(op));
-                        //tree.update(&p);
-                    }
-                    TreeOp::Build => {}
-                    TreeOp::Insert => {}
-                    TreeOp::Serialize => {}   // TODO
-                    TreeOp::Deserialize => {} // TODO
-                    _ => {}
-                };
-                if t.workq.is_empty() {
-                    t.set_state(TreeState::Ready);
-                }
-            }
-        }
-    }
-}
-
 /* ######################################################################### */
 
 /**
@@ -1132,7 +1090,7 @@ pub struct DirTree {
     root: Arc<Node>,
     handles: OpenHandles,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
-    workq: SegQueue<TreeOp>,
+    workq: RwLock<VecDeque<TreeOp>>,
     events: RwLock<Vec<TreeEvent>>,
 }
 
@@ -1173,12 +1131,25 @@ impl DirTree {
         self.state.read().clone()
     }
 
-    /// Set the tree to the given state. Also records the end of the previous
-    /// operation if the tree was in an active state.
+    /// Set the tree to the given state.
+    ///
+    /// - records the end of the previous op if the tree was in an active state
+    /// - records the beginning of the new op if it is an "active" op
     #[inline]
     fn set_state(&self, state: TreeState) {
+        if state == TreeState::Quitting {
+            self.quit_worker(false);
+        } else if state == TreeState::Ready && self.has_work() {
+            self.add_error(TreeEvent::new("Work queue not empty, cannot set state::Ready"));
+            return;
+        }
+
         match self.active_op() {
-            Some(op) => self.add_event(TreeEvent::op_end(op)),
+            Some(ref op) => self.add_event(TreeEvent::op_end(op)),
+            _ => {}
+        }
+        match state {
+            TreeState::Active(ref op) => self.add_event(TreeEvent::op_beg(op)),
             _ => {}
         }
         *self.state.write() = state;
@@ -1197,14 +1168,50 @@ impl DirTree {
         self.conf.errors_inc();
     }
 
-    /// Add an operation to the tree's work queue.
-    fn queue_op(&self, op: TreeOp) {
-        self.workq.push(op);
+    /// Whether the tree's workqueue is empty.
+    #[inline]
+    fn no_work(&self) -> bool {
+        self.workq.read().is_empty()
     }
 
-    /// Tell the background worker thread to quit.
-    fn quit_worker(&self) {
-        self.queue_op(TreeOp::Quit);
+    /// Whether there's pending work items in the tree's workqueue.
+    #[inline]
+    fn has_work(&self) -> bool {
+        !self.no_work()
+    }
+
+    /// Get the next work item from the front of the tree's work queue, if any.
+    #[inline]
+    fn get_work(&self) -> Option<TreeOp> {
+        self.workq.write().pop_front()
+    }
+
+    /// Add an operation to the tree's work queue.
+    #[inline]
+    fn queue_op(&self, op: TreeOp) {
+        self.workq.write().push_back(op);
+    }
+
+    /// Add a priority operation to the front of the tree's work queue.
+    #[inline]
+    fn queue_op_prio(&self, op: TreeOp) {
+        self.workq.write().push_front(op);
+    }
+
+    /// Whether the background worker thread has been started.
+    pub fn is_worker_running(&self) -> bool {
+        self.worker.lock().is_some()
+    }
+
+    /// Tell the background worker thread to quit. Optionally wait till
+    /// the worker thread exits.
+    fn quit_worker(&self, block: bool) {
+        self.queue_op_prio(TreeOp::Quit);
+        if block {
+            if let Some(worker) = self.worker.lock().take() {
+                worker.join().expect("Failed to join DirTree worker thread");
+            }
+        }
     }
 
     /**
@@ -1226,16 +1233,16 @@ impl DirTree {
         matches!(self.state(), TreeState::Uninitialized)
     }
 
-    /// Returns `true` if the tree is ready (has no active operation).
+    /// Returns `true` if the tree is ready and has no active operations queued.
     #[inline]
     pub fn is_ready(&self) -> bool {
-        matches!(self.state(), TreeState::Ready) && !self.is_quitting()
+        matches!(self.state(), TreeState::Ready) && self.no_work() && !self.is_quitting()
     }
 
     /// Returns `true` if the tree is in an active state.
     #[inline]
     pub fn is_active(&self) -> bool {
-        matches!(self.state(), TreeState::Active(_)) || self.workq.len() > 0
+        matches!(self.state(), TreeState::Active(_)) || self.has_work()
     }
 
     /// Returns `true` if the tree is in a quitting state.
@@ -1286,13 +1293,13 @@ impl DirTree {
     /// Build a new [[DirTree]] with the given options and start the worker thread.
     ///
     /// NOTE: must be chained with `from_path()` to set the root path.
-    pub fn build(self, state: &ScanState) -> Arc<DirTree> {
+    pub fn build(self, state: &ScanState) -> Arc<Self> {
         if self.conf.from.get().is_none() {
             panic!("Root path must be set before building the tree");
         }
         self.conf.set_sync(state.sync);
-        let tree: Arc<DirTree> = self.into();
-        let tree_c: Arc<DirTree> = tree.clone();
+        let tree: Arc<Self> = self.into();
+        let tree_c: Arc<Self> = tree.clone();
         let state: ScanState = state.clone();
         let worker: thread::JoinHandle<()> = thread::Builder::new()
             .stack_size(256 * 1024) // 256 KiB
@@ -1324,8 +1331,7 @@ impl DirTree {
         state.num_d.inc1();
         debug!(target: "TREE", "{tree:?}");
         if recursive {
-            tree.set_state(TreeState::Active(TreeOp::Build));
-            tree.add_event(TreeEvent::op_beg(&TreeOp::Build).path(path));
+            tree.set_state(TreeState::Active(TreeOp::Build(PathBuf::from(path))));
             match state.sync {
                 true => tree.populate(tree.from(), state, Some(recursive)),
                 false => tree.populate_par(tree.from(), state),
@@ -1353,7 +1359,7 @@ impl DirTree {
                                 self.insert(&path, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
                                 if recursive.is_some_and(|r: bool| r) || self.conf.recursive() {
-                                    if self.worker.lock().is_some() {
+                                    if self.is_worker_running() {
                                         self.queue_op(TreeOp::Scan(path, recursive));
                                     } else {
                                         self.populate(&path, state, recursive);
@@ -1375,7 +1381,7 @@ impl DirTree {
                         Err(e) => {
                             self.add_error(TreeEvent::error(
                                 &e.to_string(),
-                                TreeOp::Scan(path.clone(), recursive),
+                                &TreeOp::Scan(path.clone(), recursive),
                             ));
                             debug!("Error with {}: {e}", path.display());
                         }
@@ -1394,6 +1400,7 @@ impl DirTree {
     /// buffer to look ahead in the directory stream.
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
     pub fn populate_par(&self, path: &PathBuf, state: &ScanState) {
+        let op: TreeOp = TreeOp::Scan(path.into(), Some(self.conf.recursive()));
         match DirHandle::new(path) {
             Ok(mut handle) => {
                 trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
@@ -1424,7 +1431,7 @@ impl DirTree {
                             self.add_event(
                                 TreeEvent::new("Unknown entry type")
                                     .path(&entry_p.to_string_lossy().clone())
-                                    .op(TreeOp::Scan(path.into(), Some(self.conf.recursive()))),
+                                    .op(&op),
                             );
                             debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
                         }
@@ -1450,10 +1457,7 @@ impl DirTree {
                 }
             }
             Err(e) => {
-                self.add_error(TreeEvent::error(
-                    &e.to_string(),
-                    TreeOp::Scan(path.into(), Some(self.conf.recursive())),
-                ));
+                self.add_error(TreeEvent::error(&e.to_string(), &op));
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
             }
         }
@@ -1542,7 +1546,7 @@ impl DirTree {
                         // should never happen
                         self.add_error(TreeEvent::error(
                             &format!("Child {part:?} missing from HashMap: {current:?}"),
-                            TreeOp::Insert,
+                            &TreeOp::Insert,
                         ));
                         return;
                     }
@@ -1585,11 +1589,12 @@ impl DirTree {
     /// WARNING: implementation is WIP and may yet contain bugs.
     #[instrument(level = "debug", skip(self))]
     pub fn remove(&self, path: &str) -> Result<Option<(u32, u32, u32)>, Error> {
+        let op: TreeOp = TreeOp::Remove(path.into());
         match self.get_node(path) {
             Some(node) => {
                 if node.node_t == NodeType::Root {
                     let msg: &str = "Cannot remove root node";
-                    self.add_error(TreeEvent::error(msg, TreeOp::Remove(path.into())));
+                    self.add_error(TreeEvent::error(msg, &op));
                     return Err(Error::new(ErrorKind::InvalidInput, msg));
                 };
 
@@ -1618,7 +1623,7 @@ impl DirTree {
                     None => {
                         let msg: String = format!("Stale parent reference: {:?}", node.path());
                         self.add_error(
-                            TreeEvent::error(&msg, TreeOp::Remove(path.into())).node(&node),
+                            TreeEvent::error(&msg, &op).node(&node),
                         );
                         return Err(Error::new(ErrorKind::NotFound, msg));
                     }
@@ -2073,6 +2078,94 @@ impl Iterator for DirTreeIterator {
     }
 }
 
+/* ########################### UTILITY FUNCTIONS ########################### */
+
+/// Increment or decrement an [AtomicU32] value in Relaxed mode.
+#[inline]
+fn mod_atom_u32(a: &AtomicU32, n: i32) {
+    if n > 0 {
+        a.fetch_add(n as u32, Relaxed);
+    } else if n < 0 {
+        a.fetch_sub(n.abs() as u32, Relaxed);
+    }
+}
+
+/// Background worker thread for handling [TreeOperation]s.
+fn tree_worker(t: Arc<DirTree>, state: ScanState) {
+    let mut spin_ctr: u8 = 0;
+    loop {
+        if t.is_quitting() {
+            break;
+        }
+
+        if t.no_work() {
+            // wait for work in a spin loop
+            while t.no_work() {
+                if spin_ctr < 10 {
+                    spin_ctr += 1;
+                    hint::spin_loop();
+                } else {
+                    thread::sleep(Duration::from_micros(10));
+                    spin_ctr = 0;
+                    break;
+                }
+            }
+        }
+
+        match t.get_work() {
+            None => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Some(op) => {
+                match op {
+                    TreeOp::Quit => {
+                        t.set_state(TreeState::Quitting);
+                        break;
+                    }
+
+                    TreeOp::Build(ref path) => {
+                        let p: PathBuf = path.clone();
+                        t.set_state(TreeState::Active(op));
+                        t.populate(&p, &state, Some(true));
+                    }
+
+                    TreeOp::Scan(ref path, recursive) => {
+                        let p: PathBuf = path.clone();
+                        if t.is_ready() {
+                            t.set_state(TreeState::Active(op));
+                        }
+                        t.populate(&p, &state, recursive);
+                    }
+
+                    TreeOp::Remove(ref path) => {
+                        let p: String = path.clone();
+                        t.set_state(TreeState::Active(op.clone()));
+                        t.remove(&p).ok().and_then(|r| r).map(|x| {
+                            let msg: String =
+                                format!("Removed: {} nodes, {} dirs, {} files", x.0, x.1, x.2);
+                            t.add_event(TreeEvent::new(&msg).path(&p).op(&op));
+                        });
+                    }
+
+                    TreeOp::Update(ref _path) => {
+                        //let p: PathBuf = path.clone();
+                        t.set_state(TreeState::Active(op));
+                        //tree.update(&p);
+                    }
+
+                    TreeOp::Insert => {}
+                    TreeOp::Serialize => {}   // TODO
+                    TreeOp::Deserialize => {} // TODO
+                    _ => {}
+                };
+                if t.no_work() {
+                    t.set_state(TreeState::Ready);
+                }
+            }
+        }
+    }
+}
+
 /* ######################################################################### */
 
 #[cfg(test)]
@@ -2193,7 +2286,7 @@ mod tests {
         let (nodes, dirs, files, depth) = counts(&tree);
         let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
         check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
-        tree.quit_worker();
+        tree.quit_worker(true);
     }
 
     #[test]
