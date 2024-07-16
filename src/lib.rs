@@ -11,7 +11,7 @@ use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
-use size_of::SizeOf;
+use size_of::{Context, SizeOf, TotalSize};
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
@@ -20,6 +20,7 @@ use std::{
     hash::{Hash, Hasher},
     hint,
     io::{Error, ErrorKind},
+    mem::size_of,
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, RawFd},
     os::unix::fs::{DirEntryExt, MetadataExt},
@@ -277,6 +278,28 @@ impl Directory {
     #[instrument(level = "trace", skip(self))]
     fn remove_child(&self, name: &str) {
         self.write().remove(name);
+    }
+
+    /// Add the immediate (non-recursive) memory size of the directory to [Context].
+    fn size_immediate(&self, context: &mut Context) {
+        self.name.size_of_children(context);
+        context.add(size_of::<DirFd>());
+
+        let ch = self.children.read();
+        ch.hasher().size_of_children(context);
+        if ch.capacity() > 0 {
+            let s: usize = size_of::<Option<Arc<Node>>>();
+            let used: usize = s * ch.len();
+            let total: usize = (s + size_of::<String>()) * ch.capacity();
+            context
+                .add(used)
+                .add_excess(total - used)
+                .add_distinct_allocation();
+
+            ch.iter().for_each(|(key, _)| {
+                key.size_of_children(context);
+            });
+        }
     }
 }
 
@@ -715,6 +738,21 @@ impl Node {
             }
         })
     }
+
+    /// Get the immediate (non-recursive) memory size of this node.
+    fn size_immediate(&self) -> TotalSize {
+        let mut context: Context = Context::new();
+        context.add(size_of::<NodeType>());
+        context.add(size_of::<Weak<Node>>());
+        context.add(size_of::<OnceLock<NodeItem>>());
+        if self.node_t.has_data() {
+            context.add(size_of::<Data>());
+        }
+        if self.node_t == NodeType::Directory {
+            self.as_dir().unwrap().size_immediate(&mut context);
+        }
+        context.total_size()
+    }
 }
 
 impl Default for Node {
@@ -793,7 +831,7 @@ impl PartialEq<Node> for NodeItem {
 /* ######################################################################### */
 
 /// The current operation being performed on the [[DirTree]].
-#[derive(Default, Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Hash, SizeOf)]
 pub enum TreeOp {
     #[default]
     None,
@@ -835,7 +873,7 @@ pub enum TreeState {
     Quitting,
 }
 
-#[derive(Default, Debug, Clone, Hash, PartialEq)]
+#[derive(Default, Debug, Clone, Hash, PartialEq, SizeOf)]
 pub enum EventInfo {
     #[default]
     None,
@@ -872,12 +910,13 @@ impl Display for EventInfo {
 }
 
 /// A [DirTree] event. Could be an error, warning, or just a notice.
-#[derive(Default, Clone, Hash, PartialEq)]
+#[derive(Default, Clone, Hash, PartialEq, SizeOf)]
 pub struct TreeEvent {
     pub info: EventInfo,
     pub oper: Option<TreeOp>,
     pub path: Option<String>,
     pub node: MaybeNode,
+    #[size_of(skip)]
     pub when: TimeSinceEpoch,
 }
 
@@ -1006,19 +1045,19 @@ impl TreeConf {
         self.from.set(PathBuf::from(path)).ok();
     }
 
-    fn nodes(&self) -> u32 {
+    pub fn nodes(&self) -> u32 {
         self.nodes.load(Relaxed)
     }
-    fn dirs(&self) -> u32 {
+    pub fn dirs(&self) -> u32 {
         self.dirs.load(Relaxed)
     }
-    fn files(&self) -> u32 {
+    pub fn files(&self) -> u32 {
         self.files.load(Relaxed)
     }
-    fn depth(&self) -> u8 {
+    pub fn depth(&self) -> u8 {
         self.depth.load(Relaxed)
     }
-    fn errors(&self) -> u32 {
+    pub fn errors(&self) -> u32 {
         self.errors.load(Relaxed)
     }
 
@@ -1862,6 +1901,20 @@ impl DirTree {
         };
         (nodes, dirs, files)
     }
+
+    /// Calculates and returns the memory usage of directory and file nodes.
+    pub fn nodes_memuse(&self) -> (u64, u64) {
+        let dn_sz: AtomicU32 = AtomicU32::new(0);
+        let fn_sz: AtomicU32 = AtomicU32::new(0);
+
+        traverse_from_par(&self.root, &|n: &Arc<Node>| match n.node_t {
+            NodeType::Directory => mod_atom_u32(&dn_sz, n.size_immediate().total_bytes() as i32),
+            NodeType::File => mod_atom_u32(&fn_sz, n.size_of().total_bytes() as i32),
+            _ => (),
+        });
+
+        (dn_sz.load(Relaxed) as u64, fn_sz.load(Relaxed) as u64)
+    }
 }
 
 impl Display for DirTree {
@@ -2186,6 +2239,60 @@ pub fn tree_validate_counts(tree: &DirTree) {
         assert_eq!(files, 0, "{n} files != 0 {d_o}");
     } else {
         assert_eq!(want_f, files, "{n} files do not match");
+    }
+}
+
+/* ######################################################################### */
+
+impl SizeOf for Directory {
+    fn size_of_children(&self, context: &mut Context) {
+        self.name.size_of_children(context);
+        self.children.read().size_of_children(context);
+    }
+}
+
+impl SizeOf for Entry<Directory> {
+    fn size_of_children(&self, context: &mut Context) {
+        self.1.size_of_children(context);
+    }
+}
+
+impl SizeOf for NodeItem {
+    fn size_of_children(&self, context: &mut Context) {
+        match self {
+            NodeItem::Root(r) => r.size_of_children(context),
+            NodeItem::Dir(d) => d.size_of_children(context),
+            _ => {}
+        }
+    }
+}
+
+impl SizeOf for Node {
+    fn size_of_children(&self, context: &mut Context) {
+        if let Some(item) = self.item.get() {
+            item.size_of_children(context);
+        };
+    }
+}
+
+impl SizeOf for DirTree {
+    fn size_of_children(&self, context: &mut Context) {
+        context.add(size_of::<TreeConf>()).add_distinct_allocation();
+        self.handles.size_of_children(context);
+        self.workq.read().size_of_children(context);
+        context
+            .add(size_of::<TreeState>())
+            .add_distinct_allocation();
+        context
+            .add(size_of::<Option<thread::JoinHandle<()>>>())
+            .add_distinct_allocation();
+        {
+            let e = self.events.read();
+            e.size_of_children(context);
+            context.add(size_of::<TimeSinceEpoch>() * e.len());
+        }
+
+        self.root.size_of_children(context);
     }
 }
 
