@@ -218,7 +218,7 @@ impl Directory {
     }
 
     pub fn name<'a>(&self, store: &'a UniqueStrStore) -> &'a str {
-        unsafe { store.get_raw(self.name) }
+        unsafe { store.borrow_str(self.name) }
     }
 
     fn name_set(&mut self, name_idx: u32) {
@@ -624,7 +624,7 @@ impl Node {
                         .get_child_byref(&*current)
                         .expect("Node should have a name")
                         .0;
-                    path.insert(0, unsafe { store.get_raw(name_idx) }.to_string());
+                    path.insert(0, unsafe { store.borrow_str(name_idx) }.to_string());
                     current = parent;
                 }
                 None => break,
@@ -659,7 +659,7 @@ impl Node {
                     .get_child_byref(self)
                     .expect("Parent's children HashMap should contain the child node's name")
                     .0;
-                Ok(unsafe { store.get_raw(name_idx) }.to_string())
+                Ok(unsafe { store.borrow_str(name_idx) }.to_string())
             }
 
             None => {
