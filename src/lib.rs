@@ -2326,10 +2326,14 @@ impl SizeOf for DirTree {
 
 /* ######################################################################### */
 
+// Silence warning "creating a mutable reference to mutable static is discouraged".
+// This can be done due to the way we're using the mutable reference in the tests.
+#[allow(static_mut_refs)]
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{testdirs::create_test_dirs, Config, ScanState};
+    use crate::{testdirs::create_test_dirs, ScanState};
     use ctor::dtor;
     use nix::libc;
     use parking_lot::Mutex;
@@ -2342,7 +2346,6 @@ mod tests {
     const EXP_NODES: u32 = EXP_DIRS + EXP_FILES;
 
     // statics for all tests
-    static mut CONF: Option<Config> = None;
     static mut STATE: Option<ScanState> = None;
     static mut TESTDIR: Option<TempDir> = None;
     static INITIALIZED: Mutex<bool> = Mutex::new(false);
@@ -2355,7 +2358,6 @@ mod tests {
             // already initialized
             return;
         }
-        CONF = Some(Config::default());
         STATE = Some(ScanState {
             filemode: FileMode::NODE,
             ..Default::default()
@@ -2401,9 +2403,7 @@ mod tests {
     #[test]
     fn test_tree_new_from_path() {
         unsafe { setup_tests() }
-        let (path, _) = unsafe {
-            (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
-        };
+        let path = unsafe { TESTDIR.as_ref().unwrap().path().to_str().unwrap() };
 
         let tree: DirTree = DirTree::new(FileMode::NODE).from_path(path);
         let (nodes, dirs, files, depth) = counts(&tree);
