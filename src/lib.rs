@@ -3,7 +3,7 @@
 // non_snake_case added due to `instrument` macro causing a false positive for `dtor`
 #![allow(dead_code, non_snake_case)]
 
-use super::{make_weak_ref, path_parts, ScanState, ToDebug, ToDisplay};
+use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState, ToDebug, ToDisplay};
 use crate::args::FileMode;
 use crate::dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
 use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
@@ -1103,7 +1103,7 @@ impl TreeConf {
 
     /// Increment the error counter by 1.
     fn errors_inc(&self) {
-        self.errors.fetch_add(1, Relaxed);
+        mod_atom_u32(&self.errors, 1);
     }
 
     /// Compare the current depth with the given depth and set the maximum.
@@ -2090,16 +2090,6 @@ where
     }
 }
 
-/// Increment or decrement an [AtomicU32] value in Relaxed mode.
-#[inline]
-fn mod_atom_u32(a: &AtomicU32, n: i32) {
-    if n > 0 {
-        a.fetch_add(n as u32, Relaxed);
-    } else if n < 0 {
-        a.fetch_sub(n.abs() as u32, Relaxed);
-    }
-}
-
 /// Background worker thread for handling [TreeOperation]s.
 fn tree_worker(t: Arc<DirTree>, state: ScanState) {
     let mut spin_ctr: u8 = 0;
@@ -2329,7 +2319,6 @@ impl SizeOf for DirTree {
 // Silence warning "creating a mutable reference to mutable static is discouraged".
 // This can be done due to the way we're using the mutable reference in the tests.
 #[allow(static_mut_refs)]
-
 #[cfg(test)]
 mod tests {
     use super::*;
