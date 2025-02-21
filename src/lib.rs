@@ -6,7 +6,7 @@
 use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState, ToDebug, ToDisplay};
 use crate::args::FileMode;
 use crate::dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
-use crate::hashing::{build_xxh3_with_custom_secret, Xxh3};
+use crate::hashing::build_xxh3_with_custom_secret;
 use crate::stringstore::UniqueStrStore;
 use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
@@ -32,6 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
+use xxhash_rust::xxh3::Xxh3;
 
 #[cfg(feature = "size_of")]
 use {
