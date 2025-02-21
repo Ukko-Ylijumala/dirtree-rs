@@ -6,22 +6,20 @@
 use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState, ToDebug, ToDisplay};
 use crate::args::FileMode;
 use crate::dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
-use crate::hashing::{DirTreeHashMap, DirTreeXxh3Hasher};
+use crate::hashing::{build_xxh3_with_custom_secret, Xxh3};
 use crate::stringstore::UniqueStrStore;
 use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
-use size_of::{Context, SizeOf, TotalSize};
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
     fmt::{self, Debug, Display, Formatter},
     fs::{metadata, DirEntry, Metadata},
-    hash::{Hash, Hasher},
+    hash::{BuildHasher, Hash, Hasher},
     hint,
     io::{Error, ErrorKind},
-    mem::size_of,
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, RawFd},
     os::unix::fs::{DirEntryExt, MetadataExt},
@@ -35,6 +33,12 @@ use std::{
 };
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
 
+#[cfg(feature = "size_of")]
+use {
+    size_of::{Context, SizeOf, TotalSize},
+    std::mem::size_of,
+};
+
 const PATH_SEP: char = '/';
 const META_FAIL: &str = "Failed to get metadata";
 
@@ -42,6 +46,25 @@ const META_FAIL: &str = "Failed to get metadata";
 type MaybeNode = Option<Arc<Node>>;
 type Children = RwLock<DirTreeHashMap<u32, MaybeNode>>;
 type NodeIter<'a> = dyn Iterator<Item = Arc<Node>> + 'a;
+type DirTreeHashMap<K, V> = HashMap<K, V, DirTreeXxh3Hasher>;
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DirTreeXxh3Hasher;
+
+impl BuildHasher for DirTreeXxh3Hasher {
+    type Hasher = Xxh3;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        build_xxh3_with_custom_secret()
+    }
+}
+
+#[cfg(feature = "size_of")]
+impl SizeOf for DirTreeXxh3Hasher {
+    fn size_of_children(&self, context: &mut Context) {
+        context.add(size_of::<Xxh3>()).add_distinct_allocation();
+    }
+}
 
 #[derive(Default, Debug, Clone, Eq)]
 struct Data {
@@ -282,6 +305,7 @@ impl Directory {
     }
 
     /// Add the immediate (non-recursive) memory size of the directory to [Context].
+    #[cfg(feature = "size_of")]
     fn size_immediate(&self, context: &mut Context) {
         self.name.size_of_children(context);
         context.add(size_of::<DirFd>());
@@ -744,6 +768,7 @@ impl Node {
     }
 
     /// Get the immediate (non-recursive) memory size of this node.
+    #[cfg(feature = "size_of")]
     fn size_immediate(&self) -> TotalSize {
         let mut context: Context = Context::new();
         context.add(size_of::<NodeType>());
@@ -835,7 +860,8 @@ impl PartialEq<Node> for NodeItem {
 /* ######################################################################### */
 
 /// The current operation being performed on the [[DirTree]].
-#[derive(Default, Debug, Clone, Eq, PartialEq, Hash, SizeOf)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "size_of", derive(SizeOf))]
 pub enum TreeOp {
     #[default]
     None,
@@ -877,7 +903,8 @@ pub enum TreeState {
     Quitting,
 }
 
-#[derive(Default, Debug, Clone, Hash, PartialEq, SizeOf)]
+#[derive(Default, Debug, Clone, Hash, PartialEq)]
+#[cfg_attr(feature = "size_of", derive(SizeOf))]
 pub enum EventInfo {
     #[default]
     None,
@@ -914,13 +941,14 @@ impl Display for EventInfo {
 }
 
 /// A [DirTree] event. Could be an error, warning, or just a notice.
-#[derive(Default, Clone, Hash, PartialEq, SizeOf)]
+#[derive(Default, Clone, Hash, PartialEq)]
+#[cfg_attr(feature = "size_of", derive(SizeOf))]
 pub struct TreeEvent {
     pub info: EventInfo,
     pub oper: Option<TreeOp>,
     pub path: Option<String>,
     pub node: MaybeNode,
-    #[size_of(skip)]
+    #[cfg_attr(feature = "size_of", size_of(skip))]
     pub when: TimeSinceEpoch,
 }
 
@@ -1168,6 +1196,7 @@ impl DirTree {
     }
 
     /// The total size of open directory handles in bytes.
+    #[cfg(feature = "size_of")]
     pub fn handles_size(&self) -> usize {
         self.handles.size_of().total_bytes()
     }
@@ -1178,6 +1207,7 @@ impl DirTree {
     }
 
     /// The total size of stored strings structure in bytes.
+    #[cfg(feature = "size_of")]
     pub fn strings_size(&self) -> usize {
         self.strings.size_of().total_bytes()
     }
@@ -1930,6 +1960,7 @@ impl DirTree {
     }
 
     /// Calculates and returns the memory usage of directory and file nodes.
+    #[cfg(feature = "size_of")]
     pub fn nodes_memuse(&self) -> (u64, u64) {
         let dn_sz: AtomicU32 = AtomicU32::new(0);
         let fn_sz: AtomicU32 = AtomicU32::new(0);
@@ -2261,6 +2292,7 @@ pub fn tree_validate_counts(tree: &DirTree) {
 
 /* ######################################################################### */
 
+#[cfg(feature = "size_of")]
 impl SizeOf for Directory {
     fn size_of_children(&self, context: &mut Context) {
         self.name.size_of_children(context);
@@ -2268,12 +2300,14 @@ impl SizeOf for Directory {
     }
 }
 
+#[cfg(feature = "size_of")]
 impl SizeOf for Entry<Directory> {
     fn size_of_children(&self, context: &mut Context) {
         self.1.size_of_children(context);
     }
 }
 
+#[cfg(feature = "size_of")]
 impl SizeOf for NodeItem {
     fn size_of_children(&self, context: &mut Context) {
         match self {
@@ -2284,6 +2318,7 @@ impl SizeOf for NodeItem {
     }
 }
 
+#[cfg(feature = "size_of")]
 impl SizeOf for Node {
     fn size_of_children(&self, context: &mut Context) {
         if let Some(item) = self.item.get() {
@@ -2292,6 +2327,7 @@ impl SizeOf for Node {
     }
 }
 
+#[cfg(feature = "size_of")]
 impl SizeOf for DirTree {
     fn size_of_children(&self, context: &mut Context) {
         context.add(size_of::<TreeConf>()).add_distinct_allocation();
