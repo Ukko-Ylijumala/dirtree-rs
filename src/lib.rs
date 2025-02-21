@@ -8,7 +8,7 @@ use crate::args::FileMode;
 use crate::dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
 use crate::hashing::build_xxh3_with_custom_secret;
 use crate::stringstore::UniqueStrStore;
-use crate::timesince::{SecondsSinceEpoch, TimeSinceEpoch};
+use timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use crossbeam::queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
