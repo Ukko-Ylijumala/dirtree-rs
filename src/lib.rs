@@ -4,11 +4,13 @@
 #![allow(dead_code, non_snake_case)]
 
 use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState, ToDebug, ToDisplay};
-use crate::args::FileMode;
-use crate::dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
-use crate::hashing::build_xxh3_with_custom_secret;
-use crate::stringstore::UniqueStrStore;
-use timesince::{SecondsSinceEpoch, TimeSinceEpoch};
+use crate::{
+    args::FileMode,
+    dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles},
+    hashing::build_xxh3_with_custom_secret,
+    stringstore::UniqueStrStore,
+    PATH_SEP,
+};
 use crossbeam::queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
@@ -31,6 +33,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
 use xxhash_rust::xxh3::Xxh3;
 
@@ -40,7 +43,6 @@ use {
     std::mem::size_of,
 };
 
-const PATH_SEP: char = '/';
 const META_FAIL: &str = "Failed to get metadata";
 
 // Convenience aliases
