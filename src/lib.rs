@@ -3,15 +3,16 @@
 // non_snake_case added due to `instrument` macro causing a false positive for `dtor`
 #![allow(dead_code, non_snake_case)]
 
-use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState, ToDebug, ToDisplay};
+use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState};
 use crate::{
     args::FileMode,
     dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles},
-    hashing::build_xxh3_with_custom_secret,
     stringstore::UniqueStrStore,
     PATH_SEP,
 };
 use crossbeam::queue::SegQueue;
+use custom_xxh3::build_xxh3_with_custom_secret;
+use miniutils::{ToDebug, ToDisplay};
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use std::{
