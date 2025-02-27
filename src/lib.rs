@@ -4,14 +4,10 @@
 #![allow(dead_code, non_snake_case)]
 
 use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState};
-use crate::{
-    args::FileMode,
-    dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles},
-    stringstore::UniqueStrStore,
-    PATH_SEP,
-};
+use crate::{args::FileMode, stringstore::UniqueStrStore, PATH_SEP};
 use crossbeam::queue::SegQueue;
 use custom_xxh3::build_xxh3_with_custom_secret;
+use dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
 use miniutils::{ToDebug, ToDisplay};
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
