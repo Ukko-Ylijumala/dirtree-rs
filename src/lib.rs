@@ -4,7 +4,7 @@
 #![allow(dead_code, non_snake_case)]
 
 use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState};
-use crate::{args::FileMode, stringstore::UniqueStrStore, PATH_SEP};
+use crate::{args::FileMode, PATH_SEP};
 use crossbeam::queue::SegQueue;
 use custom_xxh3::build_xxh3_with_custom_secret;
 use dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
@@ -30,6 +30,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use stringstore::UniqueStrStore;
 use timesince::{SecondsSinceEpoch, TimeSinceEpoch};
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
 use xxhash_rust::xxh3::Xxh3;
@@ -2360,7 +2361,7 @@ mod tests {
     use super::*;
     use crate::{testdirs::create_test_dirs, ScanState};
     use ctor::dtor;
-    use nix::libc;
+    use libc;
     use parking_lot::Mutex;
     use std::collections::HashSet;
     use tempfile::TempDir;
