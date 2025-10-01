@@ -1785,7 +1785,7 @@ impl DirTree {
     If we don't have an open handle, but we have a [Node] for such directory,
     we try opening a handle and returning it.
     */
-    pub fn handle(&self, path: &str) -> Option<CheckedOutHandle> {
+    pub fn handle(&self, path: &str) -> Option<CheckedOutHandle<'_>> {
         let node: Arc<Node> = self.get_node(path)?;
         node.as_dir().and_then(|dir: &Directory| {
             let fd: RawFd = dir.fd().fd();
@@ -1847,12 +1847,12 @@ impl DirTree {
     /// Creates an iterator to iterate through the tree starting from a [[Node]].
     /// The iterator is depth-first and includes the starting node.
     #[instrument(level = "trace", skip(self))]
-    pub fn iter_from(&self, node: Arc<Node>) -> DirTreeIterator {
+    pub fn iter_from(&self, node: Arc<Node>) -> DirTreeIterator<'_> {
         DirTreeIterator(VecDeque::from(vec![node]), &self.strings)
     }
 
     /// Creates an iterator to walk through all [[Node]]s in the tree.
-    pub fn iter(&self) -> DirTreeIterator {
+    pub fn iter(&self) -> DirTreeIterator<'_> {
         self.iter_from(self.root())
     }
 
