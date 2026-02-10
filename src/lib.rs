@@ -3,8 +3,8 @@
 // non_snake_case added due to `instrument` macro causing a false positive for `dtor`
 #![allow(dead_code, non_snake_case)]
 
-use super::{make_weak_ref, mod_atom_u32, path_parts, ScanState};
-use crate::{args::FileMode, PATH_SEP};
+use super::{ScanState, make_weak_ref, mod_atom_u32, path_parts};
+use crate::{PATH_SEP, args::FileMode};
 use crossbeam::queue::SegQueue;
 use custom_xxh3::build_xxh3_with_custom_secret;
 use dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
@@ -15,7 +15,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
     fmt::{self, Debug, Display, Formatter},
-    fs::{metadata, DirEntry, Metadata},
+    fs::{DirEntry, Metadata, metadata},
     hash::{BuildHasher, Hash, Hasher},
     hint,
     io::{Error, ErrorKind},
@@ -24,15 +24,15 @@ use std::{
     os::unix::fs::{DirEntryExt, MetadataExt},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::Relaxed},
         Arc, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed},
     },
     thread,
     time::{Duration, Instant},
 };
 use stringstore::UniqueStrStore;
 use timesince::{SecondsSinceEpoch, TimeSinceEpoch};
-use tracing::{debug, error, info, instrument, trace, trace_span, warn, Level};
+use tracing::{Level, debug, error, info, instrument, trace, trace_span, warn};
 use xxhash_rust::xxh3::Xxh3;
 
 #[cfg(feature = "size_of")]
@@ -435,27 +435,33 @@ pub enum NodeType {
 }
 
 impl NodeType {
-    /// Returns `true` if the node type is [[Directory]].
-    ///
-    /// [[Directory]]: NodeType::Directory
+    /**
+    Returns `true` if the node type is [[Directory]].
+
+    [[Directory]]: NodeType::Directory
+    */
     #[must_use]
     #[inline]
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Directory)
     }
 
-    /// Returns `true` if the node type is [[File]].
-    ///
-    /// [[File]]: NodeType::File
+    /**
+    Returns `true` if the node type is [[File]].
+
+    [[File]]: NodeType::File
+    */
     #[must_use]
     #[inline]
     pub fn is_file(&self) -> bool {
         matches!(self, Self::File)
     }
 
-    /// Returns `true` if the node type is [[Uninitialized]].
-    ///
-    /// [[Uninitialized]]: NodeType::Uninitialized
+    /**
+    Returns `true` if the node type is [[Uninitialized]].
+
+    [[Uninitialized]]: NodeType::Uninitialized
+    */
     #[must_use]
     #[inline]
     pub fn is_uninit(&self) -> bool {
@@ -481,27 +487,33 @@ pub enum NodeItem {
 }
 
 impl NodeItem {
-    /// Returns `true` if the node item is [[Directory]].
-    ///
-    /// [[Directory]]: NodeItem::Dir
+    /**
+    Returns `true` if the node item is [[Directory]].
+
+    [[Directory]]: NodeItem::Dir
+    */
     #[must_use]
     #[inline]
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Dir(_))
     }
 
-    /// Returns `true` if the node item is [[FileEntry]].
-    ///
-    /// [[FileEntry]]: NodeItem::File
+    /**
+    Returns `true` if the node item is [[FileEntry]].
+
+    [[FileEntry]]: NodeItem::File
+    */
     #[must_use]
     #[inline]
     pub fn is_file(&self) -> bool {
         matches!(self, Self::File(_))
     }
 
-    /// Returns `true` if the node item is [`None`].
-    ///
-    /// [`None`]: NodeItem::None
+    /**
+    Returns `true` if the node item is [`None`].
+
+    [`None`]: NodeItem::None
+    */
     #[must_use]
     #[inline]
     pub fn is_none(&self) -> bool {
@@ -1230,10 +1242,12 @@ impl DirTree {
         self.state.read().clone()
     }
 
-    /// Set the tree to the given state.
-    ///
-    /// - records the end of the previous op if the tree was in an active state
-    /// - records the beginning of the new op if it is an "active" op
+    /**
+    Set the tree to the given state.
+
+    - records the end of the previous op if the tree was in an active state
+    - records the beginning of the new op if it is an "active" op
+    */
     #[inline]
     fn set_state(&self, state: TreeState) {
         if state == TreeState::Quitting {
@@ -1392,9 +1406,11 @@ impl DirTree {
         self
     }
 
-    /// Build a new [[DirTree]] with the given options and start the worker thread.
-    ///
-    /// NOTE: must be chained with `from_path()` to set the root path.
+    /**
+    Build a new [[DirTree]] with the given options and start the worker thread.
+
+    NOTE: must be chained with `from_path()` to set the root path.
+    */
     pub fn build(self, state: &ScanState) -> Arc<Self> {
         if self.conf.from.get().is_none() {
             panic!("Root path must be set before building the tree");
@@ -2359,7 +2375,7 @@ impl SizeOf for DirTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{testdirs::create_test_dirs, ScanState};
+    use crate::{ScanState, testdirs::create_test_dirs};
     use ctor::dtor;
     use libc;
     use parking_lot::Mutex;
@@ -2378,38 +2394,42 @@ mod tests {
 
     /// Setup common test environment for all tests. Will initialize
     /// the needed statics only once (due to the Mutex).
-    unsafe fn setup_tests() {
+    fn setup_tests() {
         let mut init = INITIALIZED.lock();
         if *init {
             // already initialized
             return;
         }
-        STATE = Some(ScanState {
-            filemode: FileMode::NODE,
-            ..Default::default()
-        });
-        TESTDIR = Some(create_test_dirs_for_tree_test());
+        unsafe {
+            STATE = Some(ScanState {
+                filemode: FileMode::NODE,
+                ..Default::default()
+            });
+            TESTDIR = Some(create_test_dirs_for_tree_test());
+        }
         *init = true;
     }
 
     #[dtor]
-    unsafe fn teardown() {
+    fn teardown() {
         // println! or eprintln! in `dtor` will panic as Rust has already
         // shut down certain facilities. We can use libc::printf instead.
-        libc::printf("*** DirTree tests done, tearing down ***\n\0".as_ptr() as *const i8);
-        if let Some(_) = TESTDIR {
-            libc::printf(" - Deleting temp directory...\n\0".as_ptr() as *const i8);
-            let temp: TempDir = TESTDIR.take().unwrap();
-            temp.close().unwrap();
+        unsafe {
+            libc::printf("*** DirTree tests done, tearing down ***\n\0".as_ptr() as *const i8);
+            if let Some(_) = TESTDIR {
+                libc::printf(" - Deleting temp directory...\n\0".as_ptr() as *const i8);
+                let temp: TempDir = TESTDIR.take().unwrap();
+                temp.close().unwrap();
+            }
+            libc::printf("*** Teardown finished ***\n\n\0".as_ptr() as *const i8);
         }
-        libc::printf("*** Teardown finished ***\n\n\0".as_ptr() as *const i8);
     }
 
     /* --------------------------------- */
 
     #[test]
     fn test_create_empty_tree() {
-        unsafe { setup_tests() }
+        setup_tests();
         let tree: DirTree = DirTree::new(FileMode::default());
         let (nodes, dirs, files, depth) = counts(&tree);
 
@@ -2428,7 +2448,7 @@ mod tests {
 
     #[test]
     fn test_tree_new_from_path() {
-        unsafe { setup_tests() }
+        setup_tests();
         let path = unsafe { TESTDIR.as_ref().unwrap().path().to_str().unwrap() };
 
         let tree: DirTree = DirTree::new(FileMode::NODE).from_path(path);
@@ -2452,7 +2472,7 @@ mod tests {
 
     #[test]
     fn test_tree_build_thread() {
-        unsafe { setup_tests() }
+        setup_tests();
         let (path, state) = unsafe {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
@@ -2625,7 +2645,7 @@ mod tests {
 
     /// Create a test DirTree from path and perform some basic validations.
     fn create_test_tree(recursive: bool) -> (&'static str, DirTree, u8) {
-        unsafe { setup_tests() }
+        setup_tests();
         let (path, state) = unsafe {
             (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap())
         };
