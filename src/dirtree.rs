@@ -39,6 +39,8 @@ use {
     timesince::TimeSinceEpoch,
 };
 
+const MAX_RECURSE_DEPTH: usize = 16;
+
 /**
 Trie structure for storing a directory tree.
 
@@ -394,14 +396,29 @@ impl DirTree {
         };
     }
 
-    /// Parallel version of [DirTree::populate] using [rayon::iter]
-    /// to process each dir entry in parallel.
-    ///
-    /// Uses [[DirHandle]] to read the directory entries, and its [DirHandle::iter]
-    /// method, which tries to return the directory entries first using a small
-    /// buffer to look ahead in the directory stream.
-    #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
+    /**
+    Parallel version of [DirTree::populate] using [rayon::iter]
+    to process each directory entry in parallel.
+
+    Uses [[DirHandle]] to read the directory entries, and its [DirHandle::iter]
+    method which tries to return inner directories first using a small
+    buffer to look ahead in the directory stream.
+    */
     pub fn populate_par(&self, path: &PathBuf, state: &ScanState) {
+        rayon::scope(|s| self.populate_par_inner(path, state, s, 0));
+    }
+
+    #[
+        instrument(level = "debug", name = "p_par_inner", skip_all,
+        fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str(), d = depth))
+    ]
+    fn populate_par_inner<'env>(
+        &'env self,
+        path: &PathBuf,
+        state: &'env ScanState,
+        rs: &rayon::Scope<'env>,
+        depth: usize,
+    ) {
         let op: TreeOp = TreeOp::Scan(path.into(), Some(self.conf.recursive()));
         match DirHandle::new(path) {
             Ok(mut handle) => {
@@ -415,7 +432,18 @@ impl DirTree {
                                 self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
                                 if self.conf.recursive() {
-                                    self.populate_par(&entry_p, state);
+                                    /*
+                                    this should solve stack exhaustion issues with very deep
+                                    directory trees, but spawning is slower than recursion, so we
+                                    only spawn after a certain depth to get the best of both worlds
+                                    */
+                                    if depth < MAX_RECURSE_DEPTH {
+                                        self.populate_par_inner(&entry_p, state, rs, depth + 1);
+                                    } else {
+                                        rs.spawn(move |s| {
+                                            self.populate_par_inner(&entry_p, state, s, 0)
+                                        });
+                                    }
                                 }
                             } else if entry.is_file() {
                                 if self.filemode().is_with_size() {
