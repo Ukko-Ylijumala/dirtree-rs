@@ -4,7 +4,7 @@
 #![allow(static_mut_refs)]
 
 use super::*;
-use crate::{FileMode, PATH_SEP, ScanState, testdirs::create_test_dirs};
+use crate::{FileMode, Filters, PATH_SEP, ScanState, testdirs::create_test_dirs};
 use ctor::dtor;
 use libc;
 use parking_lot::Mutex;
@@ -64,7 +64,7 @@ fn teardown() {
 #[test]
 fn test_create_empty_tree() {
     setup_tests();
-    let tree: DirTree = DirTree::new(FileMode::default());
+    let tree: DirTree = DirTree::new(FileMode::default(), Filters::default());
     let (nodes, dirs, files, depth) = counts(&tree);
 
     assert_eq!(tree.root.node_t, NodeType::Root);
@@ -85,7 +85,7 @@ fn test_tree_new_from_path() {
     setup_tests();
     let path = unsafe { TESTDIR.as_ref().unwrap().path().to_str().unwrap() };
 
-    let tree: DirTree = DirTree::new(FileMode::NODE).from_path(path);
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default()).from_path(path);
     let (nodes, dirs, files, depth) = counts(&tree);
     let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
 
@@ -110,7 +110,9 @@ fn test_tree_build_thread() {
     let (path, state) =
         unsafe { (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap()) };
 
-    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE).from_path(path).build(state);
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(path)
+        .build(state);
     assert!(tree.worker.lock().is_some(), "Worker not initialized");
 
     // scan is non-blocking, so we must wait for it to finish
