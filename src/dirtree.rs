@@ -5,7 +5,7 @@ use super::event::{TreeEvent, TreeOp, TreeState};
 use super::node::{Directory, Entry, FileEntry, MaybeNode, Node, NodeItem, NodeIter, NodeType};
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::worker::tree_worker;
-use crate::{PATH_SEP, ScanState, args::FileMode, utils::path_parts};
+use crate::{PATH_SEP, ScanState, args::FileMode, filters::Filters, utils::path_parts};
 
 use dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
 use stringstore::UniqueStrStore;
@@ -18,10 +18,12 @@ use tracing::{debug, error, instrument, trace, trace_span, warn};
 
 use std::{
     collections::VecDeque,
+    ffi::OsStr,
     fmt::{self, Display, Formatter},
     fs::DirEntry,
     io::{Error, ErrorKind},
     os::fd::{AsRawFd, RawFd},
+    os::unix::ffi::OsStrExt,
     os::unix::fs::DirEntryExt,
     path::PathBuf,
     sync::{
@@ -273,12 +275,12 @@ impl DirTree {
     }
 
     /// Creates a new empty directory tree (internally a Trie structure).
-    pub fn new(filemode: FileMode) -> Self {
+    pub fn new(filemode: FileMode, filters: Filters) -> Self {
         let store: UniqueStrStore = UniqueStrStore::new_with_capacity(1024);
         let name_idx: u32 = store.insert("ROOT");
         DirTree {
             root: Node::new(NodeItem::Root(Directory::new(name_idx)), None).into(),
-            conf: TreeConf::new(filemode).into(),
+            conf: TreeConf::new(filemode, filters).into(),
             strings: store,
             ..Default::default()
         }
@@ -322,7 +324,7 @@ impl DirTree {
     #[instrument(name = "DirTree", skip_all)]
     pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, resident: bool) -> Self {
         debug!(target: "path", "{path}");
-        let tree: DirTree = Self::new(state.filemode).from_path(path);
+        let tree: DirTree = Self::new(state.filemode, state.filters.clone()).from_path(path);
         tree.conf.set_recursive(recursive);
         tree.conf.set_resident(resident);
         tree.conf.set_sync(state.sync);
@@ -355,11 +357,15 @@ impl DirTree {
         match path.read_dir().ok() {
             Some(entries) => {
                 entries.filter_map(Result::ok).for_each(|entry: DirEntry| {
+                    let name = entry.file_name();
                     let path: PathBuf = entry.path();
                     match entry.file_type() {
                         Ok(entry_t) => {
                             trace!(target: "DirEntry", "{}", path.display());
                             if entry_t.is_dir() {
+                                if !self.conf.filters().passes(&name, true) {
+                                    return;
+                                }
                                 self.insert(&path, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
                                 if recursive.is_some_and(|r: bool| r) || self.conf.recursive() {
@@ -370,6 +376,9 @@ impl DirTree {
                                     }
                                 }
                             } else if entry_t.is_file() {
+                                if !self.conf.filters().passes(&name, false) {
+                                    return;
+                                }
                                 if self.filemode().is_with_size() {
                                     //FIXME: add error handling
                                     state.fsize.fetch_add(entry.metadata().ok().unwrap().len());
@@ -424,11 +433,21 @@ impl DirTree {
             Ok(mut handle) => {
                 trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
                 handle.iter().par_bridge().for_each(|entry: EntryExt| {
-                    let entry_p: PathBuf = path.join(entry.name());
                     match entry.file_type() {
                         Some(_) => {
-                            trace!(target: "ENTRY", "{:?} : {:?}", entry.name(), entry);
+                            /*
+                            file_name() via Deref<nix::dir::Entry> returns &CStr, a
+                            zero-copy borrow from the dirent. from_bytes() wraps it as
+                            &OsStr without any allocation, so filtered entries never
+                            pay for the String allocation from entry.name().
+                            */
+                            let name_os = OsStr::from_bytes(entry.file_name().to_bytes());
+                            trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
                             if entry.is_dir() {
+                                if !self.conf.filters().passes(name_os, true) {
+                                    return;
+                                }
+                                let entry_p: PathBuf = path.join(entry.name());
                                 self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
                                 if self.conf.recursive() {
@@ -446,6 +465,10 @@ impl DirTree {
                                     }
                                 }
                             } else if entry.is_file() {
+                                if !self.conf.filters().passes(name_os, false) {
+                                    return;
+                                }
+                                let entry_p: PathBuf = path.join(entry.name());
                                 if self.filemode().is_with_size() {
                                     state.fsize.fetch_add(entry.len());
                                 }
@@ -458,6 +481,7 @@ impl DirTree {
                             }
                         }
                         None => {
+                            let entry_p: PathBuf = path.join(entry.name());
                             self.add_event(
                                 TreeEvent::new("Unknown entry type")
                                     .path(&entry_p.to_string_lossy().clone())

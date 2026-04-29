@@ -1,6 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use crate::{args::FileMode, utils::mod_atom_u32};
+use crate::{args::FileMode, filters::Filters, utils::mod_atom_u32};
 use std::{
     path::PathBuf,
     sync::OnceLock,
@@ -17,6 +17,7 @@ tree f.ex. when inserting or removing nodes. Also stores tree configuration.
 pub struct TreeConf {
     pub(super) from: OnceLock<PathBuf>,
     pub(super) filemode: FileMode,
+    pub(super) filters: Filters,
     ctime: SecondsSinceEpoch,
     /// Does not include the root node.
     nodes: AtomicU32,
@@ -31,11 +32,16 @@ pub struct TreeConf {
 }
 
 impl TreeConf {
-    pub(super) fn new(filemode: FileMode) -> Self {
+    pub(super) fn new(filemode: FileMode, filters: Filters) -> Self {
         Self {
             filemode,
+            filters,
             ..Default::default()
         }
+    }
+
+    pub(super) fn filters(&self) -> &Filters {
+        &self.filters
     }
 
     pub(super) fn from(&self) -> &PathBuf {
