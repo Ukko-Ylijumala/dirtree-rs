@@ -4,6 +4,7 @@ use super::conf::TreeConf;
 use super::event::{TreeEvent, TreeOp, TreeState};
 use super::node::{Directory, Entry, FileEntry, MaybeNode, Node, NodeItem, NodeIter, NodeType};
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
+use super::visitor::*;
 use super::worker::tree_worker;
 use crate::{PATH_SEP, ScanState, args::FileMode, filters::Filters, utils::path_parts};
 
@@ -11,7 +12,7 @@ use dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
 use stringstore::UniqueStrStore;
 use timesince::SecondsSinceEpoch;
 
-use crossbeam::queue::SegQueue;
+use crossbeam::{channel::Sender, queue::SegQueue};
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use tracing::{debug, error, instrument, trace, trace_span, warn};
@@ -42,6 +43,18 @@ use {
 };
 
 const MAX_RECURSE_DEPTH: usize = 16;
+
+/**
+Lightweight state that flows down the parallel walk: the active
+scope, the current dir's interned name, and its parent's. Pure `Copy`
+so spawning into rayon costs nothing extra.
+*/
+#[derive(Clone, Copy, Default)]
+struct WalkState {
+    scope: ScopeTag,
+    name_idx: u32,
+    parent_name_idx: Option<u32>,
+}
 
 /**
 Trie structure for storing a directory tree.
@@ -295,6 +308,80 @@ impl DirTree {
     }
 
     /**
+    Attach a [`Visitor`] to this tree. The visitor's hooks
+    ([`Visitor::visit_dir`], [`Visitor::prune_child`],
+    [`Visitor::max_depth`]) are invoked from the parallel walker
+    (`populate_par`). Sync-mode walks ignore the visitor and
+    [`DirTree::build`] rejects sync mode when a visitor is set.
+    */
+    pub fn with_visitor(self, v: Arc<dyn Visitor>) -> Self {
+        self.conf.set_visitor(Some(v));
+        self
+    }
+
+    /**
+    Attach a [`WalkEvent`] sink. Every [`Verdict::Tag`] returned by
+    the visitor produces one event on this channel. If the receiver
+    is dropped, sends become no-ops (the walker continues).
+    */
+    pub fn with_discovery_sink(self, tx: Sender<WalkEvent>) -> Self {
+        self.conf.set_discovery_tx(Some(tx));
+        self
+    }
+
+    /// Whether this tree has a visitor configured.
+    pub fn has_visitor(&self) -> bool {
+        self.conf.has_visitor()
+    }
+
+    /// Builder: set recursive scanning.
+    pub fn with_recursive(self, val: bool) -> Self {
+        self.conf.set_recursive(val);
+        self
+    }
+
+    /// Builder: set resident-mode FD pinning.
+    pub fn with_resident(self, val: bool) -> Self {
+        self.conf.set_resident(val);
+        self
+    }
+
+    /**
+    Walk this tree's configured root path, populating it.
+
+    Uses [`DirTree::populate_par`] when sync-mode is disabled OR a visitor is
+    configured; otherwise falls back to the synchronous [`DirTree::populate`].
+    
+    This is the recommended entry point for builder-style construction:
+
+    ```ignore
+    let tree = DirTree::new(filemode, filters)
+        .from_path("/some/root")
+        .with_recursive(true)
+        .with_visitor(Arc::new(visitor));
+    tree.walk(&state);
+    ```
+    */
+    pub fn walk(&self, state: &ScanState) {
+        let from: PathBuf = self.from().clone();
+        /*
+        Counter bookkeeping for the root dir: kept here to mirror
+        `new_from_path`, since the counter is for display only and is
+        not load-bearing for tree consistency.
+        */
+        state.num_d.inc1();
+        self.set_state(TreeState::Active(TreeOp::Build(from.clone())));
+        let use_par: bool = !state.sync || self.has_visitor();
+        let recursive: bool = self.conf.recursive();
+        if use_par {
+            self.populate_par(&from, state);
+        } else {
+            self.populate(&from, state, Some(recursive));
+        }
+        self.set_state(TreeState::Ready);
+    }
+
+    /**
     Build a new [[DirTree]] with the given options and start the worker thread.
 
     NOTE: must be chained with `from_path()` to set the root path.
@@ -302,6 +389,15 @@ impl DirTree {
     pub fn build(self, state: &ScanState) -> Arc<Self> {
         if self.conf.from.get().is_none() {
             panic!("Root path must be set before building the tree");
+        }
+        if state.sync && self.has_visitor() {
+            /*
+            Silent fallthrough would mean the visitor is configured but
+            never invoked - almost certainly a caller bug. Force the
+            configuration error early.
+            */
+            panic!("DirTree::build: a visitor was configured, but state.sync is true. \
+                    The visitor protocol is parallel-walker only - set sync=false.");
         }
         self.conf.set_sync(state.sync);
         let tree: Arc<Self> = self.into();
@@ -414,7 +510,42 @@ impl DirTree {
     buffer to look ahead in the directory stream.
     */
     pub fn populate_par(&self, path: &PathBuf, state: &ScanState) {
-        rayon::scope(|s| self.populate_par_inner(path, state, s, 0));
+        let walk = self.initial_walk_state(path);
+        rayon::scope(|s| self.populate_par_inner(path, state, walk, s, 0));
+    }
+
+    /**
+    Build the [`WalkState`] for the very first call into the walker.
+    The interned name is the basename of `path`; if `path` has no
+    basename (e.g. `/`) we fall back to the empty-string index `0`.
+    */
+    fn initial_walk_state(&self, path: &PathBuf) -> WalkState {
+        let name_idx = path
+            .file_name()
+            .map(|n| self.strings.insert(n.to_string_lossy().as_ref()))
+            .unwrap_or(0);
+        WalkState { scope: SCOPE_NONE, name_idx, parent_name_idx: None }
+    }
+
+    /// Emit a [`WalkEvent`] on the discovery channel, if one is configured.
+    /// No-op if no consumer is attached or the receiver has been dropped.
+    fn emit_walk_event(
+        &self,
+        path: &PathBuf,
+        tag: ScopeTag,
+        scope: ScopeTag,
+        depth: usize,
+        claimed: bool,
+    ) {
+        if let Some(tx) = self.conf.discovery_tx() {
+            let _ = tx.send(WalkEvent {
+                path: path.clone(),
+                tag,
+                scope,
+                depth,
+                claimed,
+            });
+        }
     }
 
     #[
@@ -425,94 +556,238 @@ impl DirTree {
         &'env self,
         path: &PathBuf,
         state: &'env ScanState,
+        walk: WalkState,
         rs: &rayon::Scope<'env>,
         depth: usize,
     ) {
-        let op: TreeOp = TreeOp::Scan(path.into(), Some(self.conf.recursive()));
-        match DirHandle::new(path) {
-            Ok(mut handle) => {
-                trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
-                handle.iter().par_bridge().for_each(|entry: EntryExt| {
-                    match entry.file_type() {
-                        Some(_) => {
-                            /*
-                            file_name() via Deref<nix::dir::Entry> returns &CStr, a
-                            zero-copy borrow from the dirent. from_bytes() wraps it as
-                            &OsStr without any allocation, so filtered entries never
-                            pay for the String allocation from entry.name().
-                            */
-                            let name_os = OsStr::from_bytes(entry.file_name().to_bytes());
-                            trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
-                            if entry.is_dir() {
-                                if !self.conf.filters().passes(name_os, true) {
-                                    return;
-                                }
-                                let entry_p: PathBuf = path.join(entry.name());
-                                self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
-                                state.num_d.inc1();
-                                if self.conf.recursive() {
-                                    /*
-                                    this should solve stack exhaustion issues with very deep
-                                    directory trees, but spawning is slower than recursion, so we
-                                    only spawn after a certain depth to get the best of both worlds
-                                    */
-                                    if depth < MAX_RECURSE_DEPTH {
-                                        self.populate_par_inner(&entry_p, state, rs, depth + 1);
-                                    } else {
-                                        rs.spawn(move |s| {
-                                            self.populate_par_inner(&entry_p, state, s, 0)
-                                        });
-                                    }
-                                }
-                            } else if entry.is_file() {
-                                if !self.conf.filters().passes(name_os, false) {
-                                    return;
-                                }
-                                let entry_p: PathBuf = path.join(entry.name());
-                                if self.filemode().is_with_size() {
-                                    state.fsize.fetch_add(entry.len());
-                                }
-                                if self.filemode().is_name() {
-                                    self.insert(&entry_p, NodeType::Name, None);
-                                } else if self.filemode().is_node() {
-                                    self.insert(&entry_p, NodeType::File, Some(entry.ino()));
-                                }
-                                state.num_f.inc1();
-                            }
-                        }
-                        None => {
-                            let entry_p: PathBuf = path.join(entry.name());
-                            self.add_event(
-                                TreeEvent::new("Unknown entry type")
-                                    .path(&entry_p.to_string_lossy().clone())
-                                    .op(&op),
-                            );
-                            debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
-                        }
-                    }
-                    drop(entry);
-                });
+        // Cooperative cancellation - checked at the top of every directory
+        // entry so an in-flight walk can wind down promptly once raised.
+        if self.conf.is_cancelled() {
+            return;
+        }
 
-                #[cfg(debug_assertions)]
-                {
-                    let cur = handle.state_current();
-                    let old = handle.state();
-                    debug!(target: "HANDLE_STATE", "equal: {}", old == &cur);
-                    debug!(target: "HANDLE_STATE", "old: {old:?}");
-                    debug!(target: "HANDLE_STATE", "cur: {cur:?}");
-                } // END DEBUG -- TODO: remove
+        let visitor: Option<Arc<dyn Visitor>> = self.conf.visitor();
 
-                // shall we keep the directory handle (file descriptor) open?
-                if self.conf.resident() {
-                    self.add_fd(path, handle.as_raw_fd());
-                    self.handles.insert(handle);
-                } else {
-                    drop(handle); // unnecessary, but explicit
-                }
+        // Per-scope visitor depth cap (separate from MAX_RECURSE_DEPTH,
+        // which is about stack/spawn thresholds, not tree depth).
+        if let Some(ref v) = visitor {
+            let cap = v.max_depth(walk.scope);
+            if cap > 0 && depth >= cap {
+                return;
             }
+        }
+
+        let op: TreeOp = TreeOp::Scan(path.into(), Some(self.conf.recursive()));
+        let mut handle = match DirHandle::new(path) {
+            Ok(h) => h,
             Err(e) => {
                 self.add_error(TreeEvent::error(&e.to_string(), &op));
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
+                return;
+            }
+        };
+        trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
+
+        // Visitor branch: collect dirents so visit_dir sees the full list, then act on the verdict.
+        let mut scope_for_children: ScopeTag = walk.scope;
+        let mut skip_children: bool = false;
+        let collected: Option<Vec<EntryExt>> = if let Some(ref v) = visitor {
+            let entries: Vec<EntryExt> = handle.iter().collect();
+            let walk_ctx = WalkContext {
+                path: path.as_path(),
+                name_idx: walk.name_idx,
+                parent_name_idx: walk.parent_name_idx,
+                depth,
+                scope: walk.scope,
+                strings: &self.strings,
+            };
+            let verdict = v.visit_dir(DirContext {
+                walk: &walk_ctx,
+                entries: &entries,
+            });
+            match verdict {
+                Verdict::Continue => {}
+                Verdict::SkipChildren => {
+                    skip_children = true;
+                }
+                Verdict::Tag { tag, new_scope, descend } => {
+                    self.emit_walk_event(path, tag, walk.scope, depth, !descend);
+                    scope_for_children = new_scope;
+                    if !descend {
+                        skip_children = true;
+                    }
+                }
+            }
+            Some(entries)
+        } else {
+            None
+        };
+
+        if !skip_children {
+            /*
+            The closure is identical for both iteration paths; we factor
+            it out so we only write the entry-handling logic once. It
+            captures `&self`, `state`, `walk`, `scope_for_children`,
+            `depth`, `rs`, and `&visitor` by reference - all valid for
+            the duration of the iteration.
+            */
+            let visitor_ref = visitor.as_ref();
+            let process = |entry: EntryExt| {
+                self.process_par_entry(
+                    path,
+                    state,
+                    &walk,
+                    scope_for_children,
+                    depth,
+                    rs,
+                    visitor_ref,
+                    &op,
+                    entry,
+                );
+            };
+            match collected {
+                Some(v) => v.into_par_iter().for_each(process),
+                None => handle.iter().par_bridge().for_each(process),
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let cur = handle.state_current();
+            let old = handle.state();
+            debug!(target: "HANDLE_STATE", "equal: {}", old == &cur);
+            debug!(target: "HANDLE_STATE", "old: {old:?}");
+            debug!(target: "HANDLE_STATE", "cur: {cur:?}");
+        } // END DEBUG -- TODO: remove
+
+        // shall we keep the directory handle (file descriptor) open?
+        if self.conf.resident() {
+            self.add_fd(path, handle.as_raw_fd());
+            self.handles.insert(handle);
+        } else {
+            drop(handle); // unnecessary, but explicit
+        }
+    }
+
+    /**
+    Per-dirent processing for the parallel walker. Shared between the
+    fast path (`par_bridge` over `DirHandle::iter`) and the visitor
+    path (`into_par_iter` over a collected `Vec<EntryExt>`).
+    */
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn process_par_entry<'env>(
+        &'env self,
+        parent_path: &PathBuf,
+        state: &'env ScanState,
+        parent_walk: &WalkState,
+        scope_for_children: ScopeTag,
+        depth: usize,
+        rs: &rayon::Scope<'env>,
+        visitor: Option<&Arc<dyn Visitor>>,
+        op: &TreeOp,
+        entry: EntryExt,
+    ) {
+        match entry.file_type() {
+            Some(_) => {
+                /*
+                file_name() via Deref<nix::dir::Entry> returns &CStr, a
+                zero-copy borrow from the dirent. from_bytes() wraps it
+                as &OsStr without any allocation, so filtered entries
+                never pay for the String allocation from entry.name().
+                */
+                let name_os = OsStr::from_bytes(entry.file_name().to_bytes());
+                trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
+
+                if entry.is_dir() {
+                    /*
+                    Path-aware prune via the visitor (when set). We
+                    intern the child name once here so the visitor
+                    can compare u32-vs-u32 without allocations.
+                    */
+                    let child_idx: u32 = if visitor.is_some() {
+                        self.strings.insert(name_os.to_string_lossy().as_ref())
+                    } else {
+                        0
+                    };
+                    if let Some(v) = visitor {
+                        let parent_ctx = WalkContext {
+                            path: parent_path.as_path(),
+                            name_idx: parent_walk.name_idx,
+                            parent_name_idx: parent_walk.parent_name_idx,
+                            depth,
+                            scope: parent_walk.scope,
+                            strings: &self.strings,
+                        };
+                        if v.prune_child(&parent_ctx, child_idx, true) {
+                            return;
+                        }
+                    }
+                    if !self.conf.filters().passes(name_os, true) {
+                        return;
+                    }
+                    let entry_p: PathBuf = parent_path.join(entry.name());
+                    self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
+                    state.num_d.inc1();
+                    if self.conf.recursive() {
+                        let next = WalkState {
+                            scope: scope_for_children,
+                            name_idx: child_idx,
+                            parent_name_idx: Some(parent_walk.name_idx),
+                        };
+                        // spawning is slower than direct recursion, so only
+                        // spawn after MAX_RECURSE_DEPTH to bound stack use.
+                        if depth < MAX_RECURSE_DEPTH {
+                            self.populate_par_inner(&entry_p, state, next, rs, depth + 1);
+                        } else {
+                            rs.spawn(move |s| {
+                                self.populate_par_inner(&entry_p, state, next, s, 0)
+                            });
+                        }
+                    }
+                } else if entry.is_file() {
+                    /*
+                    Same prune+filter shape for files. We only intern
+                    the child name when a visitor is set; insertion via
+                    `insert()` does its own interning later if needed.
+                    */
+                    if let Some(v) = visitor {
+                        let child_idx = self.strings.insert(name_os.to_string_lossy().as_ref());
+                        let parent_ctx = WalkContext {
+                            path: parent_path.as_path(),
+                            name_idx: parent_walk.name_idx,
+                            parent_name_idx: parent_walk.parent_name_idx,
+                            depth,
+                            scope: parent_walk.scope,
+                            strings: &self.strings,
+                        };
+                        if v.prune_child(&parent_ctx, child_idx, false) {
+                            return;
+                        }
+                    }
+                    if !self.conf.filters().passes(name_os, false) {
+                        return;
+                    }
+                    let entry_p: PathBuf = parent_path.join(entry.name());
+                    if self.filemode().is_with_size() {
+                        state.fsize.fetch_add(entry.len());
+                    }
+                    if self.filemode().is_name() {
+                        self.insert(&entry_p, NodeType::Name, None);
+                    } else if self.filemode().is_node() {
+                        self.insert(&entry_p, NodeType::File, Some(entry.ino()));
+                    }
+                    state.num_f.inc1();
+                }
+            }
+            None => {
+                let entry_p: PathBuf = parent_path.join(entry.name());
+                self.add_event(
+                    TreeEvent::new("Unknown entry type")
+                        .path(&entry_p.to_string_lossy().clone())
+                        .op(op),
+                );
+                debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
             }
         }
     }

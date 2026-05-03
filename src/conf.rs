@@ -1,8 +1,12 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
+use super::visitor::{Visitor, WalkEvent};
 use crate::{args::FileMode, filters::Filters, utils::mod_atom_u32};
+use crossbeam::channel::Sender;
+use parking_lot::RwLock;
 use std::{
     path::PathBuf,
+    sync::Arc,
     sync::OnceLock,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed},
 };
@@ -18,6 +22,16 @@ pub struct TreeConf {
     pub(super) from: OnceLock<PathBuf>,
     pub(super) filemode: FileMode,
     pub(super) filters: Filters,
+    /**
+    Optional [`Visitor`] used by the parallel walker to recognize
+    subtrees, prune children, and bound depth. When set, the walker
+    follows the visitor-aware path; otherwise the original fast path.
+    */
+    pub(super) visitor: RwLock<Option<Arc<dyn Visitor>>>,
+    /// Optional channel for streaming [`WalkEvent`]s as the walk runs.
+    pub(super) discovery_tx: RwLock<Option<Sender<WalkEvent>>>,
+    /// Cooperative cancellation flag. Checked at the top of every `populate_par_inner`.
+    pub(super) cancelled: AtomicBool,
     ctime: SecondsSinceEpoch,
     /// Does not include the root node.
     nodes: AtomicU32,
@@ -91,6 +105,37 @@ impl TreeConf {
     }
     pub(super) fn set_sync(&self, val: bool) {
         self.sync.store(val, Relaxed);
+    }
+
+    /// A snapshot of the configured visitor, if any.
+    pub(super) fn visitor(&self) -> Option<Arc<dyn Visitor>> {
+        self.visitor.read().clone()
+    }
+
+    pub(super) fn has_visitor(&self) -> bool {
+        self.visitor.read().is_some()
+    }
+
+    pub(super) fn set_visitor(&self, v: Option<Arc<dyn Visitor>>) {
+        *self.visitor.write() = v;
+    }
+
+    pub(super) fn discovery_tx(&self) -> Option<Sender<WalkEvent>> {
+        self.discovery_tx.read().clone()
+    }
+
+    pub(super) fn set_discovery_tx(&self, tx: Option<Sender<WalkEvent>>) {
+        *self.discovery_tx.write() = tx;
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Relaxed)
+    }
+
+    /// Raise the cancellation flag. Subsequent calls into the parallel walker return early.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Relaxed);
     }
 
     /// Increment or decrement the node counter.
