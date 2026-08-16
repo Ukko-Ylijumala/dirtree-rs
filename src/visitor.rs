@@ -71,7 +71,7 @@ the walker; do not retain references to it past the `visit_dir` call.
 */
 pub struct DirContext<'a> {
     pub walk: &'a WalkContext<'a>,
-    pub entries: &'a [EntryExt],
+    pub entries: &'a [EntryExt<'a>],
 }
 
 /// The visitor's answer for the directory currently being walked.

@@ -626,76 +626,80 @@ impl DirTree {
         };
         trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
 
-        // Visitor branch: collect dirents so visit_dir sees the full list, then act on the verdict.
-        let mut scope_for_children: ScopeTag = walk.scope;
-        let mut skip_children: bool = false;
-        let collected: Option<Vec<EntryExt>> = if let Some(ref v) = visitor {
-            let entries: Vec<EntryExt> = handle.iter().collect();
-            let walk_ctx = WalkContext {
-                path: path.as_path(),
-                name_idx: walk.name_idx,
-                parent_name_idx: walk.parent_name_idx,
-                depth,
-                scope: walk.scope,
-                strings: &self.strings,
-            };
-            let verdict = v.visit_dir(DirContext {
-                walk: &walk_ctx,
-                entries: &entries,
-            });
-            match verdict {
-                Verdict::Continue => {}
-                Verdict::SkipChildren => {
-                    skip_children = true;
-                }
-                Verdict::Tag { tag, new_scope, descend } => {
-                    self.emit_walk_event(path, tag, walk.scope, depth, !descend);
-                    scope_for_children = new_scope;
-                    if !descend {
+        /*
+        Visitor branch: collect dirents so visit_dir sees the full list,
+        then act on the verdict. The entry-handling logic itself lives in
+        `process_par_entry`, shared by both iteration paths. Since 0.4.2
+        each `EntryExt` borrows its `DirHandle`, so the collected Vec must
+        be consumed inside this branch (before the handle is used again).
+        */
+        let visitor_ref = visitor.as_ref();
+        match visitor_ref {
+            Some(v) => {
+                let entries: Vec<EntryExt> = handle.iter().collect();
+                let walk_ctx = WalkContext {
+                    path: path.as_path(),
+                    name_idx: walk.name_idx,
+                    parent_name_idx: walk.parent_name_idx,
+                    depth,
+                    scope: walk.scope,
+                    strings: &self.strings,
+                };
+                let verdict = v.visit_dir(DirContext {
+                    walk: &walk_ctx,
+                    entries: &entries,
+                });
+                let mut scope_for_children: ScopeTag = walk.scope;
+                let mut skip_children: bool = false;
+                match verdict {
+                    Verdict::Continue => {}
+                    Verdict::SkipChildren => {
                         skip_children = true;
                     }
+                    Verdict::Tag { tag, new_scope, descend } => {
+                        self.emit_walk_event(path, tag, walk.scope, depth, !descend);
+                        scope_for_children = new_scope;
+                        if !descend {
+                            skip_children = true;
+                        }
+                    }
+                }
+                if !skip_children {
+                    entries.into_par_iter().for_each(|entry: EntryExt| {
+                        self.process_par_entry(
+                            path,
+                            state,
+                            &walk,
+                            scope_for_children,
+                            depth,
+                            rs,
+                            visitor_ref,
+                            &op,
+                            entry,
+                        );
+                    });
                 }
             }
-            Some(entries)
-        } else {
-            None
-        };
-
-        if !skip_children {
-            /*
-            The closure is identical for both iteration paths; we factor
-            it out so we only write the entry-handling logic once. It
-            captures `&self`, `state`, `walk`, `scope_for_children`,
-            `depth`, `rs`, and `&visitor` by reference - all valid for
-            the duration of the iteration.
-            */
-            let visitor_ref = visitor.as_ref();
-            let process = |entry: EntryExt| {
-                self.process_par_entry(
-                    path,
-                    state,
-                    &walk,
-                    scope_for_children,
-                    depth,
-                    rs,
-                    visitor_ref,
-                    &op,
-                    entry,
-                );
-            };
-            match collected {
-                Some(v) => v.into_par_iter().for_each(process),
-                None => handle.iter().par_bridge().for_each(process),
+            None => {
+                handle.iter().par_bridge().for_each(|entry: EntryExt| {
+                    self.process_par_entry(
+                        path, state, &walk, walk.scope, depth, rs, None, &op, entry,
+                    );
+                });
             }
         }
 
         #[cfg(debug_assertions)]
         {
-            let cur = handle.state_current();
-            let old = handle.state();
-            debug!(target: "HANDLE_STATE", "equal: {}", old == &cur);
-            debug!(target: "HANDLE_STATE", "old: {old:?}");
-            debug!(target: "HANDLE_STATE", "cur: {cur:?}");
+            match handle.state_current() {
+                Ok(cur) => {
+                    let old = handle.state();
+                    debug!(target: "HANDLE_STATE", "equal: {}", old == &cur);
+                    debug!(target: "HANDLE_STATE", "old: {old:?}");
+                    debug!(target: "HANDLE_STATE", "cur: {cur:?}");
+                }
+                Err(e) => debug!(target: "HANDLE_STATE", "state_current failed: {e}"),
+            }
         } // END DEBUG -- TODO: remove
 
         // shall we keep the directory handle (file descriptor) open?
@@ -724,7 +728,7 @@ impl DirTree {
         rs: &rayon::Scope<'env>,
         visitor: Option<&Arc<dyn Visitor>>,
         op: &TreeOp,
-        entry: EntryExt,
+        entry: EntryExt<'_>,
     ) {
         match entry.file_type() {
             Some(_) => {
