@@ -993,7 +993,7 @@ impl DirTree {
             let itm: NodeItem = if is_file {
                 NodeItem::File(Entry::<FileEntry>::with_inode(inode))
             } else {
-                let mut itm = NodeItem::Dir(Entry::<Directory>::with_inode(inode));
+                let itm = NodeItem::Dir(Entry::<Directory>::with_inode(inode));
                 itm.set_dir_name(name_idx);
                 itm
             };
@@ -1079,7 +1079,7 @@ impl DirTree {
                 match node_t {
                     NodeType::Directory => match Entry::<Directory>::new(path, inode) {
                         Ok(e) => {
-                            let mut itm = NodeItem::Dir(e);
+                            let itm = NodeItem::Dir(e);
                             itm.set_dir_name(part);
                             itm
                         }
@@ -1101,7 +1101,7 @@ impl DirTree {
             } else {
                 trace!(target: "intermediate", "{part:?} --> depth: {depth}/{len}");
                 // must be a container (directory) so let's create the basic structure
-                let mut itm = NodeItem::Dir(Entry::<Directory>::default());
+                let itm = NodeItem::Dir(Entry::<Directory>::default());
                 itm.set_dir_name(part);
                 itm
             };
@@ -1227,6 +1227,59 @@ impl DirTree {
         self.conf.dirs_mod(-(dirs as i32));
         self.conf.files_mod(-(files as i32));
         (nodes, dirs, files)
+    }
+
+    /**
+    Re-attach a previously detached child under `parent` with the given
+    name (rename support). The child's stored parent reference must
+    still point at `parent` - the trie has no re-parenting, so
+    cross-directory moves must re-create nodes instead of using this.
+
+    Any existing occupant of the destination name is removed first
+    (rename-over semantics), and a directory child is re-labeled with
+    the new name. The tree counters are restored from `counts` as
+    captured at detach time.
+
+    Returns `false` (leaving the tree unchanged) if `parent` is not a
+    directory or is not the child's actual parent.
+    */
+    pub(super) fn attach_child_node(
+        &self,
+        parent: &Arc<Node>,
+        name_idx: u32,
+        child: Arc<Node>,
+        counts: (u32, u32, u32),
+    ) -> bool {
+        let Some(dir) = parent.as_dir() else {
+            return false;
+        };
+        match child.parent() {
+            Some(p) if Arc::ptr_eq(&p, parent) => {}
+            _ => return false,
+        }
+
+        // rename-over: drop any previous occupant of the destination name
+        let occupant: Option<MaybeNode> = dir.read().get(&name_idx).cloned();
+        match occupant {
+            Some(Some(old)) => {
+                self.remove_child_node(parent, name_idx, old);
+            }
+            Some(None) => {
+                if dir.remove_name_child(&name_idx) {
+                    self.conf.files_mod(-1);
+                }
+            }
+            None => {}
+        }
+
+        if child.node_t.is_dir() {
+            child.set_dir_name(name_idx);
+        }
+        dir.add_child(name_idx, Some(child));
+        self.conf.nodes_mod(counts.0 as i32);
+        self.conf.dirs_mod(counts.1 as i32);
+        self.conf.files_mod(counts.2 as i32);
+        true
     }
 
     /// Remove a name-only (Node-less) file entry from its parent directory.

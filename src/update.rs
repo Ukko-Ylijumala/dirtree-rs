@@ -27,23 +27,36 @@ use super::node::{DirTreeHashMap, MaybeNode, Node, NodeType};
 use crate::ScanState;
 
 use dirhandle::{DirHandle, EntryExt};
+use timesince::SecondsSinceEpoch;
 use tracing::{debug, instrument, trace};
 
 use std::{
     ffi::OsStr,
     fmt::{self, Display, Formatter},
+    fs::metadata,
     io::{Error, ErrorKind},
     os::unix::ffi::OsStrExt,
+    os::unix::fs::MetadataExt,
     path::PathBuf,
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering::Relaxed},
 };
+
+/**
+Timestamps within this many seconds of the last-scan baseline fall
+through to a full diff, guarding against filesystem timestamp
+granularity and same-second races (mirrors dirhandle's slack).
+*/
+const MTIME_SLACK_SECS: u64 = 2;
 
 /// Counters describing what a [`DirTree::update`] pass changed.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpdateStats {
     /// Directories whose entry lists were diffed.
     pub scanned_dirs: u32,
+    /// Directories skipped by the mtime/ctime pre-check (a single stat
+    /// showed the entry list cannot have changed since the last scan).
+    pub skipped_dirs: u32,
     pub added_dirs: u32,
     pub added_files: u32,
     /// Directory nodes removed (including subtree contents).
@@ -71,13 +84,14 @@ impl Display for UpdateStats {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "+{}d/+{}f, -{}d/-{}f, ~{} replaced ({} dirs diffed, {} errors)",
+            "+{}d/+{}f, -{}d/-{}f, ~{} replaced ({} dirs diffed, {} skipped, {} errors)",
             self.added_dirs,
             self.added_files,
             self.removed_dirs,
             self.removed_files,
             self.replaced,
             self.scanned_dirs,
+            self.skipped_dirs,
             self.errors
         )
     }
@@ -87,6 +101,7 @@ impl Display for UpdateStats {
 #[derive(Default)]
 struct UpdateCtr {
     scanned_dirs: AtomicU32,
+    skipped_dirs: AtomicU32,
     added_dirs: AtomicU32,
     added_files: AtomicU32,
     removed_dirs: AtomicU32,
@@ -99,6 +114,7 @@ impl UpdateCtr {
     fn snapshot(&self) -> UpdateStats {
         UpdateStats {
             scanned_dirs: self.scanned_dirs.load(Relaxed),
+            skipped_dirs: self.skipped_dirs.load(Relaxed),
             added_dirs: self.added_dirs.load(Relaxed),
             added_files: self.added_files.load(Relaxed),
             removed_dirs: self.removed_dirs.load(Relaxed),
@@ -163,6 +179,54 @@ impl DirTree {
             return;
         }
         let op: TreeOp = TreeOp::Update(path.clone());
+
+        /*
+        Fast path: a directory's own mtime changes exactly when its entry
+        list changes (create / remove / rename), so if both mtime and
+        ctime are clearly older than the node's last scan time, the
+        entry list cannot have changed - skip the listing and diff on a
+        single stat and only descend into subdirectories (their own
+        timestamps decide for themselves). Backdating mtime bumps ctime,
+        so it cannot fake "unchanged"; only nodes whose baseline was
+        refreshed by an earlier full diff qualify.
+        */
+        if let Some(when) = node.scanned_at()
+            && when > 0
+            && let Ok(meta) = metadata(path)
+        {
+            let newest: u64 = meta.mtime().max(meta.ctime()).max(0) as u64;
+            if newest + MTIME_SLACK_SECS < when {
+                trace!(target: "UPDATE_SKIP", "{} unchanged since {when}", path.display());
+                ctr.skipped_dirs.fetch_add(1, Relaxed);
+                if recursive && let Some(ch) = node.children() {
+                    let subdirs: Vec<(u32, Arc<Node>)> = ch
+                        .read()
+                        .iter()
+                        .filter_map(|(k, v)| match v {
+                            Some(n) if n.node_t.is_dir() => Some((*k, n.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    for (name_idx, child) in subdirs {
+                        let child_p: PathBuf = path.join(self.get_string(name_idx));
+                        if frames < MAX_RECURSE_DEPTH {
+                            self.update_inner(
+                                &child_p, child, state, recursive, ctr, rs, frames + 1,
+                            );
+                        } else {
+                            rs.spawn(move |s| {
+                                self.update_inner(&child_p, child, state, recursive, ctr, s, 0)
+                            });
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // capture the pass time BEFORE listing, so a change racing the
+        // diff makes the next pre-check fall through to a full diff again
+        let pass_time: u64 = *SecondsSinceEpoch::new();
 
         let mut handle: DirHandle = match DirHandle::new(path) {
             Ok(h) => h,
@@ -327,6 +391,9 @@ impl DirTree {
                 }
             }
         }
+
+        // a completed full diff establishes a fresh pre-check baseline
+        node.set_scanned(pass_time);
     }
 
     /// Insert a directory that appeared on disk and, when `recursive`,

@@ -24,6 +24,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::PathBuf,
     ptr,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
     sync::{Arc, OnceLock, Weak},
 };
 
@@ -41,17 +42,44 @@ pub(super) type Children = RwLock<DirTreeHashMap<u32, MaybeNode>>;
 pub(super) type NodeIter<'a> = dyn Iterator<Item = Arc<Node>> + 'a;
 pub(super) type DirTreeHashMap<K, V> = HashMap<K, V, DirTreeXxh3Hasher>;
 
-#[derive(Default, Debug, Clone, Eq)]
+#[derive(Default, Debug)]
 struct Data {
     inode: u64,
-    /// last scan time (seconds since UNIX epoch)
-    when: SecondsSinceEpoch,
+    /// Last scan time (seconds since UNIX epoch). Atomic so a diff-rescan
+    /// can refresh it through the shared `&Node` without any locking.
+    when: AtomicU64,
 }
 
 impl Data {
+    fn new(inode: u64) -> Self {
+        Self {
+            inode,
+            when: AtomicU64::new(*SecondsSinceEpoch::new()),
+        }
+    }
+
     /// The inode of the file or directory.
     pub fn inode(&self) -> u64 {
         self.inode
+    }
+
+    /// Last scan time in seconds since the UNIX epoch.
+    fn when(&self) -> u64 {
+        self.when.load(Relaxed)
+    }
+
+    /// Record the given time as the last scan time.
+    fn set_when(&self, secs: u64) {
+        self.when.store(secs, Relaxed);
+    }
+}
+
+impl Clone for Data {
+    fn clone(&self) -> Self {
+        Data {
+            inode: self.inode,
+            when: AtomicU64::new(self.when()),
+        }
     }
 }
 
@@ -67,6 +95,9 @@ impl PartialEq for Data {
         self.inode == other.inode
     }
 }
+
+// manual impl since AtomicU64 is not Eq (identity is the inode anyway)
+impl Eq for Data {}
 
 impl Ord for Data {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -117,7 +148,7 @@ trait DirectoryEntry {
             error!("Inode changed: {} ({} -> {})", path.display(), self.data().inode, meta.ino());
             return Err(Error::new(ErrorKind::AlreadyExists, "Inode changed"));
         }
-        self.data_mut().when = SecondsSinceEpoch::new();
+        self.data().set_when(*SecondsSinceEpoch::new());
         Ok(meta)
     }
 }
@@ -173,10 +204,7 @@ impl<T: Default> Entry<T> {
             },
         };
         Ok(Self(
-            Data {
-                inode,
-                when: SecondsSinceEpoch::new(),
-            },
+            Data::new(inode),
             Default::default(), // provides the type parameter T
         ))
     }
@@ -184,13 +212,7 @@ impl<T: Default> Entry<T> {
     /// Infallible constructor for when the inode is already known
     /// (e.g. from a dirent) - no stat is performed.
     pub fn with_inode(inode: u64) -> Self {
-        Self(
-            Data {
-                inode,
-                when: SecondsSinceEpoch::new(),
-            },
-            Default::default(),
-        )
+        Self(Data::new(inode), Default::default())
     }
 }
 
@@ -213,7 +235,9 @@ impl<T> DirectoryEntry for Entry<T> {
 /// A [NodeItem] struct representing a Directory.
 #[derive(Debug)]
 pub struct Directory {
-    name: u32,
+    /// Interned name index. Atomic so a rename can re-label the
+    /// directory in place through the shared `&Node`.
+    name: AtomicU32,
     fd: DirFd,
     children: Children,
 }
@@ -222,17 +246,23 @@ impl Directory {
     #[instrument(level = "trace")]
     pub fn new(name_idx: u32) -> Self {
         Directory {
-            name: name_idx,
+            name: AtomicU32::new(name_idx),
             ..Default::default()
         }
     }
 
-    pub fn name<'a>(&self, store: &'a UniqueStrStore) -> &'a str {
-        unsafe { store.borrow_str(self.name) }
+    /// The directory's interned name index.
+    #[inline]
+    pub(super) fn name_idx(&self) -> u32 {
+        self.name.load(Relaxed)
     }
 
-    fn name_set(&mut self, name_idx: u32) {
-        self.name = name_idx;
+    pub fn name<'a>(&self, store: &'a UniqueStrStore) -> &'a str {
+        unsafe { store.borrow_str(self.name_idx()) }
+    }
+
+    pub(super) fn name_set(&self, name_idx: u32) {
+        self.name.store(name_idx, Relaxed);
     }
 
     /// Returns the [[DirFd]] for this [[Directory]] item.
@@ -368,7 +398,7 @@ impl Directory {
 impl Default for Directory {
     fn default() -> Self {
         Directory {
-            name: 0,
+            name: AtomicU32::new(0),
             fd: DirFd::default(),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
@@ -379,7 +409,7 @@ impl Clone for Directory {
     /// NOTE: a clone of a [Directory] has the same [RawFd], but it may become stale.
     fn clone(&self) -> Self {
         Directory {
-            name: self.name.clone(),
+            name: AtomicU32::new(self.name_idx()),
             fd: self.fd.clone(),
             children: self.children.read().clone().into(),
         }
@@ -388,7 +418,7 @@ impl Clone for Directory {
 
 impl Hash for Directory {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
+        self.name_idx().hash(state);
         let mut children: Vec<(u32, MaybeNode)> = self
             .children
             .read()
@@ -406,7 +436,7 @@ impl PartialEq for Directory {
             // also guards against a recursive read lock on self-compare
             return true;
         }
-        if self.name != other.name {
+        if self.name_idx() != other.name_idx() {
             // short circuit if the names don't match
             return false;
         }
@@ -421,7 +451,7 @@ impl Eq for Directory {}
 
 impl Ord for Directory {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.name.cmp(&other.name)
+        self.name_idx().cmp(&other.name_idx())
     }
 }
 
@@ -557,7 +587,7 @@ impl NodeItem {
     }
 
     /// Set the name of the inner [[Directory]] if the node item is [NodeItem::Dir].
-    pub(super) fn set_dir_name(&mut self, name_idx: u32) {
+    pub(super) fn set_dir_name(&self, name_idx: u32) {
         if let Self::Dir(v) = self {
             v.1.name_set(name_idx);
         }
@@ -786,6 +816,25 @@ impl Node {
     /// NOTE: intermediate nodes created without a stat report inode 0.
     pub fn inode(&self) -> Option<u64> {
         self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.inode())
+    }
+
+    /// Last scan time (seconds since epoch), if the node carries [Data].
+    pub fn scanned_at(&self) -> Option<u64> {
+        self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.when())
+    }
+
+    /// Record the given time as the node's last scan time.
+    pub(super) fn set_scanned(&self, secs: u64) {
+        if let Some(d) = self.item.get().and_then(|i: &NodeItem| i.data()) {
+            d.set_when(secs);
+        }
+    }
+
+    /// Re-label a directory node with a new interned name (rename support).
+    pub(super) fn set_dir_name(&self, name_idx: u32) {
+        if let Some(item) = self.item.get() {
+            item.set_dir_name(name_idx);
+        }
     }
 
     #[inline]

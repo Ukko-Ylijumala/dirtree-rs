@@ -428,6 +428,113 @@ fn test_tree_update_diff_name_mode() {
 }
 
 #[test]
+fn test_tree_update_mtime_precheck() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+    std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
+    std::fs::create_dir(temp.path().join("sub2")).unwrap();
+    std::fs::write(temp.path().join("sub2/b.bin"), b"y").unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+
+    /*
+    Freshly built: fs timestamps and node scan times are within the
+    slack window, so the pre-check must fall through to full diffs.
+    The pass refreshes the baselines - but only a baseline that is
+    clearly NEWER than the fs timestamps allows skipping, hence the
+    sleep before the refreshing pass.
+    */
+    std::thread::sleep(Duration::from_millis(3500));
+    let s1: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    assert_eq!(s1.skipped_dirs, 0, "first pass must diff everything: {s1}");
+    assert!(!s1.changed(), "first pass changed something: {s1}");
+
+    // now the refreshed baselines dominate: one stat per dir, no diffs
+    let s2: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    assert_eq!(s2.scanned_dirs, 0, "second pass should diff nothing: {s2}");
+    assert_eq!(s2.skipped_dirs, 3, "root, sub and sub2 should be skipped: {s2}");
+    assert!(!s2.changed(), "second pass changed something: {s2}");
+
+    // a new entry bumps its dir's mtime and forces a real diff there only
+    std::fs::write(temp.path().join("sub/new.bin"), b"n").unwrap();
+    let s3: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    assert_eq!(s3.added_files, 1, "new.bin should be found: {s3}");
+    assert_eq!(s3.scanned_dirs, 1, "only sub should be diffed: {s3}");
+    assert_eq!(s3.skipped_dirs, 2, "root and sub2 should be skipped: {s3}");
+    assert!(tree.contains(&format!("{dir}/sub/new.bin")), "new.bin missing");
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_watcher_renames() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+    std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
+    std::fs::create_dir_all(temp.path().join("dir1/inner")).unwrap();
+    std::fs::write(temp.path().join("dir1/inner/d.bin"), b"d").unwrap();
+    let outside: TempDir = TempDir::new().unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: Arc<DirTree> =
+        Arc::new(DirTree::new_from_path(dir, &state, true, false));
+    let watcher: Arc<TreeWatcher> =
+        TreeWatcher::start(tree.clone(), state.clone()).expect("watcher should start");
+
+    // same-dir file rename
+    std::fs::rename(temp.path().join("sub/a.bin"), temp.path().join("sub/renamed.bin")).unwrap();
+    wait_for(|| tree.contains(&format!("{dir}/sub/renamed.bin")), "renamed file should appear");
+    wait_for(|| !tree.contains(&format!("{dir}/sub/a.bin")), "old file name should vanish");
+
+    // same-dir directory rename: subtree and node identity must survive
+    let d1: Arc<Node> = tree.get_node(&format!("{dir}/dir1")).expect("dir1 missing");
+    std::fs::rename(temp.path().join("dir1"), temp.path().join("dir2")).unwrap();
+    wait_for(
+        || tree.contains(&format!("{dir}/dir2/inner/d.bin")),
+        "renamed dir's contents should be reachable under the new name",
+    );
+    assert!(!tree.contains(&format!("{dir}/dir1")), "old dir name should vanish");
+    let d2: Arc<Node> = tree.get_node(&format!("{dir}/dir2")).expect("dir2 missing");
+    assert!(Arc::ptr_eq(&d1, &d2), "in-place rename should preserve node identity");
+
+    // the renamed subtree's watches must still be live
+    std::fs::write(temp.path().join("dir2/inner/e.bin"), b"e").unwrap();
+    wait_for(
+        || tree.contains(&format!("{dir}/dir2/inner/e.bin")),
+        "events under the renamed dir should still be tracked",
+    );
+
+    // cross-directory file move
+    std::fs::rename(temp.path().join("sub/renamed.bin"), temp.path().join("dir2/moved.bin"))
+        .unwrap();
+    wait_for(|| tree.contains(&format!("{dir}/dir2/moved.bin")), "moved file should appear");
+    wait_for(|| !tree.contains(&format!("{dir}/sub/renamed.bin")), "moved file source vanish");
+
+    // cross-directory dir move (re-created via rescan)
+    std::fs::create_dir(temp.path().join("sub/mvdir")).unwrap();
+    std::fs::write(temp.path().join("sub/mvdir/m.bin"), b"m").unwrap();
+    wait_for(|| tree.contains(&format!("{dir}/sub/mvdir/m.bin")), "mvdir contents scanned");
+    std::fs::rename(temp.path().join("sub/mvdir"), temp.path().join("dir2/mvdir")).unwrap();
+    wait_for(|| tree.contains(&format!("{dir}/dir2/mvdir/m.bin")), "moved dir contents appear");
+    wait_for(|| !tree.contains(&format!("{dir}/sub/mvdir")), "moved dir source vanish");
+
+    // move out of the tree: detached immediately, dropped on expiry
+    std::fs::rename(temp.path().join("dir2/moved.bin"), outside.path().join("moved.bin"))
+        .unwrap();
+    wait_for(|| !tree.contains(&format!("{dir}/dir2/moved.bin")), "moved-out file vanish");
+
+    // move into the tree from outside: an uncorrelated MOVED_TO = create
+    std::fs::rename(outside.path().join("moved.bin"), temp.path().join("sub/back.bin"))
+        .unwrap();
+    wait_for(|| tree.contains(&format!("{dir}/sub/back.bin")), "moved-in file should appear");
+
+    watcher.stop();
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_rescan_via_worker() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
