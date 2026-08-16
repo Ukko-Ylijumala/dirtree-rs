@@ -11,6 +11,7 @@ The module is split into several submodules for clarity:
 - [`event`]:    [`TreeOp`], [`TreeState`], [`TreeEvent`], [`EventInfo`].
 - [`dirtree`]:  [`DirTree`] itself and [`DirTreeIterator`].
 - [`traverse`]: free traversal helpers over `Arc<Node>`.
+- [`update`]:   diff-rescan (the [`TreeOp::Update`] primitive).
 - [`worker`]:   the background work-queue executor.
 - [`visitor`]:  per-directory visitor protocol (recognition, prune, depth).
 - [`visitors`]: built-in [`Visitor`] implementations.
@@ -27,6 +28,7 @@ mod hash;
 mod node;
 mod tests;
 mod traverse;
+mod update;
 mod visitor;
 mod visitors;
 mod watch;
@@ -39,6 +41,7 @@ pub use event::{EventInfo, TreeEvent, TreeOp, TreeState};
 pub use hash::DirTreeXxh3Hasher;
 pub use node::{Directory, Entry, FileEntry, Node, NodeItem, NodeType};
 pub use traverse::{traverse_from, traverse_from_par, walk_nodes};
+pub use update::UpdateStats;
 pub use visitor::*;
 pub use visitors::*;
 pub use watch::TreeWatcher;

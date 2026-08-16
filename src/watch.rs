@@ -22,8 +22,10 @@ v1 caveats (deliberate, recorded for the future crate split):
 - Renames arrive as `IN_MOVED_FROM` + `IN_MOVED_TO` and are handled as
   remove + re-scan; move cookies are not correlated yet.
 - A kernel queue overflow (`IN_Q_OVERFLOW`) marks the tree
-  [`TreeState::Inconsistent`] and records an error event: lost creations
-  could be repaired by a rescan, lost deletions cannot.
+  [`TreeState::Inconsistent`], repairs it with a full
+  [diff-rescan](DirTree::update) (which fixes both lost creations and
+  lost deletions), re-establishes watches and restores
+  [`TreeState::Ready`]; only a failed resync leaves the tree flagged.
 - Entries created between the initial tree build and watcher start are
   not seen (the usual scan-to-watch gap).
 */
@@ -280,14 +282,39 @@ impl TreeWatcher {
 
         if mask & libc::IN_Q_OVERFLOW != 0 {
             /*
-            The kernel dropped events: additions could be repaired with a
-            rescan, but deletions are lost for good - flag the tree so
-            the consumer knows the state can no longer be trusted.
+            The kernel dropped events. A diff-rescan repairs both
+            directions (it inserts what appeared AND removes what
+            vanished), so mark the tree inconsistent, resync, and
+            restore the Ready state on success. Watches for new
+            directories are re-established by re-walking the tree -
+            re-adding an existing watch is idempotent.
             */
-            let ev: TreeEvent = TreeEvent::new("inotify queue overflow, tree out of sync");
+            let ev: TreeEvent = TreeEvent::new("inotify queue overflow, resyncing tree");
             error!("{ev:?}");
             self.tree.add_error(ev.clone());
             self.tree.set_state(TreeState::Inconsistent(ev));
+
+            let from: PathBuf = self.tree.from().clone();
+            let from_str = from.to_string_lossy();
+            match self.tree.update(from_str.as_ref(), &self.state, Some(true)) {
+                Ok(stats) => {
+                    self.sweep_dead_watches();
+                    if let Some(root) = self.tree.get_node(from_str.as_ref()) {
+                        self.watch_subtree(&root);
+                    }
+                    let msg: String = format!("Tree resynced after overflow: {stats}");
+                    warn!("{msg}");
+                    self.tree.add_event(TreeEvent::new(&msg));
+                    self.tree.set_state(TreeState::Ready);
+                }
+                Err(e) => {
+                    // stays Inconsistent - the consumer must intervene
+                    self.tree.add_error(TreeEvent::error(
+                        &format!("Overflow resync failed: {e}"),
+                        &TreeOp::Update(from.clone()),
+                    ));
+                }
+            }
             return;
         }
         if mask & libc::IN_IGNORED != 0 {

@@ -782,6 +782,12 @@ impl Node {
         self.as_dir().map(|dir: &Directory| dir.fd())
     }
 
+    /// The inode of the node's file or directory, if it carries [Data].
+    /// NOTE: intermediate nodes created without a stat report inode 0.
+    pub fn inode(&self) -> Option<u64> {
+        self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.inode())
+    }
+
     #[inline]
     pub fn children(&self) -> Option<&Children> {
         match self.item.get() {

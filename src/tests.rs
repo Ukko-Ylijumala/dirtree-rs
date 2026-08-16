@@ -361,6 +361,98 @@ fn test_concurrent_same_path_insert() {
 }
 
 #[test]
+fn test_tree_update_diff() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+    std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
+    std::fs::create_dir(temp.path().join("gone")).unwrap();
+    std::fs::write(temp.path().join("gone/g.bin"), b"g").unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    tree_validate_counts(&tree);
+
+    // a no-op pass must diff everything and change nothing
+    let stats: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    assert!(!stats.changed(), "no-op update changed something: {stats}");
+    assert!(stats.scanned_dirs >= 3, "root, sub and gone should be diffed: {stats}");
+
+    // mutate the filesystem behind the tree's back
+    std::fs::write(temp.path().join("sub/new.bin"), b"n").unwrap();
+    std::fs::create_dir(temp.path().join("newdir")).unwrap();
+    std::fs::write(temp.path().join("newdir/inner.bin"), b"i").unwrap();
+    std::fs::remove_dir_all(temp.path().join("gone")).unwrap();
+    // replace a.bin via rename-over: guarantees a different inode
+    std::fs::write(temp.path().join("sub/tmp.bin"), b"r").unwrap();
+    std::fs::rename(temp.path().join("sub/tmp.bin"), temp.path().join("sub/a.bin")).unwrap();
+
+    let stats: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    assert_eq!(stats.added_dirs, 1, "newdir should be added: {stats}");
+    assert_eq!(stats.added_files, 2, "new.bin + replacement a.bin: {stats}");
+    assert_eq!(stats.removed_dirs, 1, "gone should be removed: {stats}");
+    assert_eq!(stats.removed_files, 2, "g.bin + old a.bin: {stats}");
+    assert_eq!(stats.replaced, 1, "a.bin should count as replaced: {stats}");
+    assert_eq!(stats.errors, 0, "no errors expected: {stats}");
+
+    assert!(tree.contains(&format!("{dir}/sub/new.bin")), "new.bin missing");
+    assert!(tree.contains(&format!("{dir}/newdir/inner.bin")), "inner.bin missing");
+    assert!(tree.contains(&format!("{dir}/sub/a.bin")), "replaced a.bin missing");
+    assert!(!tree.contains(&format!("{dir}/gone")), "gone still present");
+    tree_validate_counts(&tree);
+
+    // and a second pass is a no-op again
+    let stats: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    assert!(!stats.changed(), "second update changed something: {stats}");
+}
+
+#[test]
+fn test_tree_update_diff_name_mode() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+    std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
+
+    let state = ScanState { filemode: FileMode::NAME, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    assert_eq!(tree.conf().files(), 1, "name-only file not counted");
+
+    std::fs::write(temp.path().join("sub/b.bin"), b"y").unwrap();
+    std::fs::remove_file(temp.path().join("sub/a.bin")).unwrap();
+
+    let stats: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    assert_eq!(stats.added_files, 1, "b.bin should be added: {stats}");
+    assert_eq!(stats.removed_files, 1, "a.bin should be removed: {stats}");
+    assert_eq!(tree.conf().files(), 1, "file count should be steady");
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_rescan_via_worker() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::write(temp.path().join("a.bin"), b"x").unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .build(&state);
+    tree.scan(dir, Some(true));
+    let p_a: String = format!("{dir}/a.bin");
+    wait_for(|| tree.contains(&p_a), "initial scan should find a.bin");
+
+    // mutate and let the queued Update op reconcile the tree
+    std::fs::write(temp.path().join("b.bin"), b"y").unwrap();
+    std::fs::remove_file(temp.path().join("a.bin")).unwrap();
+    tree.rescan(dir);
+    wait_for(|| tree.contains(&format!("{dir}/b.bin")), "rescan should add b.bin");
+    wait_for(|| !tree.contains(&p_a), "rescan should remove a.bin");
+
+    tree.quit_worker(true);
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_watcher() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();

@@ -72,10 +72,22 @@ pub(super) fn tree_worker(t: Arc<DirTree>, state: ScanState) {
                         });
                     }
 
-                    TreeOp::Update(ref _path) => {
-                        //let p: PathBuf = path.clone();
-                        t.set_state(TreeState::Active(op));
-                        //tree.update(&p);
+                    TreeOp::Update(ref path) => {
+                        let p: PathBuf = path.clone();
+                        t.set_state(TreeState::Active(op.clone()));
+                        match t.update(p.to_string_lossy().as_ref(), &state, None) {
+                            Ok(stats) => {
+                                let msg: String = format!("Updated: {stats}");
+                                t.add_event(
+                                    TreeEvent::new(&msg)
+                                        .path(p.to_string_lossy().as_ref())
+                                        .op(&op),
+                                );
+                            }
+                            Err(e) => {
+                                t.add_error(TreeEvent::error(&e.to_string(), &op));
+                            }
+                        }
                     }
 
                     TreeOp::Insert => {}

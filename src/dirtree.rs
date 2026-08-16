@@ -42,7 +42,7 @@ use {
     timesince::TimeSinceEpoch,
 };
 
-const MAX_RECURSE_DEPTH: usize = 16;
+pub(super) const MAX_RECURSE_DEPTH: usize = 16;
 /// Upper bound for the in-memory event log; oldest events are dropped
 /// first. Keeps long-lived (resident) trees from growing without bound.
 const EVENT_LOG_CAP: usize = 4096;
@@ -259,6 +259,17 @@ impl DirTree {
     */
     pub fn scan(&self, path: &str, recursive: Option<bool>) {
         self.queue_op(TreeOp::Scan(PathBuf::from(path), recursive));
+    }
+
+    /**
+    Tell the background worker thread to diff-rescan (update) the given
+    path: entries that appeared on disk are inserted, entries that
+    vanished are removed, entries whose inode changed are replaced.
+
+    NOTE: non-blocking; see [DirTree::update] for the direct form.
+    */
+    pub fn rescan(&self, path: &str) {
+        self.queue_op(TreeOp::Update(PathBuf::from(path)));
     }
 
     /// Returns `true` if the tree is uninitialized.
@@ -965,7 +976,7 @@ impl DirTree {
     entry or `parent` is not a directory.
     */
     #[inline]
-    fn insert_child(
+    pub(super) fn insert_child(
         &self,
         parent: &Arc<Node>,
         name_idx: u32,
@@ -1157,7 +1168,6 @@ impl DirTree {
                 let p: PathBuf = node.path(&self.strings);
                 match node.parent() {
                     Some(parent) => {
-                        let (nodes, dirs, files) = self.count_from(node.clone());
                         /*
                         get_child_byref is a pointer-identity lookup, so a
                         None here means the node was detached concurrently -
@@ -1172,20 +1182,7 @@ impl DirTree {
                             }
                         };
                         debug!(target: "REMOVE_NODE", "{:?}", p.display());
-
-                        /*
-                        We're potentially removing a branch instead of a leaf,
-                        but since the tree consists of nested Arc<Node> refs,
-                        as soon as we drop a node, its descendant nodes should
-                        also be dropped in a cascading manner since they are no
-                        longer referenced anywhere else. Ahh, the beauty of
-                        automatic reference counting.
-                        */
-                        parent.remove_child(&name);
-                        self.conf.nodes_mod(-(nodes as i32));
-                        self.conf.dirs_mod(-(dirs as i32));
-                        self.conf.files_mod(-(files as i32));
-                        return Ok(Some((nodes, dirs, files)));
+                        return Ok(Some(self.remove_child_node(&parent, name, node.clone())));
                     }
 
                     None => {
@@ -1210,6 +1207,26 @@ impl DirTree {
                 return Ok(None);
             }
         }
+    }
+
+    /**
+    Detach an already-resolved child [[Node]] from its parent and adjust
+    the tree counters. The subtree below the child is dropped in a
+    cascading manner via refcounting. Returns `(nodes, dirs, files)`
+    removed.
+    */
+    pub(super) fn remove_child_node(
+        &self,
+        parent: &Node,
+        name_idx: u32,
+        child: Arc<Node>,
+    ) -> (u32, u32, u32) {
+        let (nodes, dirs, files) = self.count_from(child);
+        parent.remove_child(&name_idx);
+        self.conf.nodes_mod(-(nodes as i32));
+        self.conf.dirs_mod(-(dirs as i32));
+        self.conf.files_mod(-(files as i32));
+        (nodes, dirs, files)
     }
 
     /// Remove a name-only (Node-less) file entry from its parent directory.
