@@ -10,7 +10,6 @@ use stringstore::UniqueStrStore;
 use timesince::SecondsSinceEpoch;
 
 use parking_lot::RwLock;
-use rayon::prelude::*;
 use tracing::{error, instrument, trace_span};
 
 use std::{
@@ -180,6 +179,18 @@ impl<T: Default> Entry<T> {
             },
             Default::default(), // provides the type parameter T
         ))
+    }
+
+    /// Infallible constructor for when the inode is already known
+    /// (e.g. from a dirent) - no stat is performed.
+    pub fn with_inode(inode: u64) -> Self {
+        Self(
+            Data {
+                inode,
+                when: SecondsSinceEpoch::new(),
+            },
+            Default::default(),
+        )
     }
 }
 
@@ -391,18 +402,18 @@ impl Hash for Directory {
 
 impl PartialEq for Directory {
     fn eq(&self, other: &Self) -> bool {
+        if ptr::eq(self, other) {
+            // also guards against a recursive read lock on self-compare
+            return true;
+        }
         if self.name != other.name {
             // short circuit if the names don't match
             return false;
         }
-        self.children.read().len() == other.children.read().len()
-            && self.children.read().par_iter().all(|(name, child)| {
-                other
-                    .children
-                    .read()
-                    .get(name)
-                    .map_or(false, |ov: &MaybeNode| *child == *ov)
-            })
+        let (a, b) = (self.children.read(), other.children.read());
+        a.len() == b.len()
+            && a.iter()
+                .all(|(name, child)| b.get(name).map_or(false, |ov: &MaybeNode| *child == *ov))
     }
 }
 
@@ -670,42 +681,60 @@ impl Node {
     /**
     Construct this node's full path by walking the tree upwards to Root.
 
-    A detached node (removed from the tree, or with an ancestor removed
-    mid-walk) cannot be reconstructed; an empty Vec is returned in that
-    case instead of panicking.
+    Directories (own and ancestor) resolve their names from the interned
+    index stored in their [[Directory]] item, so only a file leaf needs a
+    scan of its parent's children map - path construction is O(depth) for
+    directories instead of O(depth x siblings).
+
+    A detached file node (removed from the tree, or with an ancestor
+    removed mid-walk) cannot be reconstructed; an empty Vec is returned
+    in that case instead of panicking.
     */
     pub(super) fn construct_path(&self, store: &UniqueStrStore) -> Vec<String> {
         if self.node_t == NodeType::Root {
             return vec![PATH_SEP.to_string()];
         }
-        let mut path: Vec<String> = Vec::new();
-        let mut current: Arc<Node> = match self.parent().and_then(|p| p.get_child_byref(self)) {
-            Some((_, me)) => me,
+        // own name: dirs know theirs, files scan the parent's children map
+        let mut parts: Vec<String> = Vec::new();
+        match self.as_dir() {
+            Some(dir) => parts.push(dir.name(store).to_string()),
+            None => match self.parent().and_then(|p| p.get_child_byref(self)) {
+                Some((name_idx, _)) => {
+                    parts.push(unsafe { store.borrow_str(name_idx) }.to_string())
+                }
+                None => {
+                    error!("Cannot construct path for a detached node: {self:?}");
+                    return parts;
+                }
+            },
+        }
+
+        // ancestors are all directories; walk up to Root, then flip
+        let mut current: Arc<Node> = match self.parent() {
+            Some(p) => p,
             None => {
                 error!("Cannot construct path for a detached node: {self:?}");
-                return path;
+                parts.clear();
+                return parts;
             }
         };
-
-        loop {
-            match current.parent() {
-                Some(parent) => {
-                    let name_idx: u32 = match parent.get_child_byref(&current) {
-                        Some((name, _)) => name,
-                        // an ancestor was detached while we were walking up
-                        None => {
-                            error!("Detached ancestor while constructing path: {current:?}");
-                            path.clear();
-                            return path;
-                        }
-                    };
-                    path.insert(0, unsafe { store.borrow_str(name_idx) }.to_string());
-                    current = parent;
-                }
-                None => break,
+        while current.node_t == NodeType::Directory {
+            match current.as_dir() {
+                Some(dir) => parts.push(dir.name(store).to_string()),
+                None => break, // unreachable for a Directory node
             }
+            current = match current.parent() {
+                Some(p) => p,
+                // an ancestor was detached while we were walking up
+                None => {
+                    error!("Detached ancestor while constructing path: {current:?}");
+                    parts.clear();
+                    return parts;
+                }
+            };
         }
-        path
+        parts.reverse();
+        parts
     }
 
     /// Filesystem path of this node as a [PathBuf].

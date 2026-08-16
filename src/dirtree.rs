@@ -46,6 +46,10 @@ const MAX_RECURSE_DEPTH: usize = 16;
 /// Upper bound for the in-memory event log; oldest events are dropped
 /// first. Keeps long-lived (resident) trees from growing without bound.
 const EVENT_LOG_CAP: usize = 4096;
+/// Minimum number of dirents one rayon task takes from a directory's
+/// entry list. Per-entry work is tiny (an intern + one map insert), so
+/// batching is what keeps scheduling overhead from dominating the walk.
+const ENTRY_BATCH_MIN: usize = 64;
 
 /**
 Lightweight state that flows down the parallel walk: the active
@@ -61,6 +65,10 @@ struct WalkState {
     /// walk start from the per-op flag (or the tree default) and carried
     /// down so a per-op override actually takes effect in the walker.
     recursive: bool,
+    /// Absolute path depth of the walk root (path components below `/`),
+    /// used to keep the tree's depth counter in absolute-path terms while
+    /// the walker itself tracks depth relative to the walk root.
+    base_depth: u8,
 }
 
 /**
@@ -543,8 +551,39 @@ impl DirTree {
     */
     /// NOTE: If `recursive` is [None], the tree's default is used.
     pub fn populate_par(&self, path: &PathBuf, state: &ScanState, recursive: Option<bool>) {
+        /*
+        Resolve the walk root's node up front - children are attached
+        directly to their parent's node during the walk (one intern and
+        one lock per entry), instead of a full root-to-leaf trie walk
+        per entry through [DirTree::insert].
+        */
+        let path_str = path.to_string_lossy();
+        let node: Arc<Node> = match self.get_node(path_str.as_ref()) {
+            Some(n) => n,
+            None => {
+                // an unknown walk root (e.g. a worker Scan op) is created first
+                self.insert(path, NodeType::Directory, None);
+                match self.get_node(path_str.as_ref()) {
+                    Some(n) => n,
+                    None => {
+                        self.add_error(TreeEvent::error(
+                            &format!("Cannot resolve walk root: {}", path.display()),
+                            &TreeOp::Scan(path.clone(), recursive),
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
+        if !node.is_traversable() {
+            self.add_error(TreeEvent::error(
+                &format!("Walk root is not a directory: {}", path.display()),
+                &TreeOp::Scan(path.clone(), recursive),
+            ));
+            return;
+        }
         let walk = self.initial_walk_state(path, recursive);
-        rayon::scope(|s| self.populate_par_inner(path, state, walk, s, 0));
+        rayon::scope(|s| self.populate_par_inner(path, state, walk, node, s, 0, 0));
     }
 
     /**
@@ -557,11 +596,18 @@ impl DirTree {
             .file_name()
             .map(|n| self.strings.insert(n.to_string_lossy().as_ref()))
             .unwrap_or_else(|| self.strings.insert(""));
+        // number of path components below the filesystem root
+        let base_depth: u8 = path
+            .components()
+            .count()
+            .saturating_sub(1)
+            .min(u8::MAX as usize) as u8;
         WalkState {
             scope: SCOPE_NONE,
             name_idx,
             parent_name_idx: None,
             recursive: recursive.unwrap_or(self.conf.recursive()),
+            base_depth,
         }
     }
 
@@ -586,17 +632,30 @@ impl DirTree {
         }
     }
 
+    /**
+    The recursive workhorse of the parallel walker.
+
+    `node` is this directory's own node in the trie; children are
+    attached directly under it. `depth` is the semantic distance from
+    the walk root (drives visitor depth caps and events); `frames` is
+    the direct-recursion count since the last rayon spawn (drives the
+    stack-bounding spawn decision) - the two must not be conflated, or
+    a spawn would reset the visitor's view of tree depth.
+    */
     #[
         instrument(level = "debug", name = "p_par_inner", skip_all,
         fields(p = path.strip_prefix(self.from()).unwrap_or(path).to_str(), d = depth))
     ]
+    #[allow(clippy::too_many_arguments)]
     fn populate_par_inner<'env>(
         &'env self,
         path: &PathBuf,
         state: &'env ScanState,
         walk: WalkState,
+        node: Arc<Node>,
         rs: &rayon::Scope<'env>,
         depth: usize,
+        frames: usize,
     ) {
         // Cooperative cancellation - checked at the top of every directory
         // entry so an in-flight walk can wind down promptly once raised.
@@ -627,66 +686,68 @@ impl DirTree {
         trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
 
         /*
-        Visitor branch: collect dirents so visit_dir sees the full list,
-        then act on the verdict. The entry-handling logic itself lives in
-        `process_par_entry`, shared by both iteration paths. Since 0.4.2
-        each `EntryExt` borrows its `DirHandle`, so the collected Vec must
-        be consumed inside this branch (before the handle is used again).
+        Collect the dirents first (visit_dir needs the full list anyway),
+        then process them with an indexed parallel iterator. par_bridge()
+        over the streaming iterator was measured to be a bad fit here:
+        with O(1) child insertion the per-entry work is so small that
+        par_bridge's per-item synchronization dominated the walk (futex
+        storm, 4x the context switches). An indexed iterator splits the
+        work log(n) times instead, and with_min_len() batches entries so
+        one rayon task amortizes its scheduling over a whole chunk.
+
+        Since dirhandle 0.4.2 each `EntryExt` borrows its `DirHandle`, so
+        the Vec must be consumed before the handle is moved below.
         */
-        let visitor_ref = visitor.as_ref();
-        match visitor_ref {
-            Some(v) => {
-                let entries: Vec<EntryExt> = handle.iter().collect();
-                let walk_ctx = WalkContext {
-                    path: path.as_path(),
-                    name_idx: walk.name_idx,
-                    parent_name_idx: walk.parent_name_idx,
-                    depth,
-                    scope: walk.scope,
-                    strings: &self.strings,
-                };
-                let verdict = v.visit_dir(DirContext {
-                    walk: &walk_ctx,
-                    entries: &entries,
-                });
-                let mut scope_for_children: ScopeTag = walk.scope;
-                let mut skip_children: bool = false;
-                match verdict {
-                    Verdict::Continue => {}
-                    Verdict::SkipChildren => {
+        let entries: Vec<EntryExt> = handle.iter().collect();
+        let mut scope_for_children: ScopeTag = walk.scope;
+        let mut skip_children: bool = false;
+        if let Some(ref v) = visitor {
+            let walk_ctx = WalkContext {
+                path: path.as_path(),
+                name_idx: walk.name_idx,
+                parent_name_idx: walk.parent_name_idx,
+                depth,
+                scope: walk.scope,
+                strings: &self.strings,
+            };
+            let verdict = v.visit_dir(DirContext {
+                walk: &walk_ctx,
+                entries: &entries,
+            });
+            match verdict {
+                Verdict::Continue => {}
+                Verdict::SkipChildren => {
+                    skip_children = true;
+                }
+                Verdict::Tag { tag, new_scope, descend } => {
+                    self.emit_walk_event(path, tag, walk.scope, depth, !descend);
+                    scope_for_children = new_scope;
+                    if !descend {
                         skip_children = true;
                     }
-                    Verdict::Tag { tag, new_scope, descend } => {
-                        self.emit_walk_event(path, tag, walk.scope, depth, !descend);
-                        scope_for_children = new_scope;
-                        if !descend {
-                            skip_children = true;
-                        }
-                    }
-                }
-                if !skip_children {
-                    entries.into_par_iter().for_each(|entry: EntryExt| {
-                        self.process_par_entry(
-                            path,
-                            state,
-                            &walk,
-                            scope_for_children,
-                            depth,
-                            rs,
-                            visitor_ref,
-                            &op,
-                            entry,
-                        );
-                    });
                 }
             }
-            None => {
-                handle.iter().par_bridge().for_each(|entry: EntryExt| {
+        }
+        if !skip_children {
+            let visitor_ref = visitor.as_ref();
+            entries
+                .into_par_iter()
+                .with_min_len(ENTRY_BATCH_MIN)
+                .for_each(|entry: EntryExt| {
                     self.process_par_entry(
-                        path, state, &walk, walk.scope, depth, rs, None, &op, entry,
+                        path,
+                        state,
+                        &walk,
+                        &node,
+                        scope_for_children,
+                        depth,
+                        frames,
+                        rs,
+                        visitor_ref,
+                        &op,
+                        entry,
                     );
                 });
-            }
         }
 
         #[cfg(debug_assertions)]
@@ -704,7 +765,10 @@ impl DirTree {
 
         // shall we keep the directory handle (file descriptor) open?
         if self.conf.resident() {
-            self.add_fd(path, handle.as_raw_fd());
+            // we already hold this directory's node - no path lookup needed
+            if let Some(dir) = node.as_dir() {
+                dir.fd_set(handle.as_raw_fd()).ok();
+            }
             self.handles.insert(handle);
         } else {
             drop(handle); // unnecessary, but explicit
@@ -715,6 +779,10 @@ impl DirTree {
     Per-dirent processing for the parallel walker. Shared between the
     fast path (`par_bridge` over `DirHandle::iter`) and the visitor
     path (`into_par_iter` over a collected `Vec<EntryExt>`).
+
+    Children are attached directly under `parent_node` via
+    [DirTree::insert_child]; full paths are only constructed for
+    directories (recursion needs them to open the next [DirHandle]).
     */
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -723,8 +791,10 @@ impl DirTree {
         parent_path: &PathBuf,
         state: &'env ScanState,
         parent_walk: &WalkState,
+        parent_node: &Arc<Node>,
         scope_for_children: ScopeTag,
         depth: usize,
+        frames: usize,
         rs: &rayon::Scope<'env>,
         visitor: Option<&Arc<dyn Visitor>>,
         op: &TreeOp,
@@ -740,19 +810,21 @@ impl DirTree {
                 */
                 let name_os = OsStr::from_bytes(entry.file_name().to_bytes());
                 trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
+                // children of this directory live one path component deeper
+                let depth_abs: u8 =
+                    (parent_walk.base_depth as usize + depth + 1).min(u8::MAX as usize) as u8;
 
                 if entry.is_dir() {
                     /*
-                    Path-aware prune via the visitor (when set). We
-                    intern the child name once here so the visitor
-                    can compare u32-vs-u32 without allocations.
+                    Path-aware prune via the visitor (when set). The name
+                    is interned up front for the visitor (u32-vs-u32
+                    compares); otherwise only after the cheaper filter
+                    check has passed.
                     */
-                    let child_idx: u32 = if visitor.is_some() {
-                        self.strings.insert(name_os.to_string_lossy().as_ref())
-                    } else {
-                        0
-                    };
+                    let mut child_idx: Option<u32> = None;
                     if let Some(v) = visitor {
+                        let idx: u32 = self.strings.insert(name_os.to_string_lossy().as_ref());
+                        child_idx = Some(idx);
                         let parent_ctx = WalkContext {
                             path: parent_path.as_path(),
                             name_idx: parent_walk.name_idx,
@@ -761,41 +833,77 @@ impl DirTree {
                             scope: parent_walk.scope,
                             strings: &self.strings,
                         };
-                        if v.prune_child(&parent_ctx, child_idx, true) {
+                        if v.prune_child(&parent_ctx, idx, true) {
                             return;
                         }
                     }
                     if !self.conf.filters().passes(name_os, true) {
                         return;
                     }
-                    let entry_p: PathBuf = parent_path.join(entry.name());
-                    self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
+                    let child_idx: u32 = child_idx
+                        .unwrap_or_else(|| self.strings.insert(name_os.to_string_lossy().as_ref()));
+                    let (child, _) = self.insert_child(
+                        parent_node,
+                        child_idx,
+                        NodeType::Directory,
+                        entry.ino(),
+                        depth_abs,
+                    );
                     state.num_d.inc1();
+                    let Some(child_node) = child else {
+                        // a name-only entry (or similar) blocks this slot
+                        self.add_error(TreeEvent::error(
+                            &format!("Cannot attach directory node: {:?}", name_os),
+                            op,
+                        ));
+                        return;
+                    };
                     if parent_walk.recursive {
+                        let entry_p: PathBuf = parent_path.join(name_os);
                         let next = WalkState {
                             scope: scope_for_children,
                             name_idx: child_idx,
                             parent_name_idx: Some(parent_walk.name_idx),
                             recursive: true,
+                            base_depth: parent_walk.base_depth,
                         };
                         // spawning is slower than direct recursion, so only
-                        // spawn after MAX_RECURSE_DEPTH to bound stack use.
-                        if depth < MAX_RECURSE_DEPTH {
-                            self.populate_par_inner(&entry_p, state, next, rs, depth + 1);
+                        // spawn after MAX_RECURSE_DEPTH frames to bound stack
+                        // use; semantic depth keeps increasing across spawns.
+                        if frames < MAX_RECURSE_DEPTH {
+                            self.populate_par_inner(
+                                &entry_p,
+                                state,
+                                next,
+                                child_node,
+                                rs,
+                                depth + 1,
+                                frames + 1,
+                            );
                         } else {
                             rs.spawn(move |s| {
-                                self.populate_par_inner(&entry_p, state, next, s, 0)
+                                self.populate_par_inner(
+                                    &entry_p,
+                                    state,
+                                    next,
+                                    child_node,
+                                    s,
+                                    depth + 1,
+                                    0,
+                                )
                             });
                         }
                     }
                 } else if entry.is_file() {
                     /*
-                    Same prune+filter shape for files. We only intern
-                    the child name when a visitor is set; insertion via
-                    `insert()` does its own interning later if needed.
+                    Same prune+filter shape for files. No path needs to
+                    be constructed at all - the name index and the inode
+                    from the dirent are all an insertion requires.
                     */
+                    let mut child_idx: Option<u32> = None;
                     if let Some(v) = visitor {
-                        let child_idx = self.strings.insert(name_os.to_string_lossy().as_ref());
+                        let idx: u32 = self.strings.insert(name_os.to_string_lossy().as_ref());
+                        child_idx = Some(idx);
                         let parent_ctx = WalkContext {
                             path: parent_path.as_path(),
                             name_idx: parent_walk.name_idx,
@@ -804,21 +912,32 @@ impl DirTree {
                             scope: parent_walk.scope,
                             strings: &self.strings,
                         };
-                        if v.prune_child(&parent_ctx, child_idx, false) {
+                        if v.prune_child(&parent_ctx, idx, false) {
                             return;
                         }
                     }
                     if !self.conf.filters().passes(name_os, false) {
                         return;
                     }
-                    let entry_p: PathBuf = parent_path.join(entry.name());
                     if self.filemode().is_with_size() {
                         state.fsize.fetch_add(entry.len());
                     }
                     if self.filemode().is_name() {
-                        self.insert(&entry_p, NodeType::Name, None);
+                        let idx: u32 = child_idx.unwrap_or_else(|| {
+                            self.strings.insert(name_os.to_string_lossy().as_ref())
+                        });
+                        if parent_node
+                            .as_dir()
+                            .is_some_and(|dir: &Directory| dir.add_name_child(idx))
+                        {
+                            self.conf.files_mod(1);
+                            self.conf.depth_compare(depth_abs);
+                        }
                     } else if self.filemode().is_node() {
-                        self.insert(&entry_p, NodeType::File, Some(entry.ino()));
+                        let idx: u32 = child_idx.unwrap_or_else(|| {
+                            self.strings.insert(name_os.to_string_lossy().as_ref())
+                        });
+                        self.insert_child(parent_node, idx, NodeType::File, entry.ino(), depth_abs);
                     }
                     state.num_f.inc1();
                 }
@@ -835,7 +954,54 @@ impl DirTree {
         }
     }
 
+    /**
+    O(1) child insertion under an already-resolved parent [[Node]]: one
+    children-map lock instead of a full root-to-leaf trie walk like
+    [DirTree::insert]. The inode must already be known (it comes from
+    the dirent), so construction never stats and cannot fail.
+
+    Returns the child (created or pre-existing) and whether this call
+    created it; `(None, false)` when the slot is occupied by a name-only
+    entry or `parent` is not a directory.
+    */
+    #[inline]
+    fn insert_child(
+        &self,
+        parent: &Arc<Node>,
+        name_idx: u32,
+        node_t: NodeType,
+        inode: u64,
+        depth_abs: u8,
+    ) -> (MaybeNode, bool) {
+        let dir: &Directory = match parent.as_dir() {
+            Some(d) => d,
+            None => return (None, false),
+        };
+        let is_file: bool = node_t == NodeType::File;
+        let (child, created) = dir.get_or_add_child_with(name_idx, || {
+            let itm: NodeItem = if is_file {
+                NodeItem::File(Entry::<FileEntry>::with_inode(inode))
+            } else {
+                let mut itm = NodeItem::Dir(Entry::<Directory>::with_inode(inode));
+                itm.set_dir_name(name_idx);
+                itm
+            };
+            Some(Node::new(itm, Some(parent.clone())).into())
+        });
+        if created {
+            self.conf.nodes_mod(1);
+            if is_file {
+                self.conf.files_mod(1);
+            } else {
+                self.conf.dirs_mod(1);
+            }
+            self.conf.depth_compare(depth_abs);
+        }
+        (child, created)
+    }
+
     /// Add a [[RawFd]] to a directory node's [[Directory]] item.
+    #[allow(unused)]
     fn add_fd(&self, path: &PathBuf, fd: RawFd) {
         self.get_node(path.to_string_lossy().as_ref()).map(|node| {
             node.as_dir().map(|dir| {
