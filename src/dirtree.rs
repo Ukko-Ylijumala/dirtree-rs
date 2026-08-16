@@ -43,6 +43,9 @@ use {
 };
 
 const MAX_RECURSE_DEPTH: usize = 16;
+/// Upper bound for the in-memory event log; oldest events are dropped
+/// first. Keeps long-lived (resident) trees from growing without bound.
+const EVENT_LOG_CAP: usize = 4096;
 
 /**
 Lightweight state that flows down the parallel walk: the active
@@ -54,6 +57,10 @@ struct WalkState {
     scope: ScopeTag,
     name_idx: u32,
     parent_name_idx: Option<u32>,
+    /// Whether this walk descends into subdirectories. Resolved once at
+    /// walk start from the per-op flag (or the tree default) and carried
+    /// down so a per-op override actually takes effect in the walker.
+    recursive: bool,
 }
 
 /**
@@ -79,7 +86,7 @@ pub struct DirTree {
     handles: OpenHandles,
     state: RwLock<TreeState>,
     workq: RwLock<VecDeque<TreeOp>>,
-    events: RwLock<Vec<TreeEvent>>,
+    events: RwLock<VecDeque<TreeEvent>>,
 }
 
 impl DirTree {
@@ -169,10 +176,15 @@ impl DirTree {
         *self.state.write() = state;
     }
 
-    /// Record a new event in the tree's event log.
+    /// Record a new event in the tree's event log. The log is bounded to
+    /// [EVENT_LOG_CAP] entries; the oldest event is dropped when full.
     #[inline]
     pub(super) fn add_event(&self, event: TreeEvent) {
-        self.events.write().push(event);
+        let mut events = self.events.write();
+        if events.len() >= EVENT_LOG_CAP {
+            events.pop_front();
+        }
+        events.push_back(event);
     }
 
     /// Add an error event to the event log and increase the error count.
@@ -374,7 +386,7 @@ impl DirTree {
         let use_par: bool = !state.sync || self.has_visitor();
         let recursive: bool = self.conf.recursive();
         if use_par {
-            self.populate_par(&from, state);
+            self.populate_par(&from, state, Some(recursive));
         } else {
             self.populate(&from, state, Some(recursive));
         }
@@ -436,7 +448,7 @@ impl DirTree {
             tree.set_state(TreeState::Active(TreeOp::Build(PathBuf::from(path))));
             match state.sync {
                 true => tree.populate(tree.from(), state, Some(recursive)),
-                false => tree.populate_par(tree.from(), state),
+                false => tree.populate_par(tree.from(), state, Some(recursive)),
             }
         };
         tree.set_state(TreeState::Ready);
@@ -446,12 +458,14 @@ impl DirTree {
     /// Populate a leaf [[Node]] in the trie with the contents of a directory.
     /// Uses the standard [std::fs::read_dir] method to get the directory entries.
     ///
+    /// NOTE: If `recursive` is [None], the tree's default is used.
+    ///
     /// NOTE: single threaded, potentially slow with large directory trees.
-    #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str()))]
+    #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).unwrap_or(path).to_str()))]
     pub fn populate(&self, path: &PathBuf, state: &ScanState, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
-        match path.read_dir().ok() {
-            Some(entries) => {
+        match path.read_dir() {
+            Ok(entries) => {
                 entries.filter_map(Result::ok).for_each(|entry: DirEntry| {
                     let name = entry.file_name();
                     let path: PathBuf = entry.path();
@@ -464,7 +478,8 @@ impl DirTree {
                                 }
                                 self.insert(&path, NodeType::Directory, Some(entry.ino()));
                                 state.num_d.inc1();
-                                if recursive.is_some_and(|r: bool| r) || self.conf.recursive() {
+                                // an explicit per-op flag overrides the tree default
+                                if recursive.unwrap_or(self.conf.recursive()) {
                                     if self.is_worker_running() {
                                         self.queue_op(TreeOp::Scan(path, recursive));
                                     } else {
@@ -476,8 +491,19 @@ impl DirTree {
                                     return;
                                 }
                                 if self.filemode().is_with_size() {
-                                    //FIXME: add error handling
-                                    state.fsize.fetch_add(entry.metadata().ok().unwrap().len());
+                                    match entry.metadata() {
+                                        Ok(meta) => {
+                                            state.fsize.fetch_add(meta.len());
+                                        }
+                                        // likely deleted between readdir and stat
+                                        Err(e) => {
+                                            self.add_error(TreeEvent::error(
+                                                &e.to_string(),
+                                                &TreeOp::Scan(path.clone(), recursive),
+                                            ));
+                                            return;
+                                        }
+                                    }
                                 }
                                 if self.filemode().is_name() {
                                     self.insert(&path, NodeType::Name, None);
@@ -497,7 +523,13 @@ impl DirTree {
                     }
                 })
             }
-            None => return,
+            Err(e) => {
+                self.add_error(TreeEvent::error(
+                    &e.to_string(),
+                    &TreeOp::Scan(path.clone(), recursive),
+                ));
+                debug!(target: "ERROR", "Cannot read directory {}: {e}", path.display());
+            }
         };
     }
 
@@ -509,22 +541,28 @@ impl DirTree {
     method which tries to return inner directories first using a small
     buffer to look ahead in the directory stream.
     */
-    pub fn populate_par(&self, path: &PathBuf, state: &ScanState) {
-        let walk = self.initial_walk_state(path);
+    /// NOTE: If `recursive` is [None], the tree's default is used.
+    pub fn populate_par(&self, path: &PathBuf, state: &ScanState, recursive: Option<bool>) {
+        let walk = self.initial_walk_state(path, recursive);
         rayon::scope(|s| self.populate_par_inner(path, state, walk, s, 0));
     }
 
     /**
     Build the [`WalkState`] for the very first call into the walker.
     The interned name is the basename of `path`; if `path` has no
-    basename (e.g. `/`) we fall back to the empty-string index `0`.
+    basename (e.g. `/`) we fall back to interning the empty string.
     */
-    fn initial_walk_state(&self, path: &PathBuf) -> WalkState {
+    fn initial_walk_state(&self, path: &PathBuf, recursive: Option<bool>) -> WalkState {
         let name_idx = path
             .file_name()
             .map(|n| self.strings.insert(n.to_string_lossy().as_ref()))
-            .unwrap_or(0);
-        WalkState { scope: SCOPE_NONE, name_idx, parent_name_idx: None }
+            .unwrap_or_else(|| self.strings.insert(""));
+        WalkState {
+            scope: SCOPE_NONE,
+            name_idx,
+            parent_name_idx: None,
+            recursive: recursive.unwrap_or(self.conf.recursive()),
+        }
     }
 
     /// Emit a [`WalkEvent`] on the discovery channel, if one is configured.
@@ -550,7 +588,7 @@ impl DirTree {
 
     #[
         instrument(level = "debug", name = "p_par_inner", skip_all,
-        fields(p = path.strip_prefix(self.from()).ok().unwrap().to_str(), d = depth))
+        fields(p = path.strip_prefix(self.from()).unwrap_or(path).to_str(), d = depth))
     ]
     fn populate_par_inner<'env>(
         &'env self,
@@ -577,7 +615,7 @@ impl DirTree {
             }
         }
 
-        let op: TreeOp = TreeOp::Scan(path.into(), Some(self.conf.recursive()));
+        let op: TreeOp = TreeOp::Scan(path.into(), Some(walk.recursive));
         let mut handle = match DirHandle::new(path) {
             Ok(h) => h,
             Err(e) => {
@@ -729,11 +767,12 @@ impl DirTree {
                     let entry_p: PathBuf = parent_path.join(entry.name());
                     self.insert(&entry_p, NodeType::Directory, Some(entry.ino()));
                     state.num_d.inc1();
-                    if self.conf.recursive() {
+                    if parent_walk.recursive {
                         let next = WalkState {
                             scope: scope_for_children,
                             name_idx: child_idx,
                             parent_name_idx: Some(parent_walk.name_idx),
+                            recursive: true,
                         };
                         // spawning is slower than direct recursion, so only
                         // spawn after MAX_RECURSE_DEPTH to bound stack use.
@@ -805,111 +844,126 @@ impl DirTree {
 
     /// Inserts a path into the trie. The path must be an absolute filesystem path.
     /// The path is split on forward slash (`/`) to obtain its parts.
+    ///
+    /// Concurrency-safe: per-level child creation is atomic (check + insert
+    /// under one write lock), so parallel inserts of overlapping paths can
+    /// neither overwrite each other's nodes nor double-count.
     #[instrument(level = "debug", skip(self))]
     pub fn insert(&self, path: &PathBuf, node_t: NodeType, inode: Option<u64>) {
         let mut current: Arc<Node> = self.root();
         let parts = &self.strings.store_path(path)[1..];
         let len: usize = parts.len();
         let mut depth: usize = 0; // root node is at depth 0
-        self.conf.depth_compare(len as u8);
+        self.conf.depth_compare(len.min(u8::MAX as usize) as u8);
         // max depth can just as well be updated at this point
 
         for part in parts.iter().map(|i: &u32| *i) {
             depth += 1;
-            if !current.has_child(&part) {
-                trace!(target: "CURRENT_NODE", "{:?}", self.node_name(&current));
-                /*
-                we don't have an item for this node yet, hence NodeItem::None
-                also node_t must be set here since later the Node will be in
-                an Arc and we can't change that field anymore
-                */
-                let mut new: Node = Node::new(NodeItem::None, Some(current.clone()));
-                if depth < len {
-                    trace!(target: "intermediate", "{part:?} --> depth: {depth}/{len}");
-                    // must be a container (directory) so let's create the basic structure
-                    new.node_t = NodeType::Directory;
-                    let mut itm = NodeItem::Dir(Entry::<Directory>::default());
-                    itm.set_dir_name(part);
-                    new.item.set(itm).ok();
-                    /*
-                    we must increment the node counters here since we've
-                    not reached the leaf node yet and we shouldn't do a
-                    full initialization for an intermediate node
-                    */
-                    self.conf.nodes_mod(1);
-                    self.conf.dirs_mod(1);
-                } else {
-                    new.node_t = node_t.clone();
-                    if node_t == NodeType::Directory {
-                        let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, inode).unwrap());
-                        itm.set_dir_name(part);
-                        new.item.set(itm).ok();
-                        self.conf.nodes_mod(1);
-                        self.conf.dirs_mod(1);
-                    } else if node_t == NodeType::Name {
-                        /*
-                        optimization: don't create file Nodes at all, just
-                        record the fact that a file exists in the directory
-                        NOTE: total node count is not incremented in this case
-                        */
-                        drop(new);
-                        current
-                            .as_dir()
-                            .map(|dir: &Directory| dir.add_child(part, None));
-                        self.conf.files_mod(1);
-                        debug!(target: "FILENAME_ADD", "{part:?} (store name only)");
-                        return;
-                    }
-                }
-                debug!(target: "CREATED_NODE", "{part:?} : {:?}", &new);
-                current.add_child(part, new.into());
-            }
+            let is_leaf: bool = depth == len;
+            trace!(target: "CURRENT_NODE", "{:?}", self.node_name(&current));
 
-            // we've reached the bottom of the path -> grab the leaf node
-            current = match current.get_child(&part) {
-                Some(node) => node,
+            let dir: &Directory = match current.as_dir() {
+                Some(d) => d,
                 None => {
-                    if current.has_child(&part) && node_t == NodeType::Name {
-                        // this is a file name entry, so None is expected
-                        return;
-                    } else {
-                        // should never happen
-                        self.add_error(TreeEvent::error(
-                            &format!("Child {part:?} missing from HashMap: {current:?}"),
-                            &TreeOp::Insert,
-                        ));
-                        return;
-                    }
+                    // a non-container node occupies this path component
+                    self.add_error(TreeEvent::error(
+                        &format!("Not a directory at depth {depth}/{len}: {current:?}"),
+                        &TreeOp::Insert,
+                    ));
+                    return;
+                }
+            };
+
+            if is_leaf && node_t == NodeType::Name {
+                /*
+                optimization: don't create file Nodes at all, just
+                record the fact that a file exists in the directory
+                NOTE: total node count is not incremented in this case
+                */
+                if dir.add_name_child(part) {
+                    self.conf.files_mod(1);
+                    debug!(target: "FILENAME_ADD", "{part:?} (store name only)");
+                }
+                return;
+            }
+
+            /*
+            Build the item for a would-be new node up front. Leaf items can
+            require a stat (when no inode is given) and thus fail on a
+            filesystem race; erroring out here keeps the creation closure
+            below infallible. If the child turns out to already exist, the
+            speculative item is simply dropped with it.
+            */
+            let itm: NodeItem = if is_leaf {
+                match node_t {
+                    NodeType::Directory => match Entry::<Directory>::new(path, inode) {
+                        Ok(e) => {
+                            let mut itm = NodeItem::Dir(e);
+                            itm.set_dir_name(part);
+                            itm
+                        }
+                        Err(e) => {
+                            self.add_error(TreeEvent::error(&e.to_string(), &TreeOp::Insert));
+                            return;
+                        }
+                    },
+                    NodeType::File => match Entry::<FileEntry>::new(path, inode) {
+                        Ok(e) => NodeItem::File(e),
+                        Err(e) => {
+                            self.add_error(TreeEvent::error(&e.to_string(), &TreeOp::Insert));
+                            return;
+                        }
+                    },
+                    // Root / Uninitialized / Name are not insertable leaves
+                    _ => return,
+                }
+            } else {
+                trace!(target: "intermediate", "{part:?} --> depth: {depth}/{len}");
+                // must be a container (directory) so let's create the basic structure
+                let mut itm = NodeItem::Dir(Entry::<Directory>::default());
+                itm.set_dir_name(part);
+                itm
+            };
+
+            let is_file: bool = itm.is_file();
+            let (child, created) =
+                dir.get_or_add_child_with(part, || Some(Node::new(itm, Some(current.clone())).into()));
+            if created {
+                self.conf.nodes_mod(1);
+                if is_file {
+                    self.conf.files_mod(1);
+                } else {
+                    self.conf.dirs_mod(1);
                 }
             }
-        }
 
-        if !matches!(current.item.get(), None) {
-            // for now we don't overwrite existing nodes, but
-            // this may change in the future to allow for updates
-            trace!(target: "SKIP_EX_NODE", "{:?} ({:?}) : {:?}",
-                self.node_name(&current), current.node_t, current.path(&self.strings)
-            );
-            return;
-        }
+            current = match child {
+                Some(node) => {
+                    if created {
+                        debug!(target: "CREATED_NODE", "{part:?} : {:?}", &node);
+                    }
+                    node
+                }
+                None => {
+                    // a name-only entry occupies this slot; a full path
+                    // cannot pass through (or overwrite) it
+                    self.add_error(TreeEvent::error(
+                        &format!("Name-only entry blocks {part:?} at depth {depth}/{len}"),
+                        &TreeOp::Insert,
+                    ));
+                    return;
+                }
+            };
 
-        match node_t {
-            NodeType::Directory => {
-                let mut itm = NodeItem::Dir(Entry::<Directory>::new(path, inode).unwrap());
-                itm.set_dir_name(parts[len - 1]);
-                current.item.set(itm).ok();
-                self.conf.dirs_mod(1);
+            if is_leaf && !created {
+                // for now we don't overwrite existing nodes, but
+                // this may change in the future to allow for updates
+                trace!(target: "SKIP_EX_NODE", "{:?} ({:?}) : {:?}",
+                    self.node_name(&current), current.node_t, current.path(&self.strings)
+                );
+                return;
             }
-            NodeType::File => {
-                current
-                    .item
-                    .set(NodeItem::File(Entry::<FileEntry>::new(path, inode).unwrap()))
-                    .ok();
-                self.conf.files_mod(1);
-            }
-            _ => return,
-        };
-        self.conf.nodes_mod(1);
+        }
         debug!(target: "INSERT_CHILD", "{current:?}");
     }
 
@@ -934,9 +988,20 @@ impl DirTree {
                 match node.parent() {
                     Some(parent) => {
                         let (nodes, dirs, files) = self.count_from(node.clone());
-                        let (name, c) = parent.get_child_byref(&node).unwrap();
+                        /*
+                        get_child_byref is a pointer-identity lookup, so a
+                        None here means the node was detached concurrently -
+                        report instead of panicking.
+                        */
+                        let (name, _c) = match parent.get_child_byref(&node) {
+                            Some(found) => found,
+                            None => {
+                                let msg: String = format!("Node detached during removal: {:?}", p);
+                                self.add_error(TreeEvent::error(&msg, &op).node(&node));
+                                return Err(Error::new(ErrorKind::NotFound, msg));
+                            }
+                        };
                         debug!(target: "REMOVE_NODE", "{:?}", p.display());
-                        assert_eq!(node, c, "Node should be the same as the one in parent");
 
                         /*
                         We're potentially removing a branch instead of a leaf,
@@ -962,10 +1027,40 @@ impl DirTree {
             }
 
             None => {
+                /*
+                In Name filemode files exist only as name entries in their
+                parent's children map (no Node), so get_node cannot find
+                them - check for one before declaring the path missing.
+                */
+                if self.remove_name_entry(path) {
+                    self.conf.files_mod(-1);
+                    return Ok(Some((0, 0, 1)));
+                }
                 warn!("Node not found: {path:?}");
                 return Ok(None);
             }
         }
+    }
+
+    /// Remove a name-only (Node-less) file entry from its parent directory.
+    /// Returns `true` if such an entry existed and was removed.
+    fn remove_name_entry(&self, path: &str) -> bool {
+        let trimmed: &str = path.trim_end_matches(PATH_SEP);
+        let Some((parent_p, name)) = trimmed.rsplit_once(PATH_SEP) else {
+            return false;
+        };
+        // a first-level path like "/foo" splits into ("", "foo")
+        let parent_p: &str = if parent_p.is_empty() { PATH_SEP } else { parent_p };
+        let Some(name_idx) = self.strings.idx(name) else {
+            return false;
+        };
+        self.get_node(parent_p)
+            .and_then(|parent: Arc<Node>| {
+                parent
+                    .as_dir()
+                    .map(|dir: &Directory| dir.remove_name_child(&name_idx))
+            })
+            .unwrap_or(false)
     }
 
     /* --------------------------------- */
@@ -978,7 +1073,13 @@ impl DirTree {
         }
         let mut current: Arc<Node> = self.root();
         for part in path_parts(path) {
-            match current.get_child(&self.strings.insert(part)) {
+            /*
+            Lookup only - a component not in the string store cannot be in
+            the tree either. Interning here (via insert) would permanently
+            grow the store with every queried nonexistent path.
+            */
+            let idx: u32 = self.strings.idx(part)?;
+            match current.get_child(&idx) {
                 Some(node) => current = node,
                 None => return None,
             }

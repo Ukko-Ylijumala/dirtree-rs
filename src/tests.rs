@@ -10,6 +10,8 @@ use libc;
 use parking_lot::Mutex;
 use std::{
     collections::HashSet,
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -274,6 +276,88 @@ fn test_tree_removals() {
         }
         Err(e) => panic!("Error removing L1 dir {l1_p}: {e}"),
     }
+}
+
+#[test]
+fn test_node_hash_no_recursion() {
+    setup_tests();
+    let tree: DirTree = DirTree::new(FileMode::default(), Filters::default());
+    // Hashing a data-less node (Root) used to recurse infinitely.
+    let mut hasher: DefaultHasher = DefaultHasher::new();
+    tree.root().hash(&mut hasher);
+    let _ = hasher.finish();
+}
+
+#[test]
+fn test_hardlink_names() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::write(temp.path().join("orig.bin"), b"x").unwrap();
+    std::fs::hard_link(temp.path().join("orig.bin"), temp.path().join("link.bin")).unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    /*
+    Hardlinked files share an inode, so an equality-based child lookup
+    cannot tell the siblings apart - name resolution must be by identity.
+    */
+    for name in ["orig.bin", "link.bin"] {
+        let p: String = format!("{dir}/{name}");
+        let node: Arc<Node> = tree.get_node(&p).expect("hardlinked node should exist");
+        assert_eq!(tree.node_name(&node), name, "hardlink resolved to wrong sibling");
+    }
+}
+
+#[test]
+fn test_name_mode_removal() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+    std::fs::write(temp.path().join("sub/afile.bin"), b"x").unwrap();
+
+    let state = ScanState { filemode: FileMode::NAME, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    assert_eq!(tree.conf().files(), 1, "name-only file not counted");
+
+    let p: String = format!("{dir}/sub/afile.bin");
+    match tree.remove(&p) {
+        Ok(Some((0, 0, 1))) => {}
+        other => panic!("Name-only entry removal failed: {other:?}"),
+    }
+    assert_eq!(tree.conf().files(), 0, "file count not decremented");
+    assert!(matches!(tree.remove(&p), Ok(None)), "second removal should be a no-op");
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_get_node_does_not_intern() {
+    let (path, tree, _) = create_test_tree(true);
+    let before: usize = tree.strings().len();
+    assert!(!tree.contains(&format!("{path}/nonexistent_component_xyz")));
+    assert_eq!(tree.strings().len(), before, "lookup must not grow the string store");
+}
+
+#[test]
+fn test_concurrent_same_path_insert() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir_all(temp.path().join("a/b/c")).unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, false, false);
+    let target: PathBuf = temp.path().join("a/b/c");
+    let (n0, d0) = (tree.conf().nodes(), tree.conf().dirs());
+
+    // racing inserters of the same path must create each node exactly once
+    rayon::scope(|s| {
+        for _ in 0..8 {
+            let (t, p) = (&tree, &target);
+            s.spawn(move |_| t.insert(p, NodeType::Directory, None));
+        }
+    });
+    assert_eq!(tree.conf().nodes(), n0 + 3, "duplicate node creation in racing inserts");
+    assert_eq!(tree.conf().dirs(), d0 + 3, "duplicate dir creation in racing inserts");
+    tree_validate_counts(&tree);
 }
 
 /* --------------------------------- */

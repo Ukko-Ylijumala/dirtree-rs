@@ -16,6 +16,7 @@ use tracing::{error, instrument, trace_span};
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    collections::hash_map::Entry as HmEntry,
     fs::{Metadata, metadata},
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
@@ -23,6 +24,7 @@ use std::{
     os::fd::RawFd,
     os::unix::fs::MetadataExt,
     path::PathBuf,
+    ptr,
     sync::{Arc, OnceLock, Weak},
 };
 
@@ -278,6 +280,56 @@ impl Directory {
         self.write().remove(name_idx);
     }
 
+    /**
+    Atomically get an existing child, or add a new one built by `make`.
+
+    The check-then-insert happens under a single write lock hold, so two
+    threads racing to create the same child cannot overwrite each other
+    (which would silently drop the loser's descendants). Returns the child
+    and whether it was created by this call (`false` for a pre-existing
+    entry, including name-only `None` entries, and when `make` declines
+    by returning `None`).
+    */
+    pub(super) fn get_or_add_child_with<F>(&self, name_idx: u32, make: F) -> (MaybeNode, bool)
+    where
+        F: FnOnce() -> MaybeNode,
+    {
+        let mut ch = self.write();
+        match ch.entry(name_idx) {
+            HmEntry::Occupied(e) => (e.get().clone(), false),
+            HmEntry::Vacant(v) => match make() {
+                Some(node) => (v.insert(Some(node)).clone(), true),
+                None => (None, false),
+            },
+        }
+    }
+
+    /// Atomically record a name-only child (no [[Node]] is created).
+    /// Returns `true` if the name was newly added, `false` if any entry
+    /// (name-only or full node) already occupied the slot.
+    pub(super) fn add_name_child(&self, name_idx: u32) -> bool {
+        match self.write().entry(name_idx) {
+            HmEntry::Occupied(_) => false,
+            HmEntry::Vacant(v) => {
+                v.insert(None);
+                true
+            }
+        }
+    }
+
+    /// Remove a name-only (`None`) child entry. Returns `true` if one was
+    /// removed; full [[Node]] entries are left untouched.
+    pub(super) fn remove_name_child(&self, name_idx: &u32) -> bool {
+        let mut ch = self.write();
+        match ch.get(name_idx) {
+            Some(None) => {
+                ch.remove(name_idx);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Add the immediate (non-recursive) memory size of the directory to [Context].
     #[cfg(feature = "size_of")]
     fn size_immediate(&self, context: &mut Context) {
@@ -287,9 +339,9 @@ impl Directory {
         let ch = self.children.read();
         ch.hasher().size_of_children(context);
         if ch.capacity() > 0 {
-            let s: usize = size_of::<Option<Arc<Node>>>();
+            let s: usize = size_of::<Option<Arc<Node>>>() + size_of::<u32>();
             let used: usize = s * ch.len();
-            let total: usize = (s + size_of::<String>()) * ch.capacity();
+            let total: usize = s * ch.capacity();
             context
                 .add(used)
                 .add_excess(total - used)
@@ -615,25 +667,38 @@ impl Node {
         }
     }
 
-    /// Construct this node's full path by walking the tree upwards to Root.
+    /**
+    Construct this node's full path by walking the tree upwards to Root.
+
+    A detached node (removed from the tree, or with an ancestor removed
+    mid-walk) cannot be reconstructed; an empty Vec is returned in that
+    case instead of panicking.
+    */
     pub(super) fn construct_path(&self, store: &UniqueStrStore) -> Vec<String> {
         if self.node_t == NodeType::Root {
             return vec![PATH_SEP.to_string()];
         }
         let mut path: Vec<String> = Vec::new();
-        let (_, mut current) = self
-            .parent()
-            .expect("Node should have a parent")
-            .get_child_byref(self)
-            .expect("Node's parent should return a name and an Arc reference");
+        let mut current: Arc<Node> = match self.parent().and_then(|p| p.get_child_byref(self)) {
+            Some((_, me)) => me,
+            None => {
+                error!("Cannot construct path for a detached node: {self:?}");
+                return path;
+            }
+        };
 
         loop {
             match current.parent() {
                 Some(parent) => {
-                    let name_idx: u32 = parent
-                        .get_child_byref(&*current)
-                        .expect("Node should have a name")
-                        .0;
+                    let name_idx: u32 = match parent.get_child_byref(&current) {
+                        Some((name, _)) => name,
+                        // an ancestor was detached while we were walking up
+                        None => {
+                            error!("Detached ancestor while constructing path: {current:?}");
+                            path.clear();
+                            return path;
+                        }
+                    };
                     path.insert(0, unsafe { store.borrow_str(name_idx) }.to_string());
                     current = parent;
                 }
@@ -736,20 +801,21 @@ impl Node {
     Get the name of a child [[Node]] and its `Arc<Node>` ptr from a reference
     to the child node itself. The main use case is for a child node to find
     its own name and reference in the parent node's `children` HashMap.
+
+    The lookup is by pointer identity, not structural equality: equality
+    would deep-compare directory subtrees and cannot distinguish hardlinked
+    files (their [Data] compares equal via the shared inode).
     */
     #[inline]
     pub(super) fn get_child_byref(&self, child: &Node) -> Option<(u32, Arc<Node>)> {
         trace_span!("get_child_byref", ?child).in_scope(|| {
-            match self
-                .children()
-                .unwrap()
+            self.children()?
                 .read()
-                .par_iter()
-                .find_any(|entry| entry.1 == child)
-            {
-                Some((name, child)) => Some((*name, child.clone()?)),
-                None => None,
-            }
+                .iter()
+                .find_map(|(name, c)| match c {
+                    Some(n) if ptr::eq(Arc::as_ptr(n), child) => Some((*name, n.clone())),
+                    _ => None,
+                })
         })
     }
 
@@ -790,12 +856,14 @@ impl Deref for Node {
 }
 
 // For a [FileEntry] or [Directory], the hash is based on the inode.
+// Data-less nodes (Root, Uninitialized) hash their item instead; NOTE:
+// `self.hash(state)` here would recurse into this same impl infinitely.
 impl Hash for Node {
     fn hash<H: Hasher>(&self, state: &mut H) {
         if self.node_t.has_data() {
             self.data().unwrap().hash(state);
         } else {
-            self.hash(state);
+            self.item.get().hash(state);
         }
         self.node_t.hash(state);
     }

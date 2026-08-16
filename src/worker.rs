@@ -44,7 +44,7 @@ pub(super) fn tree_worker(t: Arc<DirTree>, state: ScanState) {
                         // A configured visitor forces the parallel walker
                         // because the visitor protocol is parallel-only.
                         if t.has_visitor() {
-                            t.populate_par(&p, &state);
+                            t.populate_par(&p, &state, Some(true));
                         } else {
                             t.populate(&p, &state, Some(true));
                         }
@@ -56,7 +56,7 @@ pub(super) fn tree_worker(t: Arc<DirTree>, state: ScanState) {
                             t.set_state(TreeState::Active(op));
                         }
                         if t.has_visitor() {
-                            t.populate_par(&p, &state);
+                            t.populate_par(&p, &state, recursive);
                         } else {
                             t.populate(&p, &state, recursive);
                         }
