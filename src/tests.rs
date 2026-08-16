@@ -360,6 +360,60 @@ fn test_concurrent_same_path_insert() {
     tree_validate_counts(&tree);
 }
 
+#[test]
+fn test_tree_watcher() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+    std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: Arc<DirTree> =
+        Arc::new(DirTree::new_from_path(dir, &state, true, false));
+    let watcher: Arc<TreeWatcher> =
+        TreeWatcher::start(tree.clone(), state.clone()).expect("watcher should start");
+    assert!(watcher.watches_len() >= 2, "root + sub should be watched");
+    assert_eq!(watcher.failed_watches(), 0, "no watch failures expected");
+
+    // file creation in an existing (watched) directory
+    std::fs::write(temp.path().join("sub/b.bin"), b"y").unwrap();
+    let p_b: String = format!("{dir}/sub/b.bin");
+    wait_for(|| tree.contains(&p_b), "created file should appear in the tree");
+
+    /*
+    Nested directory creation: the "newdir" create event triggers a
+    watch + recursive scan which must pick up "nested" as well. The
+    short settle time lets the watches get established before the file
+    below is created (see the watch-then-scan note in watch.rs).
+    */
+    std::fs::create_dir_all(temp.path().join("newdir/nested")).unwrap();
+    let p_nested: String = format!("{dir}/newdir/nested");
+    wait_for(|| tree.contains(&p_nested), "new nested dir should appear in the tree");
+    std::fs::write(temp.path().join("newdir/nested/c.bin"), b"z").unwrap();
+    let p_c: String = format!("{dir}/newdir/nested/c.bin");
+    wait_for(|| tree.contains(&p_c), "file in new nested dir should appear");
+
+    // removals: single file, then a whole subtree
+    std::fs::remove_file(temp.path().join("sub/b.bin")).unwrap();
+    wait_for(|| !tree.contains(&p_b), "removed file should disappear");
+    std::fs::remove_dir_all(temp.path().join("newdir")).unwrap();
+    wait_for(|| !tree.contains(&format!("{dir}/newdir")), "removed subtree should disappear");
+
+    watcher.stop();
+    tree_validate_counts(&tree);
+}
+
+/// Poll `cond` for up to ~2 seconds before failing the test with `msg`.
+fn wait_for<F: Fn() -> bool>(cond: F, msg: &str) {
+    for _ in 0..200 {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("Timeout waiting for: {msg}");
+}
+
 /* --------------------------------- */
 
 /// Create a test DirTree from path and perform some basic validations.

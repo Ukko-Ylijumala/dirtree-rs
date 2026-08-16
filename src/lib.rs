@@ -14,6 +14,7 @@ The module is split into several submodules for clarity:
 - [`worker`]:   the background work-queue executor.
 - [`visitor`]:  per-directory visitor protocol (recognition, prune, depth).
 - [`visitors`]: built-in [`Visitor`] implementations.
+- [`watch`]:    inotify-based resident-mode tree following.
 - [`debug`]:    developer-facing diagnostic helpers.
 - [`tests`]:    unit tests for the above.
 */
@@ -28,6 +29,7 @@ mod tests;
 mod traverse;
 mod visitor;
 mod visitors;
+mod watch;
 mod worker;
 
 pub use conf::TreeConf;
@@ -39,3 +41,4 @@ pub use node::{Directory, Entry, FileEntry, Node, NodeItem, NodeType};
 pub use traverse::{traverse_from, traverse_from_par, walk_nodes};
 pub use visitor::*;
 pub use visitors::*;
+pub use watch::TreeWatcher;

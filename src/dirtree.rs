@@ -196,7 +196,7 @@ impl DirTree {
     }
 
     /// Add an error event to the event log and increase the error count.
-    fn add_error(&self, event: TreeEvent) {
+    pub(super) fn add_error(&self, event: TreeEvent) {
         error!("{event:?}");
         self.add_event(event);
         self.conf.errors_inc();
