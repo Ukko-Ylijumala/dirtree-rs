@@ -154,6 +154,19 @@ impl DirTree {
                 format!("Not a directory: {path}"),
             ));
         }
+        /*
+        The trie root and the intermediate nodes above a walk root (inode
+        0, created without a stat) were never listed: their children are
+        only the path to the walk root. Diffing one would treat all of
+        its other entries on disk as new and fully scan them (all of `/`
+        for the trie root).
+        */
+        if matches!(node.inode(), None | Some(0)) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Not a scanned directory (above the tree root?): {path}"),
+            ));
+        }
         // canonical path from the trie (normalizes e.g. trailing slashes)
         let full: PathBuf = node.path(&self.strings);
         let recursive: bool = recursive.unwrap_or(self.conf.recursive());

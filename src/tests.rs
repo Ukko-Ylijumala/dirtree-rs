@@ -407,6 +407,29 @@ fn test_tree_update_diff() {
 }
 
 #[test]
+fn test_tree_update_rejects_unscanned() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    let nodes: u32 = tree.conf().nodes();
+
+    // the trie root and the intermediate nodes above the walk root
+    let parent: String = temp.path().parent().unwrap().to_string_lossy().into_owned();
+    for p in [PATH_SEP, parent.as_str()] {
+        let res = tree.update(p, &state, Some(true));
+        assert!(res.is_err(), "update({p}) should be rejected: {res:?}");
+    }
+    assert_eq!(tree.conf().nodes(), nodes, "rejected updates must not touch the tree");
+
+    // the walk root and its subdirs remain updatable
+    tree.update(dir, &state, Some(true)).expect("update of the tree root failed");
+    tree.update(&format!("{dir}/sub"), &state, Some(true)).expect("update of sub failed");
+}
+
+#[test]
 fn test_tree_update_diff_name_mode() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
