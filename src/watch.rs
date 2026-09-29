@@ -48,10 +48,12 @@ use tracing::{debug, error, trace, warn};
 
 use std::{
     ffi::{CString, OsStr},
+    fs::symlink_metadata,
     io,
     mem::size_of,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
+    os::unix::fs::MetadataExt,
     path::PathBuf,
     ptr,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
@@ -499,14 +501,42 @@ impl TreeWatcher {
                     self.watch_subtree(&new_node);
                 }
             } else {
+                /*
+                IN_CREATE fires for every entry type. Like the walker and the
+                diff, record regular files only: symlinks, FIFOs, sockets and
+                device nodes are not modelled (a later update would remove
+                them again). lstat, so a symlink is not followed - that also
+                yields the inode, and the insert needs no stat of its own.
+                */
+                let ino: u64 = match symlink_metadata(&full) {
+                    Ok(meta) if meta.file_type().is_file() => meta.ino(),
+                    _ => return, // not a regular file, or already gone again
+                };
                 debug!(target: "WATCH_CREATE", "{}", full.display());
+                let idx: u32 = self.tree.strings.insert(name.to_string_lossy().as_ref());
+                let depth: u8 = full
+                    .components()
+                    .count()
+                    .saturating_sub(1)
+                    .min(u8::MAX as usize) as u8;
                 let mode = self.tree.filemode();
-                if mode.is_name() {
-                    self.tree.insert(&full, NodeType::Name, None);
+                let counted: bool = if mode.is_name() {
+                    let added: bool = node
+                        .as_dir()
+                        .is_some_and(|d| d.add_name_child(idx));
+                    if added {
+                        self.tree.conf.files_mod(1);
+                        self.tree.conf.depth_compare(depth);
+                    }
+                    added
                 } else if mode.is_node() {
-                    self.tree.insert(&full, NodeType::File, None);
+                    self.tree.insert_child(&node, idx, NodeType::File, ino, depth).1
+                } else {
+                    true // counted, but not stored
+                };
+                if counted {
+                    self.state.num_f.inc1();
                 }
-                self.state.num_f.inc1();
             }
         } else if mask & libc::IN_DELETE != 0 {
             debug!(target: "WATCH_RM", "{}", full.display());
@@ -617,7 +647,10 @@ impl TreeWatcher {
             if let Some(ref node) = pending.node {
                 self.tree.release_handles(node);
             }
-            if pending.is_dir {
+            let was_dir: bool = pending.is_dir;
+            // drop the subtree first, or the sweep still sees its watches alive
+            drop(pending);
+            if was_dir {
                 self.sweep_dead_watches();
             }
             return true; // handled: the entry ceases to exist for the tree

@@ -10,6 +10,7 @@ use libc;
 use parking_lot::Mutex;
 use std::{
     collections::HashSet,
+    ffi::CString,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::PathBuf,
@@ -672,6 +673,32 @@ fn test_tree_watcher() {
 }
 
 /// Poll `cond` for up to ~2 seconds before failing the test with `msg`.
+#[test]
+fn test_tree_watcher_special_files() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: Arc<DirTree> = Arc::new(DirTree::new_from_path(dir, &state, true, false));
+    let _watcher: Arc<TreeWatcher> =
+        TreeWatcher::start(tree.clone(), state.clone()).expect("watcher should start");
+    let files: u32 = tree.conf().files();
+
+    // neither a (dangling) symlink nor a FIFO is a regular file
+    std::os::unix::fs::symlink("/nonexistent", temp.path().join("link")).unwrap();
+    let fifo: CString = CString::new(format!("{dir}/fifo")).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo failed");
+    // ...a regular file created last proves the events before it were handled
+    std::fs::write(temp.path().join("plain.bin"), b"p").unwrap();
+    wait_for(|| tree.contains(&format!("{dir}/plain.bin")), "regular file should appear");
+
+    assert!(!tree.contains(&format!("{dir}/link")), "symlink recorded as a file");
+    assert!(!tree.contains(&format!("{dir}/fifo")), "FIFO recorded as a file");
+    assert_eq!(tree.conf().files(), files + 1, "only plain.bin should be counted");
+    assert_eq!(tree.conf().errors(), 0, "dangling symlink caused an error");
+    tree_validate_counts(&tree);
+}
+
 fn wait_for<F: Fn() -> bool>(cond: F, msg: &str) {
     for _ in 0..200 {
         if cond() {
