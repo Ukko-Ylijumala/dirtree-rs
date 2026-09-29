@@ -8,7 +8,13 @@ use super::visitor::*;
 use super::worker::tree_worker;
 use crate::{PATH_SEP, ScanState, args::FileMode, filters::Filters, utils::path_parts};
 
-use dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
+use dirhandle::{
+    CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles,
+    nix::{
+        fcntl::{OFlag, open},
+        sys::stat::Mode,
+    },
+};
 use stringstore::{ARENA_CHUNK_SIZE, UniqueStrStore};
 use timesince::SecondsSinceEpoch;
 
@@ -594,7 +600,9 @@ impl DirTree {
             return;
         }
         let walk = self.initial_walk_state(path, recursive);
-        rayon::scope(|s| self.populate_par_inner(path, state, walk, node, s, 0, 0));
+        // the walk root is opened by path; a symlinked root is followed
+        let handle: Result<DirHandle, Error> = DirHandle::new(path);
+        rayon::scope(|s| self.populate_par_inner(path, handle, state, walk, node, s, 0, 0));
     }
 
     /**
@@ -646,8 +654,10 @@ impl DirTree {
     /**
     The recursive workhorse of the parallel walker.
 
-    `node` is this directory's own node in the trie; children are
-    attached directly under it. `depth` is the semantic distance from
+    `handle` is this directory, as opened by the caller (see
+    [open_dir_nofollow] for why descents never follow symlinks). `node`
+    is this directory's own node in the trie; children are attached
+    directly under it. `depth` is the semantic distance from
     the walk root (drives visitor depth caps and events); `frames` is
     the direct-recursion count since the last rayon spawn (drives the
     stack-bounding spawn decision) - the two must not be conflated, or
@@ -661,6 +671,7 @@ impl DirTree {
     fn populate_par_inner<'env>(
         &'env self,
         path: &PathBuf,
+        handle: Result<DirHandle, Error>,
         state: &'env ScanState,
         walk: WalkState,
         node: Arc<Node>,
@@ -686,7 +697,7 @@ impl DirTree {
         }
 
         let op: TreeOp = TreeOp::Scan(path.into(), Some(walk.recursive));
-        let mut handle = match DirHandle::new(path) {
+        let mut handle: DirHandle = match handle {
             Ok(h) => h,
             Err(e) => {
                 self.add_error(TreeEvent::error(&e.to_string(), &op));
@@ -903,8 +914,10 @@ impl DirTree {
                         // spawn after MAX_RECURSE_DEPTH frames to bound stack
                         // use; semantic depth keeps increasing across spawns.
                         if frames < MAX_RECURSE_DEPTH {
+                            // relative to our open handle, never following a symlink
                             self.populate_par_inner(
                                 &entry_p,
+                                entry.open_dir(),
                                 state,
                                 next,
                                 child_node,
@@ -913,9 +926,15 @@ impl DirTree {
                                 frames + 1,
                             );
                         } else {
+                            /*
+                            The parent's handle may be gone by the time the
+                            task runs (and opening ahead would hold one fd
+                            per queued task), so the task opens by path.
+                            */
                             rs.spawn(move |s| {
                                 self.populate_par_inner(
                                     &entry_p,
+                                    open_dir_nofollow(&entry_p),
                                     state,
                                     next,
                                     child_node,
@@ -1635,6 +1654,24 @@ impl Display for DirTree {
             self.created()
         )
     }
+}
+
+/**
+Open a directory by path for a walker descent, without following a
+symlink in the final component - the counterpart of
+[EntryExt::open_dir] for when the parent's handle is no longer at hand.
+The walker only descends into entries readdir reported as directories;
+should one be swapped for a symlink before the open, following it would
+walk a foreign subtree into the tree (or loop, via `link -> .`). With
+`O_NOFOLLOW` the open fails with `ELOOP` instead.
+*/
+fn open_dir_nofollow(path: &PathBuf) -> Result<DirHandle, Error> {
+    let flags: OFlag = OFlag::O_RDONLY
+        | OFlag::O_DIRECTORY
+        | OFlag::O_NOFOLLOW
+        | OFlag::O_CLOEXEC
+        | OFlag::O_NONBLOCK;
+    DirHandle::from_fd(open(path.as_path(), flags, Mode::empty())?)
 }
 
 /* ######################################################################### */

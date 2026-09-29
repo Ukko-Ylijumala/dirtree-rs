@@ -407,6 +407,29 @@ fn test_tree_update_diff() {
 }
 
 #[test]
+fn test_tree_deep_walk() {
+    // deeper than MAX_RECURSE_DEPTH, so descents run as spawned tasks too
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let depth: usize = 3 * dirtree::MAX_RECURSE_DEPTH + 1;
+    let mut p: PathBuf = temp.path().to_path_buf();
+    for i in 0..depth {
+        p.push(format!("d{i}"));
+    }
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(p.join("leaf.bin"), b"x").unwrap();
+    // a symlinked directory is recorded as neither dir nor file, and not followed
+    std::os::unix::fs::symlink(temp.path(), temp.path().join("d0/loop")).unwrap();
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    assert_eq!(tree.conf().errors(), 0, "deep walk reported errors");
+    assert!(tree.contains(&p.join("leaf.bin").to_string_lossy()), "deepest file missing");
+    assert!(!tree.contains(&format!("{dir}/d0/loop")), "symlink should not be recorded");
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_resident_handles_released() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
