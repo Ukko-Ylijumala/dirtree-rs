@@ -381,6 +381,38 @@ impl Directory {
         }
     }
 
+    /**
+    Add a batch of children under a single write lock hold. A name that is
+    already occupied (by a full node or a name-only entry) keeps its
+    occupant; the new counterpart is dropped. Returns how many children
+    were added.
+    */
+    pub(super) fn add_children_new<I>(&self, children: I) -> u32
+    where
+        I: IntoIterator<Item = (u32, MaybeNode)>,
+    {
+        let mut ch = self.write();
+        let mut added: u32 = 0;
+        for (name_idx, node) in children {
+            if let HmEntry::Vacant(v) = ch.entry(name_idx) {
+                v.insert(node);
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /**
+    Make room for `total` children in all, so that a directory filled in
+    parallel does not rehash its map (under the write lock, stalling the
+    other inserters) as it grows.
+    */
+    pub(super) fn reserve_children(&self, total: usize) {
+        let mut ch = self.write();
+        let additional: usize = total.saturating_sub(ch.len());
+        ch.reserve(additional);
+    }
+
     /// Atomically record a name-only child (no [[Node]] is created).
     /// Returns `true` if the name was newly added, `false` if any entry
     /// (name-only or full node) already occupied the slot.
