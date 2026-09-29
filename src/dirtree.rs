@@ -52,9 +52,13 @@ pub(super) const MAX_RECURSE_DEPTH: usize = 16;
 /// Upper bound for the in-memory event log; oldest events are dropped
 /// first. Keeps long-lived (resident) trees from growing without bound.
 const EVENT_LOG_CAP: usize = 4096;
-/// Minimum number of dirents one rayon task takes from a directory's
-/// entry list. Per-entry work is tiny (an intern + one map insert), so
-/// batching is what keeps scheduling overhead from dominating the walk.
+/**
+Minimum number of non-directory dirents one rayon task takes from a
+directory's entry list. Per-file work is tiny (an intern + one map
+insert), so batching is what keeps scheduling overhead from dominating
+the walk. Subdirectories are never batched: each one is a whole subtree
+of work.
+*/
 const ENTRY_BATCH_MIN: usize = 64;
 
 /**
@@ -709,13 +713,12 @@ impl DirTree {
 
         /*
         Collect the dirents first (visit_dir needs the full list anyway),
-        then process them with an indexed parallel iterator. par_bridge()
+        then process them with indexed parallel iterators. par_bridge()
         over the streaming iterator was measured to be a bad fit here:
         with O(1) child insertion the per-entry work is so small that
         par_bridge's per-item synchronization dominated the walk (futex
         storm, 4x the context switches). An indexed iterator splits the
-        work log(n) times instead, and with_min_len() batches entries so
-        one rayon task amortizes its scheduling over a whole chunk.
+        work log(n) times instead.
 
         Since dirhandle 0.4.2 each `EntryExt` borrows its `DirHandle`, so
         the Vec must be consumed before the handle is moved below.
@@ -764,25 +767,39 @@ impl DirTree {
             }
         }
         if !skip_children {
+            /*
+            Subdirectories and files are scheduled differently. A single
+            with_min_len(ENTRY_BATCH_MIN) over all entries never split a
+            directory of fewer than 2 * ENTRY_BATCH_MIN entries, so a tree
+            of small directories - most real trees - was walked almost
+            serially: its subdirectories all recursed on one thread (at
+            16 workers on /usr, ~3 CPUs busy and the rest spinning in
+            sched_yield). Each subdirectory now is a task of its own, and
+            only files are batched.
+            */
             let visitor_ref = visitor.as_ref();
-            entries
-                .into_par_iter()
-                .with_min_len(ENTRY_BATCH_MIN)
-                .for_each(|entry: EntryExt| {
-                    self.process_par_entry(
-                        path,
-                        state,
-                        &walk,
-                        &node,
-                        scope_for_children,
-                        depth,
-                        frames,
-                        rs,
-                        visitor_ref,
-                        &op,
-                        entry,
-                    );
-                });
+            let mut entries = entries;
+            let n_dirs: usize = partition_dirs_first(&mut entries);
+            let (dirs, files) = entries.split_at(n_dirs);
+            let each = |entry: &EntryExt| {
+                self.process_par_entry(
+                    path,
+                    state,
+                    &walk,
+                    &node,
+                    scope_for_children,
+                    depth,
+                    frames,
+                    rs,
+                    visitor_ref,
+                    &op,
+                    entry,
+                );
+            };
+            rayon::join(
+                || dirs.par_iter().for_each(each),
+                || files.par_iter().with_min_len(ENTRY_BATCH_MIN).for_each(each),
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -841,7 +858,7 @@ impl DirTree {
         rs: &rayon::Scope<'env>,
         visitor: Option<&Arc<dyn Visitor>>,
         op: &TreeOp,
-        entry: EntryExt<'_>,
+        entry: &EntryExt<'_>,
     ) {
         match entry.file_type() {
             Some(_) => {
@@ -1654,6 +1671,23 @@ impl Display for DirTree {
             self.created()
         )
     }
+}
+
+/**
+Move the directory entries to the front of `entries` (unstable, in
+place) and return how many there are, so that subdirectories and other
+entries can be scheduled differently. Entries of undeterminable type
+count as non-directories, like everywhere else.
+*/
+fn partition_dirs_first(entries: &mut [EntryExt<'_>]) -> usize {
+    let mut n_dirs: usize = 0;
+    for i in 0..entries.len() {
+        if entries[i].is_dir() {
+            entries.swap(n_dirs, i);
+            n_dirs += 1;
+        }
+    }
+    n_dirs
 }
 
 /**
