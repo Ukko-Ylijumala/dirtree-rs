@@ -9,7 +9,7 @@ use super::worker::tree_worker;
 use crate::{PATH_SEP, ScanState, args::FileMode, filters::Filters, utils::path_parts};
 
 use dirhandle::{CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles};
-use stringstore::UniqueStrStore;
+use stringstore::{ARENA_CHUNK_SIZE, UniqueStrStore};
 use timesince::SecondsSinceEpoch;
 
 use crossbeam::{channel::Sender, queue::SegQueue};
@@ -320,7 +320,7 @@ impl DirTree {
 
     /// Creates a new empty directory tree (internally a Trie structure).
     pub fn new(filemode: FileMode, filters: Filters) -> Self {
-        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(1024);
+        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(1024, ARENA_CHUNK_SIZE);
         let name_idx: u32 = store.insert("ROOT");
         DirTree {
             root: Node::new(NodeItem::Root(Directory::new(name_idx)), None).into(),
