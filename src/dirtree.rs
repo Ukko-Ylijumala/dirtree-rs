@@ -816,19 +816,6 @@ impl DirTree {
             );
         }
 
-        #[cfg(debug_assertions)]
-        {
-            match handle.state_current() {
-                Ok(cur) => {
-                    let old = handle.state();
-                    debug!(target: "HANDLE_STATE", "equal: {}", old == &cur);
-                    debug!(target: "HANDLE_STATE", "old: {old:?}");
-                    debug!(target: "HANDLE_STATE", "cur: {cur:?}");
-                }
-                Err(e) => debug!(target: "HANDLE_STATE", "state_current failed: {e}"),
-            }
-        } // END DEBUG -- TODO: remove
-
         // shall we keep the directory handle (file descriptor) open?
         if self.conf.resident() {
             /*
