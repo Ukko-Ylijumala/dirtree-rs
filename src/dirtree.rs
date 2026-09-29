@@ -1227,6 +1227,13 @@ impl DirTree {
     the tree counters. The subtree below the child is dropped in a
     cascading manner via refcounting. Returns `(nodes, dirs, files)`
     removed.
+
+    Nothing is removed (and `(0, 0, 0)` returned) if `name_idx` no longer
+    holds `child` itself: the caller resolved the child earlier, and a
+    concurrent remove (watcher vs. worker update, say) may have emptied
+    the slot or a create re-filled it with a new node since. Removing
+    by name alone would delete that newcomer and subtract the old
+    subtree's counts a second time.
     */
     pub(super) fn remove_child_node(
         &self,
@@ -1234,8 +1241,10 @@ impl DirTree {
         name_idx: u32,
         child: Arc<Node>,
     ) -> (u32, u32, u32) {
-        let (nodes, dirs, files) = self.count_from(child);
-        parent.remove_child(&name_idx);
+        let (nodes, dirs, files) = self.count_from(child.clone());
+        if !parent.remove_child_exact(&name_idx, &child) {
+            return (0, 0, 0);
+        }
         self.conf.nodes_mod(-(nodes as i32));
         self.conf.dirs_mod(-(dirs as i32));
         self.conf.files_mod(-(files as i32));

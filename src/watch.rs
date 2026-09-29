@@ -565,6 +565,15 @@ impl TreeWatcher {
                 }
             }
         };
+        if counts == (0, 0, 0) {
+            /*
+            Nothing was detached: the slot changed under us (a concurrent
+            remove or re-create). Parking the stale child would re-attach
+            it at the destination; without a pending entry the matching
+            IN_MOVED_TO takes the plain create path instead.
+            */
+            return;
+        }
         debug!(target: "WATCH_MV_FROM", "{name:?} detached (cookie {cookie})");
         self.pending.insert(
             cookie,

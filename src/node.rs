@@ -341,6 +341,23 @@ impl Directory {
     }
 
     /**
+    Remove the child under `name_idx` only if it still is `child` itself
+    (pointer identity), checked and removed under one write lock hold.
+    Returns `true` if it was removed. A caller acting on an earlier look
+    at the slot thus cannot remove a node recreated there since.
+    */
+    fn remove_child_exact(&self, name_idx: &u32, child: &Arc<Node>) -> bool {
+        let mut ch = self.write();
+        match ch.get(name_idx) {
+            Some(Some(n)) if Arc::ptr_eq(n, child) => {
+                ch.remove(name_idx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /**
     Atomically get an existing child, or add a new one built by `make`.
 
     The check-then-insert happens under a single write lock hold, so two
@@ -899,6 +916,13 @@ impl Node {
     pub(super) fn remove_child(&self, name_idx: &u32) {
         self.as_dir()
             .map(|dir: &Directory| dir.remove_child(name_idx));
+    }
+
+    /// Remove the child under `name_idx` only if it is `child` itself.
+    /// See [Directory::remove_child_exact].
+    pub(super) fn remove_child_exact(&self, name_idx: &u32, child: &Arc<Node>) -> bool {
+        self.as_dir()
+            .is_some_and(|dir: &Directory| dir.remove_child_exact(name_idx, child))
     }
 
     /**
