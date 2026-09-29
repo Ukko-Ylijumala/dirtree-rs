@@ -305,6 +305,9 @@ impl TreeWatcher {
                 return true;
             }
             debug!(target: "WATCH_MV_OUT", "cookie {cookie} expired (moved out of tree)");
+            if let Some(ref node) = p.node {
+                self.tree.release_handles(node);
+            }
             sweep |= p.is_dir;
             false // dropping the Arc cascades the subtree teardown
         });
@@ -551,7 +554,8 @@ impl TreeWatcher {
         };
 
         let counts: (u32, u32, u32) = match &child_opt {
-            Some(child) => self.tree.remove_child_node(parent, idx, child.clone()),
+            // detach only: an in-place rename re-attaches it, handles and all
+            Some(child) => self.tree.detach_child_node(parent, idx, child.clone()),
             None => {
                 // a Name-mode (node-less) file entry
                 if parent
@@ -610,6 +614,9 @@ impl TreeWatcher {
         };
         // the destination name may be excluded even though the source was tracked
         if !self.tree.conf.filters().passes(name, is_dir) {
+            if let Some(ref node) = pending.node {
+                self.tree.release_handles(node);
+            }
             if pending.is_dir {
                 self.sweep_dead_watches();
             }
@@ -639,6 +646,7 @@ impl TreeWatcher {
 
                 debug!(target: "WATCH_MV", "moved to {} (cookie {cookie})", full.display());
                 if child.node_t.is_dir() {
+                    self.tree.release_handles(&child);
                     drop(child); // release the old subtree before re-scanning
                     self.tree.insert(&full, NodeType::Directory, None);
                     self.state.num_d.inc1();

@@ -407,6 +407,29 @@ fn test_tree_update_diff() {
 }
 
 #[test]
+fn test_tree_resident_handles_released() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    for d in ["a", "a/x", "b"] {
+        std::fs::create_dir(temp.path().join(d)).unwrap();
+    }
+
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let tree: DirTree = DirTree::new_from_path(dir, &state, true, true);
+    assert_eq!(tree.handles_len(), 4, "walk root, a, a/x and b should be pinned");
+
+    // re-populating a known subtree must not pool a second set of handles
+    tree.populate_par(&PathBuf::from(format!("{dir}/a")), &state, Some(true));
+    assert_eq!(tree.handles_len(), 4, "re-populate leaked handles");
+
+    // removing a subtree closes the handles of all of its directories
+    tree.remove(&format!("{dir}/a")).expect("remove failed");
+    assert_eq!(tree.handles_len(), 2, "removed subtree kept its handles open");
+    assert!(tree.handle(dir).is_some(), "walk root handle should still be pooled");
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_update_rejects_unscanned() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();

@@ -789,11 +789,19 @@ impl DirTree {
 
         // shall we keep the directory handle (file descriptor) open?
         if self.conf.resident() {
-            // we already hold this directory's node - no path lookup needed
-            if let Some(dir) = node.as_dir() {
-                dir.fd_set(handle.as_raw_fd()).ok();
+            /*
+            We already hold this directory's node - no path lookup needed.
+            Pool the handle only if the node takes its fd: a re-populated
+            node keeps the handle it already has, and pooling a second one
+            would leak it (no node would ever point at it for closing).
+            */
+            let fd: RawFd = handle.as_raw_fd();
+            if node
+                .as_dir()
+                .is_some_and(|dir: &Directory| dir.fd_set(fd).is_ok())
+            {
+                self.handles.insert(handle);
             }
-            self.handles.insert(handle);
         } else {
             drop(handle); // unnecessary, but explicit
         }
@@ -1234,8 +1242,31 @@ impl DirTree {
     the slot or a create re-filled it with a new node since. Removing
     by name alone would delete that newcomer and subtract the old
     subtree's counts a second time.
+
+    The open directory handles (resident mode) of the removed subtree
+    are closed. To detach a subtree that will be re-attached, use
+    [DirTree::detach_child_node] instead.
     */
     pub(super) fn remove_child_node(
+        &self,
+        parent: &Node,
+        name_idx: u32,
+        child: Arc<Node>,
+    ) -> (u32, u32, u32) {
+        let counts: (u32, u32, u32) = self.detach_child_node(parent, name_idx, child.clone());
+        if counts != (0, 0, 0) {
+            self.release_handles(&child);
+        }
+        counts
+    }
+
+    /**
+    [DirTree::remove_child_node] without closing the subtree's directory
+    handles: for a subtree that is kept around to be re-attached (rename
+    support). Whoever finally drops such a subtree calls
+    [DirTree::release_handles] on it.
+    */
+    pub(super) fn detach_child_node(
         &self,
         parent: &Node,
         name_idx: u32,
@@ -1249,6 +1280,26 @@ impl DirTree {
         self.conf.dirs_mod(-(dirs as i32));
         self.conf.files_mod(-(files as i32));
         (nodes, dirs, files)
+    }
+
+    /**
+    Close the pooled directory handles (resident mode) of every directory
+    in the subtree at `node` and clear their [DirFd]s. Without this, the
+    handles of removed directories stay open forever, pinning deleted
+    directories and eventually running the process out of fds.
+    */
+    pub(super) fn release_handles(&self, node: &Arc<Node>) {
+        if self.handles.is_empty() {
+            return;
+        }
+        traverse_from(node, &mut |n: &Arc<Node>| {
+            if let Some(dir) = n.as_dir()
+                && dir.fd().is_open()
+            {
+                self.handles.close(dir.fd().fd());
+                dir.fd().clear();
+            }
+        });
     }
 
     /**
@@ -1380,15 +1431,18 @@ impl DirTree {
     pub fn handle(&self, path: &str) -> Option<CheckedOutHandle<'_>> {
         let node: Arc<Node> = self.get_node(path)?;
         node.as_dir().and_then(|dir: &Directory| {
-            let fd: RawFd = dir.fd().fd();
-            if fd > 0 {
-                self.handles.get(fd)
+            // NOTE: fd 0 is a valid open fd, hence is_open() and not `fd > 0`
+            if dir.fd().is_open() {
+                self.handles.get(dir.fd().fd())
             } else {
-                if let Ok(handle) = self.handles.open(&node.path(&self.strings)) {
-                    dir.fd_set(handle.as_raw_fd()).ok();
-                    Some(handle)
-                } else {
-                    None
+                let handle: CheckedOutHandle = self.handles.open(&node.path(&self.strings)).ok()?;
+                match dir.fd_set(handle.as_raw_fd()) {
+                    Ok(_) => Some(handle),
+                    // lost a race to another opener: keep theirs, close ours
+                    Err(existing) => {
+                        handle.close();
+                        self.handles.get(existing)
+                    }
                 }
             }
         })
@@ -1398,10 +1452,10 @@ impl DirTree {
     pub fn handle_close(&self, path: &str) {
         if let Some(node) = self.get_node(path) {
             if node.is_dir() {
-                let fd: RawFd = node.dirfd().unwrap().fd();
-                if fd > 0 {
-                    self.handles.close(fd);
-                    node.dirfd().unwrap().clear();
+                let dirfd: &DirFd = node.dirfd().unwrap();
+                if dirfd.is_open() {
+                    self.handles.close(dirfd.fd());
+                    dirfd.clear();
                 }
             }
         }
