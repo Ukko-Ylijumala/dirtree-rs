@@ -285,8 +285,11 @@ impl DirTree {
         type cannot be determined at all (DT_UNKNOWN and a failed
         fstatat) is neither: it exists, so whatever the tree has under
         that name is kept as-is.
+
+        The diff keeps its own stamp (above), so the handle's own state
+        tracking would be wasted work: iterate untracked.
         */
-        let mut iter = handle.iter();
+        let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
         if let Some(e) = iter.error() {
             /*

@@ -729,8 +729,13 @@ impl DirTree {
         instead of posing as a clean end of stream. The entries read so
         far are real and still get inserted, but the listing is partial,
         so the error must be recorded rather than silently accepted.
+
+        iter_untracked() (dirhandle 0.6.1): the walker never reads the
+        handle's DirectoryState, and partitions the entries itself, so
+        skip the state pass (a directory fstat and a digest per entry)
+        and the dir-first lookahead.
         */
-        let mut iter = handle.iter();
+        let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
         if let Some(e) = iter.error() {
             self.add_error(TreeEvent::error(
