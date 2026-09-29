@@ -260,7 +260,23 @@ impl DirTree {
         as absent, and entry types the tree does not model (symlinks,
         sockets, ...) are ignored like everywhere else.
         */
-        let entries: Vec<EntryExt> = handle.iter().collect();
+        let mut iter = handle.iter();
+        let entries: Vec<EntryExt> = iter.by_ref().collect();
+        if let Some(e) = iter.error() {
+            /*
+            A readdir error cut the listing short. Diffing against it
+            would remove every entry not read yet, and a refreshed
+            baseline would then let the pre-check skip this directory
+            for good. Leave the tree (and the baseline) as they are.
+            */
+            ctr.errors.fetch_add(1, Relaxed);
+            self.add_error(TreeEvent::error(
+                &format!("readdir failed, listing incomplete: {e}"),
+                &op,
+            ));
+            return;
+        }
+        drop(iter);
         let mut disk: DirTreeHashMap<u32, &EntryExt> =
             DirTreeHashMap::with_capacity_and_hasher(entries.len(), DirTreeXxh3Hasher);
         for e in &entries {

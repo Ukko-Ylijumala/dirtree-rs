@@ -708,8 +708,21 @@ impl DirTree {
 
         Since dirhandle 0.4.2 each `EntryExt` borrows its `DirHandle`, so
         the Vec must be consumed before the handle is moved below.
+
+        Since dirhandle 0.6.0 a `readdir` error ends the iteration early
+        instead of posing as a clean end of stream. The entries read so
+        far are real and still get inserted, but the listing is partial,
+        so the error must be recorded rather than silently accepted.
         */
-        let entries: Vec<EntryExt> = handle.iter().collect();
+        let mut iter = handle.iter();
+        let entries: Vec<EntryExt> = iter.by_ref().collect();
+        if let Some(e) = iter.error() {
+            self.add_error(TreeEvent::error(
+                &format!("readdir failed, listing incomplete: {e}"),
+                &op,
+            ));
+        }
+        drop(iter);
         let mut scope_for_children: ScopeTag = walk.scope;
         let mut skip_children: bool = false;
         if let Some(ref v) = visitor {
@@ -787,9 +800,9 @@ impl DirTree {
     }
 
     /**
-    Per-dirent processing for the parallel walker. Shared between the
-    fast path (`par_bridge` over `DirHandle::iter`) and the visitor
-    path (`into_par_iter` over a collected `Vec<EntryExt>`).
+    Per-dirent processing for the parallel walker, run from an indexed
+    parallel iterator over the directory's collected `Vec<EntryExt>`
+    (with or without a visitor).
 
     Children are attached directly under `parent_node` via
     [DirTree::insert_child]; full paths are only constructed for
@@ -814,12 +827,12 @@ impl DirTree {
         match entry.file_type() {
             Some(_) => {
                 /*
-                file_name() via Deref<nix::dir::Entry> returns &CStr, a
-                zero-copy borrow from the dirent. from_bytes() wraps it
-                as &OsStr without any allocation, so filtered entries
-                never pay for the String allocation from entry.name().
+                name_as_bytes() borrows the name stored in the entry
+                itself. from_bytes() wraps it as &OsStr without any
+                allocation, so filtered entries never pay for the String
+                allocation from entry.name().
                 */
-                let name_os = OsStr::from_bytes(entry.file_name().to_bytes());
+                let name_os = OsStr::from_bytes(entry.name_as_bytes());
                 trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
                 // children of this directory live one path component deeper
                 let depth_abs: u8 =
