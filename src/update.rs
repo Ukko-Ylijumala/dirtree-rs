@@ -258,7 +258,10 @@ impl DirTree {
         /*
         Disk view: interned name -> dirent. Filtered entries are treated
         as absent, and entry types the tree does not model (symlinks,
-        sockets, ...) are ignored like everywhere else.
+        sockets, ...) are ignored like everywhere else. An entry whose
+        type cannot be determined at all (DT_UNKNOWN and a failed
+        fstatat) is neither: it exists, so whatever the tree has under
+        that name is kept as-is.
         */
         let mut iter = handle.iter();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
@@ -279,12 +282,20 @@ impl DirTree {
         drop(iter);
         let mut disk: DirTreeHashMap<u32, &EntryExt> =
             DirTreeHashMap::with_capacity_and_hasher(entries.len(), DirTreeXxh3Hasher);
+        let mut unknown: Vec<u32> = Vec::new();
         for e in &entries {
+            let name_os: &OsStr = OsStr::from_bytes(e.name_as_bytes());
+            if e.file_type().is_none() {
+                // lookup only: a name the store lacks is not in the tree either
+                if let Some(idx) = self.strings.idx(name_os.to_string_lossy().as_ref()) {
+                    unknown.push(idx);
+                }
+                continue;
+            }
             let is_dir: bool = e.is_dir();
             if !is_dir && !e.is_file() {
                 continue;
             }
-            let name_os: &OsStr = OsStr::from_bytes(e.file_name().to_bytes());
             if !self.conf.filters().passes(name_os, is_dir) {
                 continue;
             }
@@ -299,7 +310,7 @@ impl DirTree {
 
         // pass 1: remove what is no longer on disk
         for (name_idx, child) in &tree_view {
-            if disk.contains_key(name_idx) {
+            if disk.contains_key(name_idx) || unknown.contains(name_idx) {
                 continue;
             }
             trace!(target: "UPDATE_RM", "{:?} in {}", name_idx, path.display());
@@ -326,7 +337,7 @@ impl DirTree {
         for (name_idx, entry) in disk {
             let is_dir: bool = entry.is_dir();
             let disk_ino: u64 = entry.ino();
-            let name_os: &OsStr = OsStr::from_bytes(entry.file_name().to_bytes());
+            let name_os: &OsStr = OsStr::from_bytes(entry.name_as_bytes());
 
             match tree_view.get(&name_idx) {
                 // new on disk
