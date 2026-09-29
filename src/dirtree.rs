@@ -25,6 +25,7 @@ use rayon::prelude::*;
 use tracing::{debug, error, instrument, trace, trace_span, warn};
 
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     ffi::OsStr,
     fmt::{self, Display, Formatter},
@@ -996,8 +997,29 @@ impl DirTree {
         let store: bool = name_only || self.filemode().is_node();
         let with_size: bool = self.filemode().is_with_size();
         let mut children: Vec<(u32, MaybeNode)> = Vec::with_capacity(batch.len());
+        /*
+        Names still to intern, with their inodes: interned together after
+        the loop. Every new name takes stringstore's writer mutex, and with
+        a mutex round per name the handoffs between workers dominated the
+        walk of a tree of unique file names (it got slower past 4 workers).
+        */
+        let mut names: Vec<Cow<str>> = Vec::with_capacity(batch.len());
+        let mut inodes: Vec<u64> = Vec::with_capacity(batch.len());
         let mut seen: u64 = 0;
         let mut size: u64 = 0;
+        // name-only files get no node, just a (name -> None) entry
+        let file_node = |inode: u64| -> MaybeNode {
+            match name_only {
+                true => None,
+                false => Some(
+                    Node::new(
+                        NodeItem::File(Entry::<FileEntry>::with_inode(inode)),
+                        Some(parent_node.clone()),
+                    )
+                    .into(),
+                ),
+            }
+        };
 
         for entry in batch {
             let Some(entry_t) = entry.file_type() else {
@@ -1041,21 +1063,24 @@ impl DirTree {
                 size += entry.len();
             }
             if store {
-                let idx: u32 = child_idx
-                    .unwrap_or_else(|| self.strings.insert(name_os.to_string_lossy().as_ref()));
-                // name-only files get no node, just a (name -> None) entry
-                let child: MaybeNode = match name_only {
-                    true => None,
-                    false => Some(
-                        Node::new(
-                            NodeItem::File(Entry::<FileEntry>::with_inode(entry.ino())),
-                            Some(parent_node.clone()),
-                        )
-                        .into(),
-                    ),
-                };
-                children.push((idx, child));
+                match child_idx {
+                    // already interned for the visitor
+                    Some(idx) => children.push((idx, file_node(entry.ino()))),
+                    None => {
+                        names.push(name_os.to_string_lossy());
+                        inodes.push(entry.ino());
+                    }
+                }
             }
+        }
+        if !names.is_empty() {
+            let indices: Vec<u32> = self.strings.insert_many(&names);
+            children.extend(
+                indices
+                    .into_iter()
+                    .zip(inodes)
+                    .map(|(idx, inode)| (idx, file_node(inode))),
+            );
         }
 
         let added: u32 = match children.is_empty() {
