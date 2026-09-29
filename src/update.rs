@@ -23,7 +23,7 @@ there; adds and removes still work.
 use super::dirtree::{DirTree, MAX_RECURSE_DEPTH};
 use super::event::{TreeEvent, TreeOp};
 use super::hash::DirTreeXxh3Hasher;
-use super::node::{DirTreeHashMap, MaybeNode, Node, NodeType};
+use super::node::{DirTreeHashMap, MaybeNode, Node, NodeType, ctime_stamp};
 use crate::ScanState;
 
 use dirhandle::{DirHandle, EntryExt};
@@ -43,9 +43,11 @@ use std::{
 };
 
 /**
-Timestamps within this many seconds of the last-scan baseline fall
-through to a full diff, guarding against filesystem timestamp
-granularity and same-second races (mirrors dirhandle's slack).
+A directory's ctime must be this many seconds older than the start of a
+full diff for that diff to establish a pre-check baseline. A change
+landing within the stamp's own timestamp granule would not move it, so
+a fresher stamp cannot prove "unchanged" later (mirrors dirhandle's
+slack).
 */
 const MTIME_SLACK_SECS: u64 = 2;
 
@@ -181,51 +183,49 @@ impl DirTree {
         let op: TreeOp = TreeOp::Update(path.clone());
 
         /*
-        Fast path: a directory's own mtime changes exactly when its entry
-        list changes (create / remove / rename), so if both mtime and
-        ctime are clearly older than the node's last scan time, the
-        entry list cannot have changed - skip the listing and diff on a
-        single stat and only descend into subdirectories (their own
-        timestamps decide for themselves). Backdating mtime bumps ctime,
-        so it cannot fake "unchanged"; only nodes whose baseline was
-        refreshed by an earlier full diff qualify.
+        Fast path: a directory's ctime moves whenever its entry list
+        changes (create / remove / rename), so if it still equals the
+        stamp recorded before the last full diff, the entry list cannot
+        have changed - skip the listing and diff on a single stat and
+        only descend into subdirectories (their own stamps decide for
+        themselves). Stamps are compared with stamps only, never with
+        the local clock, so clock skew against an NFS / SMB / FUSE
+        server cannot hide a change. Only nodes whose baseline was set
+        by an earlier, settled full diff qualify (see [MTIME_SLACK_SECS]).
         */
-        if let Some(when) = node.scanned_at()
-            && when > 0
+        if let Some(stamp) = node.scan_stamp()
+            && stamp != 0
             && let Ok(meta) = metadata(path)
+            && ctime_stamp(meta.ctime(), meta.ctime_nsec()) == stamp
         {
-            let newest: u64 = meta.mtime().max(meta.ctime()).max(0) as u64;
-            if newest + MTIME_SLACK_SECS < when {
-                trace!(target: "UPDATE_SKIP", "{} unchanged since {when}", path.display());
-                ctr.skipped_dirs.fetch_add(1, Relaxed);
-                if recursive && let Some(ch) = node.children() {
-                    let subdirs: Vec<(u32, Arc<Node>)> = ch
-                        .read()
-                        .iter()
-                        .filter_map(|(k, v)| match v {
-                            Some(n) if n.node_t.is_dir() => Some((*k, n.clone())),
-                            _ => None,
-                        })
-                        .collect();
-                    for (name_idx, child) in subdirs {
-                        let child_p: PathBuf = path.join(self.get_string(name_idx));
-                        if frames < MAX_RECURSE_DEPTH {
-                            self.update_inner(
-                                &child_p, child, state, recursive, ctr, rs, frames + 1,
-                            );
-                        } else {
-                            rs.spawn(move |s| {
-                                self.update_inner(&child_p, child, state, recursive, ctr, s, 0)
-                            });
-                        }
+            trace!(target: "UPDATE_SKIP", "{} unchanged since {stamp}", path.display());
+            ctr.skipped_dirs.fetch_add(1, Relaxed);
+            if recursive && let Some(ch) = node.children() {
+                let subdirs: Vec<(u32, Arc<Node>)> = ch
+                    .read()
+                    .iter()
+                    .filter_map(|(k, v)| match v {
+                        Some(n) if n.node_t.is_dir() => Some((*k, n.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                for (name_idx, child) in subdirs {
+                    let child_p: PathBuf = path.join(self.get_string(name_idx));
+                    if frames < MAX_RECURSE_DEPTH {
+                        self.update_inner(
+                            &child_p, child, state, recursive, ctr, rs, frames + 1,
+                        );
+                    } else {
+                        rs.spawn(move |s| {
+                            self.update_inner(&child_p, child, state, recursive, ctr, s, 0)
+                        });
                     }
                 }
-                return;
             }
+            return;
         }
 
-        // capture the pass time BEFORE listing, so a change racing the
-        // diff makes the next pre-check fall through to a full diff again
+        // the pass start, for the settle check of the new baseline below
         let pass_time: u64 = *SecondsSinceEpoch::new();
 
         let mut handle: DirHandle = match DirHandle::new(path) {
@@ -252,6 +252,16 @@ impl DirTree {
             }
         };
         ctr.scanned_dirs.fetch_add(1, Relaxed);
+        /*
+        Stamp the directory BEFORE listing it (fstat on the open handle,
+        so it is the very directory being listed): a change racing the
+        diff moves ctime past the stamp, and the next pre-check falls
+        through to a full diff again.
+        */
+        let stamp: u64 = handle
+            .stat()
+            .map(|st: libc::stat| ctime_stamp(st.st_ctime, st.st_ctime_nsec))
+            .unwrap_or(0);
         // children of this directory sit one path component deeper
         let child_depth: u8 = path.components().count().min(u8::MAX as usize) as u8;
 
@@ -419,8 +429,13 @@ impl DirTree {
             }
         }
 
-        // a completed full diff establishes a fresh pre-check baseline
-        node.set_scanned(pass_time);
+        /*
+        A completed full diff establishes a fresh pre-check baseline -
+        unless the stamp is too recent to be trusted (see
+        [MTIME_SLACK_SECS]), which clears the baseline instead.
+        */
+        let settled: bool = stamp / 1_000_000_000 + MTIME_SLACK_SECS < pass_time;
+        node.set_scan_stamp(if settled { stamp } else { 0 });
     }
 
     /// Insert a directory that appeared on disk and, when `recursive`,

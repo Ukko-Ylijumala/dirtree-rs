@@ -7,7 +7,6 @@ use crate::{PATH_SEP, utils::make_weak_ref};
 
 use dirhandle::DirFd;
 use stringstore::UniqueStrStore;
-use timesince::SecondsSinceEpoch;
 
 use parking_lot::RwLock;
 use tracing::{error, instrument, trace_span};
@@ -45,16 +44,21 @@ pub(super) type DirTreeHashMap<K, V> = HashMap<K, V, DirTreeXxh3Hasher>;
 #[derive(Default, Debug)]
 struct Data {
     inode: u64,
-    /// Last scan time (seconds since UNIX epoch). Atomic so a diff-rescan
-    /// can refresh it through the shared `&Node` without any locking.
-    when: AtomicU64,
+    /**
+    Change stamp of the last complete scan: the object's ctime as seen
+    just before that scan, in nanoseconds since the UNIX epoch by the
+    filesystem's own clock (see [ctime_stamp]); 0 = no baseline. Atomic
+    so a diff-rescan can refresh it through the shared `&Node` without
+    any locking.
+    */
+    stamp: AtomicU64,
 }
 
 impl Data {
     fn new(inode: u64) -> Self {
         Self {
             inode,
-            when: AtomicU64::new(*SecondsSinceEpoch::new()),
+            stamp: AtomicU64::new(0),
         }
     }
 
@@ -63,14 +67,14 @@ impl Data {
         self.inode
     }
 
-    /// Last scan time in seconds since the UNIX epoch.
-    fn when(&self) -> u64 {
-        self.when.load(Relaxed)
+    /// Change stamp of the last complete scan (0 = none).
+    fn stamp(&self) -> u64 {
+        self.stamp.load(Relaxed)
     }
 
-    /// Record the given time as the last scan time.
-    fn set_when(&self, secs: u64) {
-        self.when.store(secs, Relaxed);
+    /// Record the change stamp of a complete scan.
+    fn set_stamp(&self, stamp: u64) {
+        self.stamp.store(stamp, Relaxed);
     }
 }
 
@@ -78,7 +82,7 @@ impl Clone for Data {
     fn clone(&self) -> Self {
         Data {
             inode: self.inode,
-            when: AtomicU64::new(self.when()),
+            stamp: AtomicU64::new(self.stamp()),
         }
     }
 }
@@ -108,6 +112,21 @@ impl Ord for Data {
 impl PartialOrd for Data {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/**
+A ctime as a change stamp: nanoseconds since the UNIX epoch (0 for
+pre-epoch times, which thus never match as a baseline). ctime alone is
+enough - every entry list change moves a directory's mtime *and* ctime,
+and setting timestamps (`touch -d`, `utimensat`) bumps ctime to "now".
+Stamps come from the filesystem's clock and are only ever compared with
+each other, never with the local clock (skew on NFS / SMB / FUSE).
+*/
+pub(super) fn ctime_stamp(secs: i64, nsecs: i64) -> u64 {
+    match secs {
+        s if s < 0 => 0,
+        s => (s as u64).saturating_mul(1_000_000_000).saturating_add(nsecs as u64),
     }
 }
 
@@ -148,7 +167,7 @@ trait DirectoryEntry {
             error!("Inode changed: {} ({} -> {})", path.display(), self.data().inode, meta.ino());
             return Err(Error::new(ErrorKind::AlreadyExists, "Inode changed"));
         }
-        self.data().set_when(*SecondsSinceEpoch::new());
+        self.data().set_stamp(ctime_stamp(meta.ctime(), meta.ctime_nsec()));
         Ok(meta)
     }
 }
@@ -818,15 +837,16 @@ impl Node {
         self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.inode())
     }
 
-    /// Last scan time (seconds since epoch), if the node carries [Data].
-    pub fn scanned_at(&self) -> Option<u64> {
-        self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.when())
+    /// Change stamp of the node's last complete scan (see [ctime_stamp];
+    /// 0 = no baseline), if the node carries [Data].
+    pub fn scan_stamp(&self) -> Option<u64> {
+        self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.stamp())
     }
 
-    /// Record the given time as the node's last scan time.
-    pub(super) fn set_scanned(&self, secs: u64) {
+    /// Record the change stamp of a complete scan of this node.
+    pub(super) fn set_scan_stamp(&self, stamp: u64) {
         if let Some(d) = self.item.get().and_then(|i: &NodeItem| i.data()) {
-            d.set_when(secs);
+            d.set_stamp(stamp);
         }
     }
 
