@@ -26,7 +26,8 @@ v1 caveats (deliberate, recorded for the future crate split):
   *directory* moves pay a re-scan (the trie has no re-parenting). A
   `MOVED_FROM` with no matching `MOVED_TO` within [`PENDING_MOVE_TTL`]
   is a move out of the tree and drops the subtree. Events arriving for
-  a subtree during its FROM->TO limbo window are skipped.
+  a subtree between its `MOVED_FROM` and `MOVED_TO` mark the move dirty,
+  and the subtree is diffed once it is back in the tree.
 - A kernel queue overflow (`IN_Q_OVERFLOW`) marks the tree
   [`TreeState::Inconsistent`], repairs it with a full
   [diff-rescan](DirTree::update) (which fixes both lost creations and
@@ -109,6 +110,8 @@ struct PendingMove {
     /// When the `IN_MOVED_FROM` was seen (for expiry).
     seen: Instant,
     is_dir: bool,
+    /// Events arrived for the detached subtree: diff it once it is back in the tree.
+    dirty: bool,
 }
 
 /**
@@ -376,26 +379,42 @@ impl TreeWatcher {
         }
     }
 
-    /// Whether the node (or any of its ancestors) is a detached subtree
-    /// root currently awaiting rename correlation.
-    fn in_pending(&self, node: &Arc<Node>) -> bool {
+    /// The cookie of the pending move whose detached subtree holds the
+    /// node (as its root or below it), if any.
+    fn pending_cookie(&self, node: &Arc<Node>) -> Option<u32> {
         if self.pending.is_empty() {
-            return false;
+            return None;
         }
-        let roots: Vec<Arc<Node>> = self
+        let roots: Vec<(u32, Arc<Node>)> = self
             .pending
             .iter()
-            .filter_map(|p| p.value().node.clone())
+            .filter_map(|p| p.value().node.clone().map(|n: Arc<Node>| (*p.key(), n)))
             .collect();
         let mut current: Arc<Node> = node.clone();
         loop {
-            if roots.iter().any(|r: &Arc<Node>| Arc::ptr_eq(r, &current)) {
-                return true;
+            if let Some((cookie, _)) = roots.iter().find(|(_, r)| Arc::ptr_eq(r, &current)) {
+                return Some(*cookie);
             }
-            match current.parent() {
-                Some(p) => current = p,
-                None => return false,
+            current = current.parent()?;
+        }
+    }
+
+    /**
+    Diff the subtree at `path` against the disk, for a moved subtree that
+    had events while detached. New directories found are watched as the
+    diff scans them; watches of removed ones are dropped.
+    */
+    fn resync_subtree(&self, path: &Path) {
+        let path_str = path.to_string_lossy();
+        match self.tree.update(path_str.as_ref(), Some(true)) {
+            Ok(stats) => {
+                debug!(target: "WATCH_MV", "{} resynced: {stats}", path.display());
+                self.sweep_dead_watches();
             }
+            Err(e) => self.tree.add_error(TreeEvent::error(
+                &format!("Moved subtree resync failed: {e}"),
+                &TreeOp::Update(path.to_path_buf()),
+            )),
         }
     }
 
@@ -489,13 +508,16 @@ impl TreeWatcher {
             .get_node(dir_path.to_string_lossy().as_ref())
             .is_some_and(|n: Arc<Node>| Arc::ptr_eq(&n, &node));
         if !attached {
-            if self.in_pending(&node) {
+            if let Some(cookie) = self.pending_cookie(&node) {
                 /*
-                Part of an in-flight rename: skip the event (changes made
-                inside a subtree during its FROM->TO limbo are lost, a
-                documented v1 gap) but keep the watch - it stays valid
-                once the subtree is re-attached.
+                Part of an in-flight move: the subtree is detached, so the
+                event cannot be applied now. Mark the move dirty instead -
+                the subtree is diffed once it is back in the tree - and keep
+                the watch, which stays valid across the move.
                 */
+                if let Some(mut pending) = self.pending.get_mut(&cookie) {
+                    pending.dirty = true;
+                }
                 return;
             }
             unsafe { libc::inotify_rm_watch(self.ino_fd.as_raw_fd(), wd) };
@@ -669,6 +691,7 @@ impl TreeWatcher {
                 parent: Arc::downgrade(parent),
                 seen: Instant::now(),
                 is_dir,
+                dirty: false,
             },
         );
     }
@@ -709,6 +732,7 @@ impl TreeWatcher {
         }
 
         let full: PathBuf = dir_path.join(name);
+        let dirty: bool = pending.dirty;
         match pending.node {
             Some(child) => {
                 let idx: u32 = self.tree.strings.insert(name.to_string_lossy().as_ref());
@@ -726,6 +750,9 @@ impl TreeWatcher {
                     self.tree.add_event(
                         TreeEvent::new("Renamed").path(full.to_string_lossy().as_ref()),
                     );
+                    if dirty {
+                        self.resync_subtree(&full);
+                    }
                     return true;
                 }
 
@@ -768,5 +795,23 @@ impl TreeWatcher {
                 true
             }
         }
+    }
+}
+
+/* ===== test hooks ===== */
+
+#[cfg(test)]
+impl TreeWatcher {
+    /// Apply one synthetic event, as the event loop would.
+    pub(super) fn inject(&self, wd: i32, mask: u32, cookie: u32, name: &str) {
+        self.handle_event(wd, mask, cookie, OsStr::new(name));
+    }
+
+    /// The watch descriptor of the directory at `path`, if it is watched.
+    pub(super) fn wd_of(&self, path: &Path) -> Option<i32> {
+        self.watches
+            .iter()
+            .find(|e| e.value().upgrade().is_some_and(|n| n.path(self.tree.strings()) == path))
+            .map(|e| *e.key())
     }
 }

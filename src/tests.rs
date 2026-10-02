@@ -787,6 +787,38 @@ fn test_tree_watcher_prepared_before_walk() {
 }
 
 #[test]
+fn test_tree_watcher_events_during_rename() {
+    /*
+    Events for a subtree between its MOVED_FROM and MOVED_TO cannot be
+    applied while it is detached. The real race needs events from other
+    threads inside one rename(), so the events are injected here, into a
+    watcher whose event loop never runs.
+    */
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir_all(temp.path().join("a/sub")).unwrap();
+    std::fs::write(temp.path().join("a/sub/old.bin"), b"x").unwrap();
+    let tree: Arc<DirTree> = Arc::new(walked_tree(dir, FileMode::NODE, false));
+    let watcher: Arc<TreeWatcher> = TreeWatcher::prepare(tree.clone()).unwrap();
+    let wd_root: i32 = watcher.wd_of(temp.path()).unwrap();
+    let wd_sub: i32 = watcher.wd_of(&temp.path().join("a/sub")).unwrap();
+
+    // rename a -> b, with a file created in b/sub between the two halves
+    std::fs::rename(temp.path().join("a"), temp.path().join("b")).unwrap();
+    watcher.inject(wd_root, libc::IN_MOVED_FROM | libc::IN_ISDIR, 7, "a");
+    std::fs::write(temp.path().join("b/sub/new.bin"), b"y").unwrap();
+    watcher.inject(wd_sub, libc::IN_CREATE, 0, "new.bin");
+    watcher.inject(wd_root, libc::IN_MOVED_TO | libc::IN_ISDIR, 7, "b");
+
+    assert!(tree.contains(&format!("{dir}/b/sub/old.bin")), "renamed subtree lost its file");
+    assert!(tree.contains(&format!("{dir}/b/sub/new.bin")), "file created mid-rename lost");
+    assert!(!tree.contains(&format!("{dir}/a")), "old name still in the tree");
+    watcher.stop();
+    assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_watcher_new_subtrees() {
     /*
     New directories with subdirectories, and files written into those
