@@ -25,7 +25,7 @@ use super::event::{TreeEvent, TreeOp};
 use super::hash::DirTreeXxh3Hasher;
 use super::conf::NodeCounts;
 use super::dirtree::NewChild;
-use super::node::{DirTreeHashMap, FileEntry, FileKind, MaybeNode, Node, ctime_stamp};
+use super::node::{Child, DirTreeHashMap, Directory, FileEntry, FileKind, NodeRef, ctime_stamp};
 
 use dirhandle::{DirHandle, EntryExt};
 use timesince::SecondsSinceEpoch;
@@ -166,15 +166,16 @@ impl DirTree {
         path: &str,
         recursive: Option<bool>,
     ) -> Result<UpdateStats, Error> {
-        let node: Arc<Node> = self
-            .get_node(path)
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("Not in tree: {path}")))?;
-        if !node.is_traversable() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("Not a directory: {path}"),
-            ));
-        }
+        let node: Arc<Directory> = match self.get_node(path) {
+            Some(NodeRef::Dir(dir)) => dir,
+            Some(NodeRef::File { .. }) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Not a directory: {path}"),
+                ));
+            }
+            None => return Err(Error::new(ErrorKind::NotFound, format!("Not in tree: {path}"))),
+        };
         /*
         The trie root and the intermediate nodes above a walk root (inode
         0, created without a stat) were never listed: their children are
@@ -182,7 +183,7 @@ impl DirTree {
         its other entries on disk as new and fully scan them (all of `/`
         for the trie root).
         */
-        if matches!(node.inode(), None | Some(0)) {
+        if node.inode() == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("Not a scanned directory (above the tree root?): {path}"),
@@ -204,7 +205,7 @@ impl DirTree {
     fn update_inner<'env>(
         &'env self,
         path: &PathBuf,
-        node: Arc<Node>,
+        node: Arc<Directory>,
         recursive: bool,
         ctr: &'env UpdateCtr,
         rs: &rayon::Scope<'env>,
@@ -226,21 +227,19 @@ impl DirTree {
         server cannot hide a change. Only nodes whose baseline was set
         by an earlier, settled full diff qualify (see [MTIME_SLACK_SECS]).
         */
-        if let Some(stamp) = node.scan_stamp()
-            && stamp != 0
+        let stamp: u64 = node.scan_stamp();
+        if stamp != 0
             && let Ok(meta) = metadata(path)
             && ctime_stamp(meta.ctime(), meta.ctime_nsec()) == stamp
         {
             trace!(target: "UPDATE_SKIP", "{} unchanged since {stamp}", path.display());
             ctr.skipped_dirs.fetch_add(1, Relaxed);
-            if recursive && let Some(ch) = node.children() {
-                let subdirs: Vec<(u32, Arc<Node>)> = ch
+            if recursive {
+                let subdirs: Vec<(u32, Arc<Directory>)> = node
+                    .children()
                     .read()
                     .iter()
-                    .filter_map(|(k, v)| match v {
-                        Some(n) if n.node_t.is_dir() => Some((*k, n.clone())),
-                        _ => None,
-                    })
+                    .filter_map(|(k, v)| v.as_dir().map(|d: &Arc<Directory>| (*k, d.clone())))
                     .collect();
                 for (name_idx, child) in subdirs {
                     let child_p: PathBuf = path.join(self.get_string(name_idx));
@@ -271,9 +270,9 @@ impl DirTree {
                 */
                 if e.kind() == ErrorKind::NotFound
                     && let Some(parent) = node.parent()
-                    && let Some((name_idx, _)) = parent.get_child_byref(&node)
                 {
-                    ctr.removed(self.remove_child_node(&parent, name_idx, node.clone()));
+                    let child: Child = Child::Dir(node.clone());
+                    ctr.removed(self.remove_child_node(&parent, node.name_idx(), &child));
                     return;
                 }
                 ctr.errors.fetch_add(1, Relaxed);
@@ -362,11 +361,8 @@ impl DirTree {
             disk.extend(indices.into_iter().zip(batch_entries.iter().copied()));
         }
 
-        // tree view snapshot (Arc clones only, one read lock hold)
-        let tree_view: DirTreeHashMap<u32, MaybeNode> = match node.children() {
-            Some(ch) => ch.read().clone(),
-            None => return,
-        };
+        // tree view snapshot (file copies and directory Arc clones, one read lock hold)
+        let tree_view: DirTreeHashMap<u32, Child> = node.children().read().clone();
 
         // pass 1: remove what is no longer on disk
         for (name_idx, child) in &tree_view {
@@ -374,9 +370,7 @@ impl DirTree {
                 continue;
             }
             trace!(target: "UPDATE_RM", "{:?} in {}", name_idx, path.display());
-            if let Some(c) = child {
-                ctr.removed(self.remove_child_node(&node, *name_idx, c.clone()));
-            }
+            ctr.removed(self.remove_child_node(&node, *name_idx, child));
         }
 
         // pass 2: add what is new, replace what changed, recurse into the rest
@@ -391,7 +385,7 @@ impl DirTree {
                     FileKind::Symlink => self.link_target_at(dirfd, entry.file_name()),
                     _ => None,
                 };
-                FileEntry::new(kind, target)
+                FileEntry::new(disk_ino, kind, target)
             };
 
             match tree_view.get(&name_idx) {
@@ -404,21 +398,19 @@ impl DirTree {
                             ctr,
                         );
                     } else {
-                        self.update_add_file(&node, name_idx, disk_ino, leaf(), child_depth, ctr);
+                        self.update_add_file(&node, name_idx, leaf(), child_depth, ctr);
                     }
                 }
 
-                Some(None) => {}
-
-                Some(Some(existing)) => {
+                Some(existing) => {
                     /*
                     A directory has no FileKind on either side. A kind change
                     under the same inode is a freed inode number reused at
                     once (a file deleted and a FIFO created, say): replaced.
                     */
-                    let type_match: bool = existing.node_t.is_dir() == is_dir
+                    let type_match: bool = existing.is_dir() == is_dir
                         && existing.file_kind() == entry.file_type().and_then(FileKind::from_type);
-                    let tree_ino: u64 = existing.inode().unwrap_or(0);
+                    let tree_ino: u64 = existing.inode();
                     /*
                     Inode 0 marks an intermediate node created without a
                     stat - treat it as "unknown" rather than "changed".
@@ -427,7 +419,7 @@ impl DirTree {
                         !type_match || (tree_ino != 0 && disk_ino != 0 && tree_ino != disk_ino);
                     if replaced {
                         trace!(target: "UPDATE_REPLACE", "{:?} in {}", name_os, path.display());
-                        ctr.removed(self.remove_child_node(&node, name_idx, existing.clone()));
+                        ctr.removed(self.remove_child_node(&node, name_idx, existing));
                         ctr.replaced.fetch_add(1, Relaxed);
                         if is_dir {
                             let child_p: PathBuf = path.join(name_os);
@@ -435,14 +427,14 @@ impl DirTree {
                                 &node, name_idx, disk_ino, child_depth, &child_p, recursive, ctr,
                             );
                         } else {
-                            self.update_add_file(
-                                &node, name_idx, disk_ino, leaf(), child_depth, ctr,
-                            );
+                            self.update_add_file(&node, name_idx, leaf(), child_depth, ctr);
                         }
-                    } else if is_dir && recursive {
+                    } else if let Child::Dir(child) = existing
+                        && recursive
+                    {
                         // unchanged directory: recurse the diff into it
                         let child_p: PathBuf = path.join(name_os);
-                        let child: Arc<Node> = existing.clone();
+                        let child: Arc<Directory> = child.clone();
                         if frames < MAX_RECURSE_DEPTH {
                             self.update_inner(
                                 &child_p, child, recursive, ctr, rs, frames + 1,
@@ -471,7 +463,7 @@ impl DirTree {
     #[allow(clippy::too_many_arguments)]
     fn update_add_dir(
         &self,
-        parent: &Arc<Node>,
+        parent: &Arc<Directory>,
         name_idx: u32,
         inode: u64,
         depth: u8,
@@ -480,13 +472,12 @@ impl DirTree {
         ctr: &UpdateCtr,
     ) {
         trace!(target: "UPDATE_ADD", "dir {}", child_p.display());
-        let (child, created) =
-            self.insert_child(parent, name_idx, NewChild::Dir, inode, depth);
+        let (child, created) = self.insert_child(parent, name_idx, NewChild::Dir(inode), depth);
         if created {
             ctr.added_dirs.fetch_add(1, Relaxed);
             self.conf.observer().dirs_added(1);
         }
-        if recursive && child.is_some() {
+        if recursive && child.is_dir() {
             // a whole new subtree: full scan instead of a diff
             self.populate_par(child_p, Some(true));
         }
@@ -495,16 +486,15 @@ impl DirTree {
     /// Insert a file that appeared on disk, honoring the tree's filemode.
     fn update_add_file(
         &self,
-        parent: &Arc<Node>,
+        parent: &Arc<Directory>,
         name_idx: u32,
-        inode: u64,
         file: FileEntry,
         depth: u8,
         ctr: &UpdateCtr,
     ) {
         if self.filemode().is_node() {
             let (_, created) =
-                self.insert_child(parent, name_idx, NewChild::Leaf(file), inode, depth);
+                self.insert_child(parent, name_idx, NewChild::File(file), depth);
             if created && file.kind().is_special() {
                 ctr.added_specials.fetch_add(1, Relaxed);
                 self.conf.observer().specials_added(1);

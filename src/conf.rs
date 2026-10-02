@@ -1,6 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use super::node::{FileKind, Node, NodeType};
+use super::node::{Directory, FileEntry, FileKind};
 use super::observer::{NOOP_OBSERVER, TreeObserver};
 use super::visitor::{Visitor, WalkEvent};
 use super::{FileMode, Filters};
@@ -27,7 +27,7 @@ and none falls in between.
 pub(super) struct ListHook(pub(super) Arc<ListHookFn>);
 
 /// The function a [ListHook] runs, given the directory's node.
-pub(super) type ListHookFn = dyn Fn(&Arc<Node>) + Send + Sync;
+pub(super) type ListHookFn = dyn Fn(&Arc<Directory>) + Send + Sync;
 
 impl Debug for ListHook {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -54,24 +54,27 @@ impl NodeCounts {
         *self == Self::default()
     }
 
-    /// Count `node`: a directory, or a file or special file by its kind.
+    /// Count a directory.
     #[inline]
-    pub(super) fn add_node(&mut self, node: &Node) {
+    pub(super) fn add_dir(&mut self) {
         self.nodes += 1;
-        match node.node_t {
-            NodeType::Directory => self.dirs += 1,
-            NodeType::File => match node.file_kind().is_some_and(FileKind::is_special) {
-                true => self.specials += 1,
-                false => self.files += 1,
-            },
-            _ => {}
+        self.dirs += 1;
+    }
+
+    /// Count a file or a special file, by its kind.
+    #[inline]
+    pub(super) fn add_file(&mut self, file: &FileEntry) {
+        self.nodes += 1;
+        match file.kind().is_special() {
+            true => self.specials += 1,
+            false => self.files += 1,
         }
     }
 
-    /// The counts of `node` alone, or of its subtree with [DirTree::count_from](super::DirTree::count_from).
-    pub(super) fn of_node(node: &Node) -> Self {
+    /// The counts of a file alone; see [DirTree::count_from](super::DirTree::count_from) for a directory.
+    pub(super) fn of_file(file: &FileEntry) -> Self {
         let mut c: Self = Self::default();
-        c.add_node(node);
+        c.add_file(file);
         c
     }
 }
@@ -243,7 +246,7 @@ impl TreeConf {
 
     /// Run the [ListHook], if one is set, for the directory `node` about to be listed.
     #[inline]
-    pub(super) fn before_listing(&self, node: &Arc<Node>) {
+    pub(super) fn before_listing(&self, node: &Arc<Directory>) {
         // cloned out, so that the hook runs without the lock held
         let hook: Option<ListHook> = self.list_hook.read().clone();
         if let Some(hook) = hook {

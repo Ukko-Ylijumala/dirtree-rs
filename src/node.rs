@@ -1,121 +1,52 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
+/*!
+The building blocks of the trie. Directories are shared nodes
+([`Arc<Directory>`]); everything else is a [`FileEntry`] stored by value
+in its parent directory's children map, as a [`Child`]. A file has no
+allocation and no parent pointer of its own: its parent is whichever
+directory's map holds it, and its name is the key it is stored under.
+
+[`NodeRef`] (owned) and [`NodeView`] (borrowed) refer to either kind of
+entry from outside a children map.
+*/
+
 #![allow(dead_code)]
 
 use super::hash::DirTreeXxh3Hasher;
-use super::utils::{PATH_SEP, make_weak_ref};
+use super::utils::PATH_SEP;
 
 use dirhandle::{DirFd, nix::dir::Type};
 use stringstore::UniqueStrStore;
 
 use parking_lot::RwLock;
-use tracing::{error, instrument, trace_span};
+use tracing::error;
 
 use std::{
-    cmp::Ordering,
     collections::HashMap,
     collections::hash_map::Entry as HmEntry,
-    fs::{FileType, Metadata, metadata},
+    fs::FileType,
     hash::{Hash, Hasher},
-    io::{Error, ErrorKind},
-    ops::{Deref, DerefMut},
     os::fd::RawFd,
-    os::unix::fs::{FileTypeExt, MetadataExt},
+    os::unix::fs::FileTypeExt,
     path::PathBuf,
-    ptr,
     sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
-    sync::{Arc, OnceLock, Weak},
+    sync::{Arc, Weak},
 };
 
 #[cfg(feature = "size_of")]
 use {
-    size_of::{Context, SizeOf, TotalSize},
+    size_of::{Context, SizeOf},
     std::mem::size_of,
 };
 
-static META_FAIL: &str = "Failed to get metadata";
-/// What an uninitialized node (one with no item) dereferences to.
-static NO_ITEM: NodeItem = NodeItem::None;
-
 // Convenience aliases
-pub(super) type MaybeNode = Option<Arc<Node>>;
-pub(super) type Children = RwLock<DirTreeHashMap<u32, MaybeNode>>;
-pub(super) type NodeIter<'a> = dyn Iterator<Item = Arc<Node>> + 'a;
+pub(super) type Children = RwLock<DirTreeHashMap<u32, Child>>;
+pub(super) type NodeIter<'a> = dyn Iterator<Item = NodeRef> + 'a;
 pub(super) type DirTreeHashMap<K, V> = HashMap<K, V, DirTreeXxh3Hasher>;
 
-#[derive(Default, Debug)]
-struct Data {
-    inode: u64,
-    /**
-    Change stamp of the last complete scan: the object's ctime as seen
-    just before that scan, in nanoseconds since the UNIX epoch by the
-    filesystem's own clock (see [ctime_stamp]); 0 = no baseline. Atomic
-    so a diff-rescan can refresh it through the shared `&Node` without
-    any locking.
-    */
-    stamp: AtomicU64,
-}
-
-impl Data {
-    fn new(inode: u64) -> Self {
-        Self {
-            inode,
-            stamp: AtomicU64::new(0),
-        }
-    }
-
-    /// The inode of the file or directory.
-    pub fn inode(&self) -> u64 {
-        self.inode
-    }
-
-    /// Change stamp of the last complete scan (0 = none).
-    fn stamp(&self) -> u64 {
-        self.stamp.load(Relaxed)
-    }
-
-    /// Record the change stamp of a complete scan.
-    fn set_stamp(&self, stamp: u64) {
-        self.stamp.store(stamp, Relaxed);
-    }
-}
-
-impl Clone for Data {
-    fn clone(&self) -> Self {
-        Data {
-            inode: self.inode,
-            stamp: AtomicU64::new(self.stamp()),
-        }
-    }
-}
-
-// An inode should be enough to uniquely identify a file or directory.
-impl Hash for Data {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inode.hash(state);
-    }
-}
-
-impl PartialEq for Data {
-    fn eq(&self, other: &Self) -> bool {
-        self.inode == other.inode
-    }
-}
-
-// manual impl since AtomicU64 is not Eq (identity is the inode anyway)
-impl Eq for Data {}
-
-impl Ord for Data {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.inode.cmp(&other.inode)
-    }
-}
-
-impl PartialOrd for Data {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+/// [FileEntry::target] of an entry that is not a symlink, or whose target is unknown.
+const NO_TARGET: u32 = u32::MAX;
 
 /**
 A ctime as a change stamp: nanoseconds since the UNIX epoch (0 for
@@ -135,150 +66,79 @@ pub(super) fn ctime_stamp(secs: i64, nsecs: i64) -> u64 {
 /* ######################################################################### */
 
 /**
-A common trait for Directory and File entries.
-
-Used to consolidate common code between [Directory] and [FileEntry] structs
-(which themselves are just type placeholders for [Entry] struct).
+A directory node of the trie, shared as `Arc<Directory>`: the tree holds
+one per directory, and so may a watcher (by its watch descriptor) or a
+caller holding a [NodeRef]. Everything mutable in it is atomic or behind
+the children map's lock, so it is changed in place through `&Directory`.
 */
-trait DirectoryEntry {
-    fn data(&self) -> &Data;
-    fn data_mut(&mut self) -> &mut Data;
-
-    fn stat(&self, path: &PathBuf) -> Option<Metadata> {
-        metadata(path).ok()
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    fn rescan(&mut self, path: &PathBuf) -> Result<Metadata, Error> {
-        let meta: Metadata = match self.stat(path) {
-            Some(m) => m,
-            // failed to get metadata, likely deleted in the meantime
-            None => {
-                let mut msg: String = String::from(META_FAIL);
-                msg.push_str(format!(": {}", path.display()).as_str());
-                error!(msg);
-                return Err(Error::new(ErrorKind::NotFound, META_FAIL));
-            }
-        };
-        if self.data().inode != meta.ino() {
-            // inode changed, file/dir was replaced and we're out of sync
-            // this case must be handled by the caller
-            error!("Inode changed: {} ({} -> {})", path.display(), self.data().inode, meta.ino());
-            return Err(Error::new(ErrorKind::AlreadyExists, "Inode changed"));
-        }
-        self.data().set_stamp(ctime_stamp(meta.ctime(), meta.ctime_nsec()));
-        Ok(meta)
-    }
-}
-
-impl AsRef<Data> for dyn DirectoryEntry {
-    fn as_ref(&self) -> &Data {
-        self.data()
-    }
-}
-
-/**
-A generic struct wrapping the `Data` struct, with an extra type parameter `T`.
-The [Entry] struct's `new()` method is responsible for creating [Directory]
-and [FileEntry] instances with the given path and metadata.
-
-Two structs [Directory] and [FileEntry] are also defined, which are used
-as type parameters for [Entry]. These structs implement the `Default` trait,
-which is needed for creating [Entry] instances without additional params.
-
-This approach allows [Directory] and [FileEntry] to share the
-implementation of [Entry] without too much code duplication.
-
-You can use the struct like this:
-```rust
-use statter::tree::{Directory, Entry, FileEntry};
-use std::fs::{metadata, Metadata};
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
-
-let root: PathBuf = PathBuf::from("/etc");
-let pwfile: PathBuf = root.join("passwd");
-let pwmeta: Metadata = metadata(&pwfile).ok().expect("Metadata should be returned");
-
-let d = Entry::<Directory>::new(&root.join("systemd"), None).unwrap();
-let f = Entry::<FileEntry>::new(&pwfile, Some(pwmeta.ino())).unwrap();
-*/
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Entry<T>(Data, T);
-
-impl<T: Default> Entry<T> {
-    #[instrument(level = "trace")]
-    pub fn new(path: &PathBuf, inode: Option<u64>) -> Result<Self, Error> {
-        let inode: u64 = match inode {
-            Some(i) => i,
-            None => match metadata(path) {
-                Ok(meta) => meta.ino(),
-                Err(_) => {
-                    let mut msg: String = String::from(META_FAIL);
-                    msg.push_str(format!(": {}", path.display()).as_str());
-                    error!(msg);
-                    return Err(Error::new(ErrorKind::NotFound, META_FAIL));
-                }
-            },
-        };
-        Ok(Self(
-            Data::new(inode),
-            Default::default(), // provides the type parameter T
-        ))
-    }
-
-    /// Infallible constructor for when the inode is already known
-    /// (e.g. from a dirent) - no stat is performed.
-    pub fn with_inode(inode: u64) -> Self {
-        Self(Data::new(inode), Default::default())
-    }
-}
-
-impl Entry<FileEntry> {
-    /// A non-directory entry with a known inode - no stat is performed.
-    pub fn leaf(inode: u64, file: FileEntry) -> Self {
-        Self(Data::new(inode), file)
-    }
-
-    /// This entry as `file` (a kind and a symlink target).
-    pub fn with_file(self, file: FileEntry) -> Self {
-        Self(self.0, file)
-    }
-}
-
-/**
-Implement trait [DirectoryEntry] for [Entry] struct.
-
-Basically, this allows us to consolidate common code under trait
-[DirectoryEntry] since then we can reference the inner [Data] struct there.
-*/
-impl<T> DirectoryEntry for Entry<T> {
-    fn data(&self) -> &Data {
-        &self.0
-    }
-
-    fn data_mut(&mut self) -> &mut Data {
-        &mut self.0
-    }
-}
-
-/// A [NodeItem] struct representing a Directory.
 #[derive(Debug)]
 pub struct Directory {
+    /// The parent directory; [None] for the root.
+    parent: Option<Weak<Directory>>,
+    /// NOTE: intermediate directories created without a stat have inode 0.
+    inode: u64,
+    /**
+    Change stamp of the last complete scan: the directory's ctime as seen
+    just before that scan, in nanoseconds since the UNIX epoch by the
+    filesystem's own clock (see [ctime_stamp]); 0 = no baseline. Atomic
+    so a diff-rescan can refresh it through the shared `&Directory`.
+    */
+    stamp: AtomicU64,
     /// Interned name index. Atomic so a rename can re-label the
-    /// directory in place through the shared `&Node`.
+    /// directory in place through the shared `&Directory`.
     name: AtomicU32,
     fd: DirFd,
     children: Children,
 }
 
 impl Directory {
-    #[instrument(level = "trace")]
-    pub fn new(name_idx: u32) -> Self {
-        Directory {
+    /// The root directory of a tree (no parent).
+    pub(super) fn new_root(name_idx: u32) -> Self {
+        Self::with_parent(None, name_idx, 0)
+    }
+
+    /// A directory named `name_idx` under `parent`.
+    pub(super) fn new(parent: &Arc<Directory>, name_idx: u32, inode: u64) -> Self {
+        Self::with_parent(Some(Arc::downgrade(parent)), name_idx, inode)
+    }
+
+    fn with_parent(parent: Option<Weak<Directory>>, name_idx: u32, inode: u64) -> Self {
+        Self {
+            parent,
+            inode,
+            stamp: AtomicU64::new(0),
             name: AtomicU32::new(name_idx),
-            ..Default::default()
+            fd: DirFd::default(),
+            children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
+    }
+
+    /// Whether this is the root of its tree.
+    #[inline]
+    pub fn is_root(&self) -> bool {
+        self.parent.is_none()
+    }
+
+    /// The parent directory; [None] for the root, or for a directory
+    /// whose parent has been removed from the tree.
+    #[inline]
+    pub fn parent(&self) -> Option<Arc<Directory>> {
+        self.parent.as_ref()?.upgrade()
+    }
+
+    #[inline]
+    pub fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    /// Change stamp of the last complete scan (see `ctime_stamp`; 0 = none).
+    pub fn scan_stamp(&self) -> u64 {
+        self.stamp.load(Relaxed)
+    }
+
+    /// Record the change stamp of a complete scan of this directory.
+    pub(super) fn set_scan_stamp(&self, stamp: u64) {
+        self.stamp.store(stamp, Relaxed);
     }
 
     /// The directory's interned name index.
@@ -291,11 +151,12 @@ impl Directory {
         unsafe { store.borrow_str(self.name_idx()) }
     }
 
+    /// Re-label the directory with a new interned name (rename support).
     pub(super) fn name_set(&self, name_idx: u32) {
         self.name.store(name_idx, Relaxed);
     }
 
-    /// Returns the [[DirFd]] for this [[Directory]] item.
+    /// Returns the [[DirFd]] for this [[Directory]].
     pub fn fd(&self) -> &DirFd {
         &self.fd
     }
@@ -320,47 +181,49 @@ impl Directory {
         self.fd.clear();
     }
 
+    /// The children map: interned name -> [Child].
     #[inline]
-    fn children(&self) -> &Children {
+    pub fn children(&self) -> &Children {
         &self.children
     }
 
     /// Whether we have a child with the given name.
     #[inline]
     pub fn has_child(&self, name_idx: &u32) -> bool {
-        self.read().contains_key(name_idx)
+        self.children.read().contains_key(name_idx)
     }
 
-    /// Add a child node to this item's children.
-    #[instrument(level = "trace", skip(self))]
+    /// Get a child by name (a clone: an `Arc` for a directory, a copy for a file).
     #[inline]
-    pub(super) fn add_child(&self, name_idx: u32, node: MaybeNode) {
-        self.write().insert(name_idx, node);
+    pub fn get_child(&self, name_idx: &u32) -> Option<Child> {
+        self.children.read().get(name_idx).cloned()
     }
 
-    /// Get a child node by name.
+    /// Get a child directory by name.
     #[inline]
-    pub fn get_child(&self, name_idx: &u32) -> MaybeNode {
-        self.read().get(name_idx).cloned()?
+    pub fn get_dir(&self, name_idx: &u32) -> Option<Arc<Directory>> {
+        match self.children.read().get(name_idx)? {
+            Child::Dir(dir) => Some(dir.clone()),
+            Child::File(_) => None,
+        }
     }
 
-    /// Remove a child node (or a file name entry) by name. The removal is
-    /// cascading (all descendants of the child node are removed as well).
-    #[instrument(level = "trace", skip(self))]
-    fn remove_child(&self, name_idx: &u32) {
-        self.write().remove(name_idx);
+    /// Add a child, replacing any previous occupant of the name.
+    #[inline]
+    pub(super) fn add_child(&self, name_idx: u32, child: Child) {
+        self.children.write().insert(name_idx, child);
     }
 
     /**
     Remove the child under `name_idx` only if it still is `child` itself
-    (pointer identity), checked and removed under one write lock hold.
+    (see [Child::same]), checked and removed under one write lock hold.
     Returns `true` if it was removed. A caller acting on an earlier look
-    at the slot thus cannot remove a node recreated there since.
+    at the slot thus cannot remove an entry recreated there since.
     */
-    fn remove_child_exact(&self, name_idx: &u32, child: &Arc<Node>) -> bool {
-        let mut ch = self.write();
+    pub(super) fn remove_child_exact(&self, name_idx: &u32, child: &Child) -> bool {
+        let mut ch = self.children.write();
         match ch.get(name_idx) {
-            Some(Some(n)) if Arc::ptr_eq(n, child) => {
+            Some(c) if c.same(child) => {
                 ch.remove(name_idx);
                 true
             }
@@ -374,39 +237,33 @@ impl Directory {
     The check-then-insert happens under a single write lock hold, so two
     threads racing to create the same child cannot overwrite each other
     (which would silently drop the loser's descendants). Returns the child
-    and whether it was created by this call (`false` for a pre-existing
-    entry, including name-only `None` entries, and when `make` declines
-    by returning `None`).
+    and whether it was created by this call.
     */
-    pub(super) fn get_or_add_child_with<F>(&self, name_idx: u32, make: F) -> (MaybeNode, bool)
+    pub(super) fn get_or_add_child_with<F>(&self, name_idx: u32, make: F) -> (Child, bool)
     where
-        F: FnOnce() -> MaybeNode,
+        F: FnOnce() -> Child,
     {
-        let mut ch = self.write();
+        let mut ch = self.children.write();
         match ch.entry(name_idx) {
             HmEntry::Occupied(e) => (e.get().clone(), false),
-            HmEntry::Vacant(v) => match make() {
-                Some(node) => (v.insert(Some(node)).clone(), true),
-                None => (None, false),
-            },
+            HmEntry::Vacant(v) => (v.insert(make()).clone(), true),
         }
     }
 
     /**
     Add a batch of children under a single write lock hold. A name that is
-    already occupied (by a full node or a name-only entry) keeps its
-    occupant; the new counterpart is dropped. Returns how many children
-    were added.
+    already occupied keeps its occupant; the new counterpart is dropped.
+    Returns how many children were added.
     */
     pub(super) fn add_children_new<I>(&self, children: I) -> u32
     where
-        I: IntoIterator<Item = (u32, MaybeNode)>,
+        I: IntoIterator<Item = (u32, Child)>,
     {
-        let mut ch = self.write();
+        let mut ch = self.children.write();
         let mut added: u32 = 0;
-        for (name_idx, node) in children {
+        for (name_idx, child) in children {
             if let HmEntry::Vacant(v) = ch.entry(name_idx) {
-                v.insert(node);
+                v.insert(child);
                 added += 1;
             }
         }
@@ -419,116 +276,59 @@ impl Directory {
     other inserters) as it grows.
     */
     pub(super) fn reserve_children(&self, total: usize) {
-        let mut ch = self.write();
+        let mut ch = self.children.write();
         let additional: usize = total.saturating_sub(ch.len());
         ch.reserve(additional);
     }
 
-    /// Add the immediate (non-recursive) memory size of the directory to [Context].
+    /**
+    The names of this directory and its ancestors up to (not including)
+    the root, root-first. [None] if the directory has been detached from
+    the tree (it, or an ancestor, removed while still referenced).
+    */
+    pub(super) fn construct_path(&self, store: &UniqueStrStore) -> Option<Vec<String>> {
+        let mut parts: Vec<String> = Vec::new();
+        if self.is_root() {
+            return Some(parts);
+        }
+        parts.push(self.name(store).to_string());
+        let mut current: Arc<Directory> = self.parent()?;
+        while !current.is_root() {
+            parts.push(current.name(store).to_string());
+            current = current.parent()?;
+        }
+        parts.reverse();
+        Some(parts)
+    }
+
+    /// Filesystem path of this directory; `/` for the root, or for a
+    /// detached directory (logged), whose path cannot be resolved.
+    pub fn path(&self, store: &UniqueStrStore) -> PathBuf {
+        let mut path: PathBuf = PathBuf::from(PATH_SEP);
+        match self.construct_path(store) {
+            Some(parts) => path.extend(parts),
+            None => error!("Cannot construct path for a detached directory: {self:?}"),
+        }
+        path
+    }
+
+    /**
+    The memory of this directory alone: the struct and its `Arc` header,
+    plus its children map, split into the slots holding files and the
+    rest. Returns `(directory bytes, file bytes)`.
+    */
     #[cfg(feature = "size_of")]
-    fn size_immediate(&self, context: &mut Context) {
-        self.name.size_of_children(context);
-        context.add(size_of::<DirFd>());
-
+    pub(super) fn size_immediate(&self) -> (usize, usize) {
         let ch = self.children.read();
-        ch.hasher().size_of_children(context);
-        if ch.capacity() > 0 {
-            let s: usize = size_of::<Option<Arc<Node>>>() + size_of::<u32>();
-            let used: usize = s * ch.len();
-            let total: usize = s * ch.capacity();
-            context
-                .add(used)
-                .add_excess(total - used)
-                .add_distinct_allocation();
-
-            ch.iter().for_each(|(key, _)| {
-                key.size_of_children(context);
-            });
-        }
+        // a hashbrown slot is the entry plus one control byte
+        let slot: usize = size_of::<(u32, Child)>() + 1;
+        let files: usize = ch.values().filter(|c| !c.is_dir()).count();
+        let own: usize = size_of::<Directory>() + 2 * size_of::<usize>();
+        (own + slot * (ch.capacity() - files), slot * files)
     }
 }
 
-impl Default for Directory {
-    fn default() -> Self {
-        Directory {
-            name: AtomicU32::new(0),
-            fd: DirFd::default(),
-            children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
-        }
-    }
-}
-
-impl Clone for Directory {
-    /// NOTE: a clone of a [Directory] has the same [RawFd], but it may become stale.
-    fn clone(&self) -> Self {
-        Directory {
-            name: AtomicU32::new(self.name_idx()),
-            fd: self.fd.clone(),
-            children: self.children.read().clone().into(),
-        }
-    }
-}
-
-impl Hash for Directory {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name_idx().hash(state);
-        let mut children: Vec<(u32, MaybeNode)> = self
-            .children
-            .read()
-            .iter()
-            .map(|(name, child)| (name.to_owned(), child.clone()))
-            .collect();
-        children.sort_by_key(|(name, _)| *name);
-        children.hash(state);
-    }
-}
-
-impl PartialEq for Directory {
-    fn eq(&self, other: &Self) -> bool {
-        if ptr::eq(self, other) {
-            // also guards against a recursive read lock on self-compare
-            return true;
-        }
-        if self.name_idx() != other.name_idx() {
-            // short circuit if the names don't match
-            return false;
-        }
-        let (a, b) = (self.children.read(), other.children.read());
-        a.len() == b.len()
-            && a.iter()
-                .all(|(name, child)| b.get(name).is_some_and(|ov: &MaybeNode| *child == *ov))
-    }
-}
-
-impl Eq for Directory {}
-
-impl Ord for Directory {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.name_idx().cmp(&other.name_idx())
-    }
-}
-
-impl PartialOrd for Directory {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-// Implement Deref for Directory to allow read access through RwLock to children.
-impl Deref for Directory {
-    type Target = Children;
-
-    fn deref(&self) -> &Self::Target {
-        &self.children
-    }
-}
-
-// Implement mutable Deref for Directory to allow write access through RwLock to children.
-impl DerefMut for Directory {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.children
-    }
-}
+/* ######################################################################### */
 
 /**
 What a non-directory entry is, from its directory entry type (`d_type`,
@@ -583,30 +383,36 @@ impl FileKind {
     }
 }
 
-/// [FileEntry::target] of an entry that is not a symlink, or whose target is unknown.
-const NO_TARGET: u32 = u32::MAX;
-
 /**
-The [Entry] type parameter of a non-directory node: its [FileKind], and
-for a symlink the interned index of its target (read with `readlink`
-when the symlink is recorded; symlinks never change in place, so a new
-target always comes with a new inode).
+A non-directory entry, stored by value in its parent's children map: its
+inode, its [FileKind], and for a symlink the interned index of its target
+(read with `readlink` when the symlink is recorded; symlinks never change
+in place, so a new target always comes with a new inode). 16 bytes, with
+room to spare.
 */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileEntry {
+    inode: u64,
     target: u32,
     kind: FileKind,
 }
 
 impl FileEntry {
     /// An entry of `kind`; `target` is the interned target of a symlink.
-    pub fn new(kind: FileKind, target: Option<u32>) -> Self {
+    pub fn new(inode: u64, kind: FileKind, target: Option<u32>) -> Self {
         Self {
+            inode,
             target: target.unwrap_or(NO_TARGET),
             kind,
         }
     }
 
+    #[inline]
+    pub fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    #[inline]
     pub fn kind(&self) -> FileKind {
         self.kind
     }
@@ -617,576 +423,300 @@ impl FileEntry {
     }
 }
 
-// a regular file
-impl Default for FileEntry {
-    fn default() -> Self {
-        Self::new(FileKind::File, None)
-    }
-}
-
 /* ######################################################################### */
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
-pub enum NodeType {
-    Root,
-    Directory,
-    File,
-    /// Signifies an entry with a name, but for which no Node should be created.
-    Name,
-    #[default]
-    Uninitialized,
+/// An entry of a directory's children map.
+#[derive(Debug, Clone)]
+pub enum Child {
+    Dir(Arc<Directory>),
+    File(FileEntry),
 }
 
-impl NodeType {
-    /**
-    Returns `true` if the node type is [[Directory]].
-
-    [[Directory]]: NodeType::Directory
-    */
-    #[must_use]
-    #[inline]
-    pub fn is_dir(&self) -> bool {
-        matches!(self, Self::Directory)
-    }
-
-    /**
-    Returns `true` if the node type is [[File]].
-
-    [File]: NodeType::File
-    */
-    #[must_use]
-    #[inline]
-    pub fn is_file(&self) -> bool {
-        matches!(self, Self::File)
-    }
-
-    /**
-    Returns `true` if the node type is [[Uninitialized]].
-
-    [Uninitialized]: NodeType::Uninitialized
-    */
-    #[must_use]
-    #[inline]
-    pub fn is_uninit(&self) -> bool {
-        matches!(self, Self::Uninitialized)
-    }
-
-    /// Returns `true` if the node contains a `Data` struct.
-    #[inline]
-    pub fn has_data(&self) -> bool {
-        matches!(self, Self::Directory | Self::File)
-    }
-}
-
-/* ######################################################################### */
-
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
-pub enum NodeItem {
-    Root(Directory),
-    Dir(Entry<Directory>),
-    File(Entry<FileEntry>),
-    #[default]
-    None,
-}
-
-impl NodeItem {
-    /**
-    Returns `true` if the node item is [[Directory]].
-
-    [[Directory]]: NodeItem::Dir
-    */
-    #[must_use]
+impl Child {
     #[inline]
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Dir(_))
     }
 
-    /**
-    Returns `true` if the node item is [[FileEntry]].
-
-    [[FileEntry]]: NodeItem::File
-    */
-    #[must_use]
     #[inline]
-    pub fn is_file(&self) -> bool {
-        matches!(self, Self::File(_))
+    pub fn as_dir(&self) -> Option<&Arc<Directory>> {
+        match self {
+            Self::Dir(dir) => Some(dir),
+            Self::File(_) => None,
+        }
     }
 
-    /**
-    Returns `true` if the node item is [`None`].
-
-    [`None`]: NodeItem::None
-    */
-    #[must_use]
     #[inline]
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
-
-    /// Set the name of the inner [[Directory]] if the node item is [NodeItem::Dir].
-    pub(super) fn set_dir_name(&self, name_idx: u32) {
-        if let Self::Dir(v) = self {
-            v.1.name_set(name_idx);
-        }
-    }
-
-    /// Clear the file descriptor of the inner [[Directory]]
-    /// if the node item is [NodeItem::Dir].
-    fn clear_fd(&mut self) {
-        if let Self::Dir(v) = self {
-            v.1.fd_clear();
-        }
-    }
-
-    /// Returns a ref to the inner [[Directory]] if the node item is
-    /// [NodeItem::Dir] or [NodeItem::Root].
-    pub fn as_dir(&self) -> Option<&Directory> {
-        if self.is_file() {
-            // short circuit since files are expected to outnumber
-            // directories by a large margin and we can optimize for that
-            return None;
-        }
-
-        // Root and Dir store the [Directory] struct differently
-        // so we must handle them separately
-        if let Self::Dir(v) = self {
-            Some(&v.1)
-        } else if let Self::Root(v) = self {
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    /// Returns a reference to the inner [[FileEntry]] if the node item is [NodeItem::File].
     pub fn as_file(&self) -> Option<&FileEntry> {
-        if let Self::File(v) = self {
-            Some(&v.1)
-        } else {
-            None
+        match self {
+            Self::Dir(_) => None,
+            Self::File(file) => Some(file),
         }
     }
 
-    /// Returns a reference to item's [[Data]] if the node item is
-    /// [NodeItem::Dir] or [NodeItem::File].
-    fn data(&self) -> Option<&Data> {
-        Some(match self {
-            Self::Dir(d) => d.data(),
-            Self::File(f) => f.data(),
-            _ => return None,
-        })
-    }
-}
-
-// Implement `From` for converting [Directory] into `NodeItem`.
-impl From<Entry<Directory>> for NodeItem {
-    fn from(v: Entry<Directory>) -> Self {
-        Self::Dir(v)
-    }
-}
-
-// Implement `From` for converting [File] into `NodeItem`.
-impl From<Entry<FileEntry>> for NodeItem {
-    fn from(v: Entry<FileEntry>) -> Self {
-        Self::File(v)
-    }
-}
-
-/* ######################################################################### */
-
-/// Node in the trie structure for storing paths and items, respectively.
-#[derive(Debug, Clone)]
-pub struct Node {
-    pub node_t: NodeType,
-    pub(super) item: OnceLock<NodeItem>,
-    parent: Weak<Node>,
-}
-
-impl Node {
-    /// Returns a new node with the given item.
-    /// NOTE: children are initialized only for containers (directories and root).
-    #[instrument(level = "debug")]
-    pub fn new(item: NodeItem, parent: MaybeNode) -> Self {
-        let node_t: NodeType = match item {
-            NodeItem::Root(_) => NodeType::Root,
-            NodeItem::Dir(_) => NodeType::Directory,
-            NodeItem::File(_) => NodeType::File,
-            NodeItem::None => NodeType::Uninitialized,
-        };
-        Self {
-            item: match node_t {
-                NodeType::Uninitialized => OnceLock::new(),
-                _ => item.into(),
-            },
-            node_t,
-            parent: parent.map_or_else(Weak::new, |p: Arc<Node>| make_weak_ref(p)),
-        }
-    }
-
-    /// The node's item; [NodeItem::None] for an uninitialized node.
+    /// NOTE: intermediate directories created without a stat have inode 0.
     #[inline]
-    pub fn item(&self) -> &NodeItem {
-        self.item.get().unwrap_or(&NO_ITEM)
+    pub fn inode(&self) -> u64 {
+        match self {
+            Self::Dir(dir) => dir.inode(),
+            Self::File(file) => file.inode(),
+        }
     }
 
-    /// Returns `true` if the node is traversable (`children` != `None`).
+    /// The [FileKind] of a file; [None] for a directory.
     #[inline]
-    pub fn is_traversable(&self) -> bool {
-        matches!(self.node_t, NodeType::Directory | NodeType::Root)
-    }
-
-    /// Resolve the weak reference to this node's parent node.
-    #[inline]
-    pub(super) fn parent(&self) -> MaybeNode {
-        match self.parent.upgrade() {
-            Some(parent) => parent.clone().into(),
-            None => None,
-        }
-    }
-
-    /**
-    Construct this node's full path by walking the tree upwards to Root.
-
-    Directories (own and ancestor) resolve their names from the interned
-    index stored in their [[Directory]] item, so only a file leaf needs a
-    scan of its parent's children map - path construction is O(depth) for
-    directories instead of O(depth x siblings).
-
-    A detached file node (removed from the tree, or with an ancestor
-    removed mid-walk) cannot be reconstructed; an empty Vec is returned
-    in that case instead of panicking.
-    */
-    pub(super) fn construct_path(&self, store: &UniqueStrStore) -> Vec<String> {
-        if self.node_t == NodeType::Root {
-            return vec![PATH_SEP.to_string()];
-        }
-        // own name: dirs know theirs, files scan the parent's children map
-        let mut parts: Vec<String> = Vec::new();
-        match self.as_dir() {
-            Some(dir) => parts.push(dir.name(store).to_string()),
-            None => match self.parent().and_then(|p| p.get_child_byref(self)) {
-                Some((name_idx, _)) => {
-                    parts.push(unsafe { store.borrow_str(name_idx) }.to_string())
-                }
-                None => {
-                    error!("Cannot construct path for a detached node: {self:?}");
-                    return parts;
-                }
-            },
-        }
-
-        // ancestors are all directories; walk up to Root, then flip
-        let mut current: Arc<Node> = match self.parent() {
-            Some(p) => p,
-            None => {
-                error!("Cannot construct path for a detached node: {self:?}");
-                parts.clear();
-                return parts;
-            }
-        };
-        while current.node_t == NodeType::Directory {
-            match current.as_dir() {
-                Some(dir) => parts.push(dir.name(store).to_string()),
-                None => break, // unreachable for a Directory node
-            }
-            current = match current.parent() {
-                Some(p) => p,
-                // an ancestor was detached while we were walking up
-                None => {
-                    error!("Detached ancestor while constructing path: {current:?}");
-                    parts.clear();
-                    return parts;
-                }
-            };
-        }
-        parts.reverse();
-        parts
-    }
-
-    /// Filesystem path of this node as a [PathBuf].
-    pub fn path(&self, store: &UniqueStrStore) -> PathBuf {
-        let mut path: PathBuf = PathBuf::from(PATH_SEP.to_string());
-        for part in self.construct_path(store) {
-            path.push(part);
-        }
-        path
-    }
-
-    /**
-    For directories, the name is retrieved from the [[Directory]] struct.
-
-    For files, the name is retrieved from parent node's `children` HashMap.
-
-    Root node always returns `/`.
-    */
-    pub fn name(&self, store: &UniqueStrStore) -> Result<String, Error> {
-        if self.node_t == NodeType::Directory
-            && let Some(dir) = self.as_dir()
-        {
-            return Ok(dir.name(store).to_string());
-        }
-        match self.parent() {
-            Some(parent) => match parent.get_child_byref(self) {
-                Some((name_idx, _)) => Ok(unsafe { store.borrow_str(name_idx) }.to_string()),
-                // removed from its parent while still referenced
-                None => {
-                    let msg: &str = "Detached node";
-                    error!(node = ?self, msg);
-                    Err(Error::new(ErrorKind::NotFound, msg))
-                }
-            },
-
-            None => {
-                if self.node_t == NodeType::Root {
-                    return Ok(PATH_SEP.to_string());
-                }
-                let msg: &str = "Stale parent reference";
-                error!(node = ?self, msg);
-                Err(Error::new(ErrorKind::NotFound, msg))
-            }
-        }
-    }
-
-    /// The [FileKind] of a non-directory node.
     pub fn file_kind(&self) -> Option<FileKind> {
         self.as_file().map(|f: &FileEntry| f.kind())
     }
 
-    /// Returns the [[DirFd]] for this node if it's a directory.
-    pub fn dirfd(&self) -> Option<&DirFd> {
-        self.as_dir().map(|dir: &Directory| dir.fd())
-    }
-
-    /// The inode of the node's file or directory, if it carries `Data`.
-    /// NOTE: intermediate nodes created without a stat report inode 0.
-    pub fn inode(&self) -> Option<u64> {
-        self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.inode())
-    }
-
-    /// Change stamp of the node's last complete scan (see `ctime_stamp()`;
-    /// 0 = no baseline), if the node carries `Data`.
-    pub fn scan_stamp(&self) -> Option<u64> {
-        self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.stamp())
-    }
-
-    /// Record the change stamp of a complete scan of this node.
-    pub(super) fn set_scan_stamp(&self, stamp: u64) {
-        if let Some(d) = self.item.get().and_then(|i: &NodeItem| i.data()) {
-            d.set_stamp(stamp);
-        }
-    }
-
-    /// Re-label a directory node with a new interned name (rename support).
-    pub(super) fn set_dir_name(&self, name_idx: u32) {
-        if let Some(item) = self.item.get() {
-            item.set_dir_name(name_idx);
-        }
-    }
-
-    #[inline]
-    pub fn children(&self) -> Option<&Children> {
-        match self.item.get() {
-            Some(item) => item.as_dir()?.children().into(),
-            // catch uninitialized nodes
-            None => None,
-        }
-    }
-
-    /// Whether we have a child with the given name.
-    #[inline]
-    pub fn has_child(&self, name_idx: &u32) -> bool {
-        self.as_dir()
-            .is_some_and(|dir: &Directory| dir.has_child(name_idx))
-    }
-
-    /// Add a child [[Node]] to the current node's children.
-    #[inline]
-    pub(super) fn add_child(&self, name_idx: u32, node: Arc<Node>) {
-        if let Some(dir) = self.as_dir() {
-            dir.add_child(name_idx, Some(node));
-        }
-    }
-
-    /// Get a child [[Node]] by name.
-    #[inline]
-    pub fn get_child(&self, name_idx: &u32) -> MaybeNode {
-        self.as_dir()
-            .and_then(|dir: &Directory| dir.get_child(name_idx))
-    }
-
     /**
-    Remove a child [[Node]] by name.
-
-    NOTE: due to the way the tree is structured, as soon as we drop a child,
-    all its descendants are also dropped in a cascading manner. This happens
-    because each child is stored in an `Arc` and most likely only the parent
-    has a reference to it. When the last reference to a node is dropped,
-    the node is dropped as well due to refcounting.
+    Whether `self` is the very entry `other` is: the same directory node
+    (by identity), or an equal file entry. Guards "remove it if it is
+    still there" against a slot emptied or re-filled since it was read.
     */
-    pub(super) fn remove_child(&self, name_idx: &u32) {
-        if let Some(dir) = self.as_dir() {
-            dir.remove_child(name_idx);
+    pub(super) fn same(&self, other: &Child) -> bool {
+        match (self, other) {
+            (Self::Dir(a), Self::Dir(b)) => Arc::ptr_eq(a, b),
+            (Self::File(a), Self::File(b)) => a == b,
+            _ => false,
         }
-    }
-
-    /// Remove the child under `name_idx` only if it is `child` itself.
-    /// See [Directory::remove_child_exact].
-    pub(super) fn remove_child_exact(&self, name_idx: &u32, child: &Arc<Node>) -> bool {
-        self.as_dir()
-            .is_some_and(|dir: &Directory| dir.remove_child_exact(name_idx, child))
-    }
-
-    /**
-    Get the name of a child [[Node]] and its `Arc<Node>` ptr from a reference
-    to the child node itself. The main use case is for a child node to find
-    its own name and reference in the parent node's `children` HashMap.
-
-    The lookup is by pointer identity, not structural equality: equality
-    would deep-compare directory subtrees and cannot distinguish hardlinked
-    files (their [Data] compares equal via the shared inode).
-    */
-    #[inline]
-    pub(super) fn get_child_byref(&self, child: &Node) -> Option<(u32, Arc<Node>)> {
-        trace_span!("get_child_byref", ?child).in_scope(|| {
-            self.children()?
-                .read()
-                .iter()
-                .find_map(|(name, c)| match c {
-                    Some(n) if ptr::eq(Arc::as_ptr(n), child) => Some((*name, n.clone())),
-                    _ => None,
-                })
-        })
-    }
-
-    /// Get the immediate (non-recursive) memory size of this node.
-    #[cfg(feature = "size_of")]
-    pub(super) fn size_immediate(&self) -> TotalSize {
-        let mut context: Context = Context::new();
-        context.add(size_of::<NodeType>());
-        context.add(size_of::<Weak<Node>>());
-        context.add(size_of::<OnceLock<NodeItem>>());
-        if self.node_t.has_data() {
-            context.add(size_of::<Data>());
-        }
-        if self.node_t == NodeType::Directory
-            && let Some(dir) = self.as_dir()
-        {
-            dir.size_immediate(&mut context);
-        }
-        context.total_size()
-    }
-}
-
-impl Default for Node {
-    fn default() -> Self {
-        Node {
-            node_t: NodeType::Uninitialized,
-            item: OnceLock::new(),
-            parent: Weak::new(),
-        }
-    }
-}
-
-// Implement Deref for Node to allow access to NodeItem methods.
-impl Deref for Node {
-    type Target = NodeItem;
-
-    fn deref(&self) -> &Self::Target {
-        self.item()
-    }
-}
-
-// For a [FileEntry] or [Directory], the hash is based on the inode.
-// Data-less nodes (Root, Uninitialized) hash their item instead; NOTE:
-// `self.hash(state)` here would recurse into this same impl infinitely.
-impl Hash for Node {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        if self.node_t.has_data()
-            && let Some(data) = self.data()
-        {
-            data.hash(state);
-        } else {
-            self.item.get().hash(state);
-        }
-        self.node_t.hash(state);
-    }
-}
-
-// Implement <Node> == <Node> comparisons
-impl PartialEq for Node {
-    fn eq(&self, other: &Self) -> bool {
-        // we could use plain `self` here due to impl Deref, but let's be explicit
-        self.item == other.item
-    }
-}
-
-// Implement <Node> == Option<Arc<Node>> comparisons
-impl PartialEq<MaybeNode> for Node {
-    fn eq(&self, other: &Option<Arc<Self>>) -> bool {
-        match other {
-            Some(other) => self.item == other.item,
-            None => false,
-        }
-    }
-}
-
-// Implement Option<Arc<Node>> == <Node> comparisons
-impl PartialEq<Node> for MaybeNode {
-    fn eq(&self, other: &Node) -> bool {
-        match self {
-            Some(node) => node.item == other.item,
-            None => false,
-        }
-    }
-}
-
-// Implement <Node> == <NodeItem> comparisons
-impl PartialEq<NodeItem> for Node {
-    fn eq(&self, other: &NodeItem) -> bool {
-        self.item() == other
-    }
-}
-
-// Implement <NodeItem> == <Node> comparisons
-impl PartialEq<Node> for NodeItem {
-    fn eq(&self, other: &Node) -> bool {
-        self == other.item()
     }
 }
 
 /* ######################################################################### */
 
+/**
+An owned reference to an entry of the tree, from a lookup or an
+iterator. A directory is its shared node; a file is a snapshot of its
+entry, with its parent directory and its interned name. Holds no lock.
+*/
+#[derive(Debug, Clone)]
+pub enum NodeRef {
+    Dir(Arc<Directory>),
+    File {
+        parent: Arc<Directory>,
+        name: u32,
+        file: FileEntry,
+    },
+}
+
+impl NodeRef {
+    #[inline]
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Self::Dir(_))
+    }
+
+    #[inline]
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File { .. })
+    }
+
+    #[inline]
+    pub fn as_dir(&self) -> Option<&Arc<Directory>> {
+        match self {
+            Self::Dir(dir) => Some(dir),
+            Self::File { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_file(&self) -> Option<&FileEntry> {
+        match self {
+            Self::Dir(_) => None,
+            Self::File { file, .. } => Some(file),
+        }
+    }
+
+    /// NOTE: intermediate directories created without a stat have inode 0.
+    #[inline]
+    pub fn inode(&self) -> u64 {
+        match self {
+            Self::Dir(dir) => dir.inode(),
+            Self::File { file, .. } => file.inode(),
+        }
+    }
+
+    /// The [FileKind] of a file; [None] for a directory.
+    #[inline]
+    pub fn file_kind(&self) -> Option<FileKind> {
+        self.as_file().map(|f: &FileEntry| f.kind())
+    }
+
+    /// The interned name of the entry.
+    #[inline]
+    pub fn name_idx(&self) -> u32 {
+        match self {
+            Self::Dir(dir) => dir.name_idx(),
+            Self::File { name, .. } => *name,
+        }
+    }
+
+    /// The parent directory; [None] for the root (or a detached directory).
+    pub fn parent(&self) -> Option<Arc<Directory>> {
+        match self {
+            Self::Dir(dir) => dir.parent(),
+            Self::File { parent, .. } => Some(parent.clone()),
+        }
+    }
+
+    /// Filesystem path of the entry (see [Directory::path]).
+    pub fn path(&self, store: &UniqueStrStore) -> PathBuf {
+        self.view().path(store)
+    }
+
+    /// The entry as it is stored in its parent's map.
+    pub(super) fn to_child(&self) -> Child {
+        match self {
+            Self::Dir(dir) => Child::Dir(dir.clone()),
+            Self::File { file, .. } => Child::File(*file),
+        }
+    }
+
+    /// The borrowed form of this reference.
+    pub fn view(&self) -> NodeView<'_> {
+        match self {
+            Self::Dir(dir) => NodeView::Dir(dir),
+            Self::File { parent, name, file } => NodeView::File { parent, name: *name, file },
+        }
+    }
+}
+
+// identity: the same directory node, or the same file entry under the same name and parent
+impl PartialEq for NodeRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Dir(a), Self::Dir(b)) => Arc::ptr_eq(a, b),
+            (
+                Self::File { parent: pa, name: na, file: fa },
+                Self::File { parent: pb, name: nb, file: fb },
+            ) => Arc::ptr_eq(pa, pb) && na == nb && fa == fb,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for NodeRef {}
+
+// consistent with PartialEq: hashes the identity, not the subtree
+impl Hash for NodeRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Dir(dir) => Arc::as_ptr(dir).hash(state),
+            Self::File { parent, name, file } => {
+                Arc::as_ptr(parent).hash(state);
+                name.hash(state);
+                file.hash(state);
+            }
+        }
+    }
+}
+
+/**
+A borrowed reference to an entry of the tree, as a traversal visits it:
+no reference counting and no copies. A traversal holds the read lock of
+the directory whose children it is visiting while calling back, so the
+callback must not modify that directory (it would deadlock).
+*/
+#[derive(Debug, Clone, Copy)]
+pub enum NodeView<'a> {
+    Dir(&'a Arc<Directory>),
+    File {
+        parent: &'a Arc<Directory>,
+        name: u32,
+        file: &'a FileEntry,
+    },
+}
+
+impl NodeView<'_> {
+    #[inline]
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Self::Dir(_))
+    }
+
+    #[inline]
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File { .. })
+    }
+
+    #[inline]
+    pub fn as_dir(&self) -> Option<&Arc<Directory>> {
+        match self {
+            Self::Dir(dir) => Some(dir),
+            Self::File { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_file(&self) -> Option<&FileEntry> {
+        match self {
+            Self::Dir(_) => None,
+            Self::File { file, .. } => Some(file),
+        }
+    }
+
+    /// The [FileKind] of a file; [None] for a directory.
+    #[inline]
+    pub fn file_kind(&self) -> Option<FileKind> {
+        self.as_file().map(|f: &FileEntry| f.kind())
+    }
+
+    /// Filesystem path of the entry (see [Directory::path]).
+    pub fn path(&self, store: &UniqueStrStore) -> PathBuf {
+        match self {
+            Self::Dir(dir) => dir.path(store),
+            Self::File { parent, name, .. } => {
+                parent.path(store).join(unsafe { store.borrow_str(*name) })
+            }
+        }
+    }
+
+    /// The owned form of this reference.
+    pub fn to_ref(&self) -> NodeRef {
+        match *self {
+            Self::Dir(dir) => NodeRef::Dir(dir.clone()),
+            Self::File { parent, name, file } => {
+                NodeRef::File { parent: parent.clone(), name, file: *file }
+            }
+        }
+    }
+}
+
+/* ######################################################################### */
+
+// a parentless directory: what a defaulted tree starts from
+impl Default for Directory {
+    fn default() -> Self {
+        Self::new_root(0)
+    }
+}
+
 #[cfg(feature = "size_of")]
 impl SizeOf for Directory {
     fn size_of_children(&self, context: &mut Context) {
-        self.name.size_of_children(context);
         self.children.read().size_of_children(context);
     }
 }
 
 #[cfg(feature = "size_of")]
-impl SizeOf for Entry<Directory> {
+impl SizeOf for Child {
     fn size_of_children(&self, context: &mut Context) {
-        self.1.size_of_children(context);
-    }
-}
-
-#[cfg(feature = "size_of")]
-impl SizeOf for NodeItem {
-    fn size_of_children(&self, context: &mut Context) {
-        match self {
-            NodeItem::Root(r) => r.size_of_children(context),
-            NodeItem::Dir(d) => d.size_of_children(context),
-            _ => {}
+        if let Self::Dir(dir) = self {
+            dir.size_of_children(context);
         }
     }
 }
 
 #[cfg(feature = "size_of")]
-impl SizeOf for Node {
+impl SizeOf for FileEntry {
+    fn size_of_children(&self, _context: &mut Context) {}
+}
+
+#[cfg(feature = "size_of")]
+impl SizeOf for NodeRef {
     fn size_of_children(&self, context: &mut Context) {
-        if let Some(item) = self.item.get() {
-            item.size_of_children(context);
-        };
+        match self {
+            Self::Dir(dir) => dir.size_of_children(context),
+            Self::File { parent, .. } => parent.size_of_children(context),
+        }
     }
 }

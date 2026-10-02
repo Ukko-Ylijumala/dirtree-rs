@@ -2,21 +2,22 @@
 
 use super::conf::NodeCounts;
 use super::dirtree::DirTree;
-use super::node::Node;
-use std::{sync::Arc, time::Instant};
+use super::node::NodeView;
+use std::time::Instant;
 use tracing::{Level, debug, info};
 
 /// Print the full contents of a [[DirTree]] recursively, using [tracing]'s
 /// facilities. This is a (very verbose) debugging function.
 pub fn tree_print_debug(tree: &DirTree) {
     eprintln!("\n{tree:?}\n");
-    tree.traverse(|node: &Arc<Node>| {
-        if node.node_t.has_data() {
-            if tracing::level_enabled!(Level::DEBUG) {
-                debug!("{:?}", node.construct_path(tree.strings()));
-            } else {
-                info!("{}", tree.fs_path(node).unwrap().display());
-            }
+    tree.traverse(|node: NodeView<'_>| {
+        if node.as_dir().is_some_and(|dir| dir.is_root()) {
+            return;
+        }
+        if tracing::level_enabled!(Level::DEBUG) {
+            debug!("{:?}", node.path(tree.strings()));
+        } else {
+            info!("{}", node.path(tree.strings()).display());
         }
     });
 }
@@ -48,7 +49,7 @@ pub fn tree_validate_counts(tree: &DirTree) {
     /* ------------------------- */
 
     let start: Instant = Instant::now();
-    assert_eq!(tree.count_from(tree.root()), want, "count_from() != master counts");
+    assert_eq!(tree.count_from(&tree.root()), want, "count_from() != master counts");
     eprintln!(" --> count_from() = {:?}", start.elapsed());
 
     let start: Instant = Instant::now();

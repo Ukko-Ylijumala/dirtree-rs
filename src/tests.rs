@@ -12,6 +12,7 @@ use std::{
     collections::HashSet,
     collections::hash_map::DefaultHasher,
     ffi::CString,
+    mem::size_of,
     fs::{remove_file, rename, write},
     hash::{Hash, Hasher},
     os::unix::{ffi::OsStrExt, fs::symlink},
@@ -74,7 +75,7 @@ fn test_create_empty_tree() {
     let tree: DirTree = DirTree::new(FileMode::default(), Filters::default());
     let (nodes, dirs, files, depth) = counts(&tree);
 
-    assert_eq!(tree.root.node_t, NodeType::Root);
+    assert!(tree.root.is_root());
     assert_eq!(tree.conf.from, OnceLock::default());
     assert_eq!(tree.state(), TreeState::Uninitialized);
     assert!(tree.is_uninit(), "Tree is not uninitialized");
@@ -164,11 +165,11 @@ fn test_tree_traversals() {
     let p_iter: HashSet<String> = tree.iter_paths().collect();
     let p_walk: HashSet<String> = tree
         .nodes()
-        .filter_map(|n: Arc<Node>| tree.fs_path(&n))
+        .filter_map(|n: NodeRef| tree.fs_path(&n))
         .map(|p: PathBuf| p.to_string_lossy().to_string())
         .collect();
     let mut p_trav: HashSet<String> = HashSet::new();
-    tree.traverse(|n: &Arc<Node>| {
+    tree.traverse(|n: NodeView<'_>| {
         p_trav.insert(n.path(&tree.strings).to_string_lossy().to_string());
     });
 
@@ -197,7 +198,7 @@ fn test_tree_subcounts() {
     assert_eq!(l2_dirs.len(), exp_l2_num as usize, "L2 dirs num mismatch (test error)");
 
     for p in l1_dirs.iter() {
-        let node: Arc<Node> = tree.get_node(p).expect("get_node() should return a node");
+        let node: Arc<Directory> = tree.get_dir(p).expect("get_dir() should return a node");
         let (l1_n, l1_d, l1_f) = validate_counts_below_node(&tree, node);
 
         let dirs_exp: u64 = TEST_NUM[1] + 1; // +1 for the dir itself
@@ -210,7 +211,7 @@ fn test_tree_subcounts() {
     }
 
     for p in l2_dirs.iter() {
-        let node: Arc<Node> = tree.get_node(p).expect("get_node() should return a node");
+        let node: Arc<Directory> = tree.get_dir(p).expect("get_dir() should return a node");
         let (l2_n, l2_d, l2_f) = validate_counts_below_node(&tree, node);
 
         assert_eq!(l2_d, 1, "L2 dir count != expected");
@@ -234,9 +235,9 @@ fn test_tree_removals() {
     }
 
     let (l2_n, l2_d, l2_f) =
-        validate_counts_below_node(&tree, tree.get_node(&l2_p).expect("L2 node not found"));
+        validate_counts_below_node(&tree, tree.get_dir(&l2_p).expect("L2 node not found"));
     let (l1_n, l1_d, l1_f) =
-        validate_counts_below_node(&tree, tree.get_node(&l1_p).expect("L1 node not found"));
+        validate_counts_below_node(&tree, tree.get_dir(&l1_p).expect("L1 node not found"));
 
     match tree.remove(&file) {
         Ok(_) => {
@@ -287,9 +288,9 @@ fn test_tree_removals() {
 fn test_node_hash_no_recursion() {
     setup_tests();
     let tree: DirTree = DirTree::new(FileMode::default(), Filters::default());
-    // Hashing a data-less node (Root) used to recurse infinitely.
+    // Hashing the root (as Node, it used to recurse infinitely) hashes its identity only.
     let mut hasher: DefaultHasher = DefaultHasher::new();
-    tree.root().hash(&mut hasher);
+    NodeRef::Dir(tree.root()).hash(&mut hasher);
     let _ = hasher.finish();
 }
 
@@ -307,7 +308,7 @@ fn test_hardlink_names() {
     */
     for name in ["file-0.bin", "hardlink-0", "hardlink-1"] {
         let p: String = format!("{dir}/{name}");
-        let node: Arc<Node> = tree.get_node(&p).expect("hardlinked node should exist");
+        let node: NodeRef = tree.get_node(&p).expect("hardlinked node should exist");
         assert_eq!(tree.node_name(&node), name, "hardlink resolved to wrong sibling");
     }
 }
@@ -356,7 +357,7 @@ fn test_concurrent_same_path_insert() {
     rayon::scope(|s| {
         for _ in 0..8 {
             let (t, p) = (&tree, &target);
-            s.spawn(move |_| t.insert(p, NodeType::Directory, None));
+            s.spawn(move |_| t.insert_dir(p, None));
         }
     });
     assert_eq!(tree.conf().nodes(), n0 + 3, "duplicate node creation in racing inserts");
@@ -439,7 +440,7 @@ fn recorded(e: &PlannedEntry, mode: FileMode) -> bool {
 /// Check that the tree holds a planned entry as recorded: its kind, and a symlink's target.
 fn check_recorded(tree: &DirTree, e: &PlannedEntry, ctx: &str) {
     let p = e.path.to_string_lossy();
-    let node: Arc<Node> = tree.get_node(&p).unwrap_or_else(|| panic!("{ctx}: {p} missing"));
+    let node: NodeRef = tree.get_node(&p).unwrap_or_else(|| panic!("{ctx}: {p} missing"));
     let EntryKind::Special(kind) = e.kind else {
         return;
     };
@@ -516,7 +517,7 @@ fn test_tree_deep_walk() {
     let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
     assert_eq!(tree.conf().errors(), 0, "deep walk reported errors");
     assert!(tree.contains(&leaf.to_string_lossy()), "deepest file missing");
-    let node: Arc<Node> = tree.get_node(&link.to_string_lossy()).expect("symlink missing");
+    let node: NodeRef = tree.get_node(&link.to_string_lossy()).expect("symlink missing");
     assert_eq!(node.file_kind(), Some(FileKind::Symlink));
     let root_depth: u64 = (dir.split(PATH_SEP).count() - 1) as u64;
     assert_eq!(tree.conf().dirs() as u64, root_depth + depth as u64, "dirs miscounted");
@@ -648,14 +649,14 @@ fn test_tree_watcher_renames() {
     wait_for(|| !tree.contains(&format!("{dir}/sub/a.bin")), "old file name should vanish");
 
     // same-dir directory rename: subtree and node identity must survive
-    let d1: Arc<Node> = tree.get_node(&format!("{dir}/dir1")).expect("dir1 missing");
+    let d1: Arc<Directory> = tree.get_dir(&format!("{dir}/dir1")).expect("dir1 missing");
     std::fs::rename(temp.path().join("dir1"), temp.path().join("dir2")).unwrap();
     wait_for(
         || tree.contains(&format!("{dir}/dir2/inner/d.bin")),
         "renamed dir's contents should be reachable under the new name",
     );
     assert!(!tree.contains(&format!("{dir}/dir1")), "old dir name should vanish");
-    let d2: Arc<Node> = tree.get_node(&format!("{dir}/dir2")).expect("dir2 missing");
+    let d2: Arc<Directory> = tree.get_dir(&format!("{dir}/dir2")).expect("dir2 missing");
     assert!(Arc::ptr_eq(&d1, &d2), "in-place rename should preserve node identity");
 
     // the renamed subtree's watches must still be live
@@ -706,26 +707,27 @@ fn test_tree_no_root() {
 }
 
 #[test]
-fn test_node_uninitialized_item() {
-    // an item-less node reads as NodeItem::None instead of panicking
-    let node: Node = Node::default();
-    assert!(node.item().is_none());
-    assert!(node.as_dir().is_none() && node.as_file().is_none());
+fn test_node_sizes() {
+    // a file is a 16-byte value in a 24-byte map slot: guard against regrowth
+    assert_eq!(size_of::<FileEntry>(), 16, "FileEntry");
+    assert_eq!(size_of::<Child>(), 16, "Child (FileKind's spare values tag the Dir variant)");
+    assert_eq!(size_of::<(u32, Child)>(), 24, "children map slot");
 }
 
 #[test]
-fn test_node_name_detached() {
+fn test_node_ref_snapshot() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
     TreeSpec::new().root_files(1).create(temp.path()).unwrap();
     let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
 
     let p: String = format!("{dir}/file-0.bin");
-    let node: Arc<Node> = tree.get_node(&p).expect("file node should exist");
+    let node: NodeRef = tree.get_node(&p).expect("file node should exist");
     tree.remove(&p).unwrap();
-    // still referenced, but gone from its parent's children map
-    assert!(node.name(tree.strings()).is_err());
-    assert_eq!(tree.node_name(&node), "<unnamed>");
+    // gone from the tree, but the snapshot still knows what it was
+    assert!(!tree.contains(&p));
+    assert_eq!(tree.node_name(&node), "file-0.bin");
+    assert_eq!(node.path(tree.strings()), PathBuf::from(&p));
 }
 
 #[test]
@@ -1369,7 +1371,7 @@ fn create_test_tree(recursive: bool) -> (&'static str, DirTree, u8) {
         .from_path(path)
         .with_recursive(recursive);
     tree.walk().unwrap();
-    assert_eq!(tree.root.node_t, NodeType::Root);
+    assert!(tree.root.is_root());
     assert_eq!(*tree.from().unwrap(), PathBuf::from(path));
     assert_eq!(tree.state(), TreeState::Ready);
     assert!(tree.is_ready(), "Tree is not ready");
@@ -1398,8 +1400,8 @@ fn check_nodes_dirs_files(nodes: u32, root_depth: u8, dirs: u32, files: u32, dep
 }
 
 /// Validate and return the counts of nodes, dirs, and files below a given node.
-fn validate_counts_below_node(tree: &DirTree, node: Arc<Node>) -> (u64, u64, u64) {
-    let c: NodeCounts = tree.count_from(node.clone());
+fn validate_counts_below_node(tree: &DirTree, node: Arc<Directory>) -> (u64, u64, u64) {
+    let c: NodeCounts = tree.count_from(&node);
     let i: NodeCounts = tree.iter_count_from(node.clone());
 
     assert_eq!(c.nodes, c.dirs + c.files + c.specials, "count_from() node count != dirs+files+specials");

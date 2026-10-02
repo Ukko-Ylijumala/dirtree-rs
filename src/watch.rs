@@ -7,7 +7,7 @@ Inotify-based tree following for resident mode (Linux-only).
 and applies filesystem events to the tree as they happen: created entries
 are inserted (new directories are watched first, then scanned recursively),
 deleted or moved-away entries are removed along with their subtrees. The
-watch map keys kernel watch descriptors to `Weak<Node>`, so a removed
+watch map keys kernel watch descriptors to `Weak<Directory>`, so a removed
 subtree self-heals: an event for a dead node drops the stale watch on
 sight instead of requiring bookkeeping at removal time.
 
@@ -21,11 +21,11 @@ v1 caveats (deliberate, recorded for the future crate split):
   consulted for single-file events.
 - Renames are correlated via move cookies: a rename within one directory
   re-attaches the detached subtree in place (node identity, contents and
-  kernel watches survive - no rescan); a move to another directory
-  rebuilds the entry there from memory (the trie cannot re-parent a
-  node): a file from its known inode, a directory subtree with its
-  inodes, stamps and handles ([`DirTree::graft_subtree`]), without disk
-  reads. With a visitor, a moved directory is re-scanned instead, as
+  kernel watches survive - no rescan). A file is re-attached the same way
+  in any directory (it has no parent pointer); a directory moved to
+  another one is rebuilt there from memory (the trie cannot re-parent a
+  directory node), with its inodes, stamps and handles
+  ([`DirTree::graft_subtree`]), without disk reads. With a visitor, a moved directory is re-scanned instead, as
   the visitor's verdicts depend on its ancestors. A
   `MOVED_FROM` with no matching `MOVED_TO` within [`PENDING_MOVE_TTL`]
   is a move out of the tree and drops the subtree. Events arriving for
@@ -47,7 +47,7 @@ use super::error::TreeError;
 use super::event::{TreeEvent, TreeOp, TreeState};
 use super::conf::NodeCounts;
 use super::dirtree::NewChild;
-use super::node::{FileEntry, FileKind, MaybeNode, Node, NodeType};
+use super::node::{Child, Directory, FileEntry, FileKind, NodeView};
 use super::traverse::traverse_from;
 
 use dashmap::DashMap;
@@ -106,12 +106,12 @@ Tree counters are adjusted at detach time; `counts` restores them on
 re-attach.
 */
 struct PendingMove {
-    /// The detached child; `None` for a Name-mode (node-less) entry.
-    node: MaybeNode,
+    /// The detached child.
+    node: Child,
     /// Counts captured at detach time.
     counts: NodeCounts,
     /// The parent the child was detached from.
-    parent: Weak<Node>,
+    parent: Weak<Directory>,
     /// When the `IN_MOVED_FROM` was seen (for expiry).
     seen: Instant,
     is_dir: bool,
@@ -132,7 +132,7 @@ pub struct TreeWatcher {
     root: PathBuf,
     ino_fd: OwnedFd,
     /// watch descriptor -> the watched directory's node
-    watches: DashMap<i32, Weak<Node>>,
+    watches: DashMap<i32, Weak<Directory>>,
     /// move cookie -> detached subtree awaiting rename correlation
     pending: DashMap<u32, PendingMove>,
     /// filesystem events applied to the tree so far
@@ -180,8 +180,8 @@ impl TreeWatcher {
             .from()
             .map_err(|e: TreeError| io::Error::new(io::ErrorKind::InvalidInput, e))?
             .clone();
-        let from_node: Arc<Node> = tree
-            .get_node(from.to_string_lossy().as_ref())
+        let from_node: Arc<Directory> = tree
+            .get_dir(from.to_string_lossy().as_ref())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "Tree root node not found")
             })?;
@@ -203,7 +203,7 @@ impl TreeWatcher {
 
         // every scan from here on watches each directory before reading it
         let weak: Weak<Self> = Arc::downgrade(&watcher);
-        watcher.tree.conf.set_list_hook(Some(ListHook(Arc::new(move |node: &Arc<Node>| {
+        watcher.tree.conf.set_list_hook(Some(ListHook(Arc::new(move |node: &Arc<Directory>| {
             if let Some(w) = weak.upgrade() {
                 w.add_watch(node);
             }
@@ -268,10 +268,7 @@ impl TreeWatcher {
     /* --------------------------------- */
 
     /// Add a watch for a single directory node.
-    fn add_watch(&self, node: &Arc<Node>) {
-        if !node.is_traversable() {
-            return;
-        }
+    fn add_watch(&self, node: &Arc<Directory>) {
         let path: PathBuf = node.path(self.tree.strings());
         let cpath: CString = match CString::new(path.as_os_str().as_bytes()) {
             Ok(c) => c,
@@ -297,14 +294,18 @@ impl TreeWatcher {
     }
 
     /// Watch a directory node and every directory below it.
-    fn watch_subtree(&self, node: &Arc<Node>) {
-        traverse_from(node, &mut |n: &Arc<Node>| self.add_watch(n));
+    fn watch_subtree(&self, node: &Arc<Directory>) {
+        traverse_from(node, &mut |n: NodeView<'_>| {
+            if let NodeView::Dir(dir) = n {
+                self.add_watch(dir);
+            }
+        });
     }
 
     /// Drop watches whose nodes have been removed from the tree.
     fn sweep_dead_watches(&self) {
         let fd: RawFd = self.ino_fd.as_raw_fd();
-        self.watches.retain(|wd: &i32, w: &mut Weak<Node>| {
+        self.watches.retain(|wd: &i32, w: &mut Weak<Directory>| {
             if w.strong_count() == 0 {
                 trace!(target: "WATCH_SWEEP", "dropping dead wd {wd}");
                 unsafe { libc::inotify_rm_watch(fd, *wd) };
@@ -373,7 +374,7 @@ impl TreeWatcher {
                 return true;
             }
             debug!(target: "WATCH_MV_OUT", "cookie {cookie} expired (moved out of tree)");
-            if let Some(ref node) = p.node {
+            if let Child::Dir(ref node) = p.node {
                 self.tree.release_handles(node);
             }
             sweep |= p.is_dir;
@@ -386,16 +387,16 @@ impl TreeWatcher {
 
     /// The cookie of the pending move whose detached subtree holds the
     /// node (as its root or below it), if any.
-    fn pending_cookie(&self, node: &Arc<Node>) -> Option<u32> {
+    fn pending_cookie(&self, node: &Arc<Directory>) -> Option<u32> {
         if self.pending.is_empty() {
             return None;
         }
-        let roots: Vec<(u32, Arc<Node>)> = self
+        let roots: Vec<(u32, Arc<Directory>)> = self
             .pending
             .iter()
-            .filter_map(|p| p.value().node.clone().map(|n: Arc<Node>| (*p.key(), n)))
+            .filter_map(|p| p.value().node.as_dir().map(|d: &Arc<Directory>| (*p.key(), d.clone())))
             .collect();
-        let mut current: Arc<Node> = node.clone();
+        let mut current: Arc<Directory> = node.clone();
         loop {
             if let Some((cookie, _)) = roots.iter().find(|(_, r)| Arc::ptr_eq(r, &current)) {
                 return Some(*cookie);
@@ -469,7 +470,7 @@ impl TreeWatcher {
             match self.tree.update(from_str.as_ref(), Some(true)) {
                 Ok(stats) => {
                     self.sweep_dead_watches();
-                    if let Some(root) = self.tree.get_node(from_str.as_ref()) {
+                    if let Some(root) = self.tree.get_dir(from_str.as_ref()) {
                         self.watch_subtree(&root);
                     }
                     let msg: String = format!("Tree resynced after overflow: {stats}");
@@ -493,7 +494,7 @@ impl TreeWatcher {
             return;
         }
 
-        let node: Arc<Node> = match self.watches.get(&wd).and_then(|w| w.value().upgrade()) {
+        let node: Arc<Directory> = match self.watches.get(&wd).and_then(|w| w.value().upgrade()) {
             Some(n) => n,
             None => {
                 // the node is gone from the tree: retire the stale watch
@@ -510,8 +511,8 @@ impl TreeWatcher {
         */
         let attached: bool = self
             .tree
-            .get_node(dir_path.to_string_lossy().as_ref())
-            .is_some_and(|n: Arc<Node>| Arc::ptr_eq(&n, &node));
+            .get_dir(dir_path.to_string_lossy().as_ref())
+            .is_some_and(|n: Arc<Directory>| Arc::ptr_eq(&n, &node));
         if !attached {
             if let Some(cookie) = self.pending_cookie(&node) {
                 /*
@@ -567,7 +568,7 @@ impl TreeWatcher {
             }
             if is_dir {
                 debug!(target: "WATCH_MKDIR", "{}", full.display());
-                self.tree.insert(&full, NodeType::Directory, None);
+                self.tree.insert_dir(&full, None);
                 self.tree.conf.observer().dirs_added(1);
                 /*
                 Watch-then-list, per directory: the scan runs the watcher's
@@ -605,8 +606,8 @@ impl TreeWatcher {
                         FileKind::Symlink => self.tree.link_target(&full),
                         _ => None,
                     };
-                    let file: FileEntry = FileEntry::new(kind, target);
-                    self.tree.insert_child(&node, idx, NewChild::Leaf(file), ino, depth).1
+                    let file: FileEntry = FileEntry::new(ino, kind, target);
+                    self.tree.insert_child(&node, idx, NewChild::File(file), depth).1
                 } else {
                     true // counted, but not stored
                 };
@@ -648,23 +649,17 @@ impl TreeWatcher {
     [`TreeWatcher::expire_pending`] drops the stash - the entry was
     moved out of the watched tree.
     */
-    fn on_moved_from(&self, parent: &Arc<Node>, name: &OsStr, cookie: u32, is_dir: bool) {
+    fn on_moved_from(&self, parent: &Arc<Directory>, name: &OsStr, cookie: u32, is_dir: bool) {
         // lookup only: a name we never interned cannot be in the tree
         let Some(idx) = self.tree.strings.idx(name.to_string_lossy().as_ref()) else {
             return;
         };
-        let slot: Option<MaybeNode> = parent
-            .as_dir()
-            .and_then(|d| d.read().get(&idx).cloned());
-        let Some(child_opt) = slot else {
+        let Some(child) = parent.get_child(&idx) else {
             return; // not in the tree (filtered out or never scanned)
         };
 
-        let counts: NodeCounts = match &child_opt {
-            // detach only: an in-place rename re-attaches it, handles and all
-            Some(child) => self.tree.detach_child_node(parent, idx, child.clone()),
-            None => NodeCounts::default(),
-        };
+        // detach only: an in-place rename re-attaches it, handles and all
+        let counts: NodeCounts = self.tree.detach_child_node(parent, idx, &child);
         if counts.is_empty() {
             /*
             Nothing was detached: the slot changed under us (a concurrent
@@ -678,7 +673,7 @@ impl TreeWatcher {
         self.pending.insert(
             cookie,
             PendingMove {
-                node: child_opt,
+                node: child,
                 counts,
                 parent: Arc::downgrade(parent),
                 seen: Instant::now(),
@@ -691,16 +686,16 @@ impl TreeWatcher {
     /**
     Handle `IN_MOVED_TO` for a cookie with a pending `IN_MOVED_FROM`.
     A rename within one directory re-attaches the detached subtree in
-    place (node identity, contents and kernel watches all survive); a
-    cross-directory move re-creates the entry at the destination (files
-    from their known inode without a stat, directories via a re-scan,
-    since the trie has no re-parenting). Returns `false` when the
-    cookie is unknown - the caller then treats the event as a plain
-    create (a move into the tree from outside).
+    place (node identity, contents and kernel watches all survive), and
+    so does a file's move to any directory. A directory moved to another
+    directory is rebuilt there from memory, or re-scanned with a visitor
+    (the trie has no re-parenting). Returns `false` when the cookie is
+    unknown - the caller then treats the event as a plain create (a move
+    into the tree from outside).
     */
     fn on_moved_to(
         &self,
-        parent: &Arc<Node>,
+        parent: &Arc<Directory>,
         dir_path: &Path,
         name: &OsStr,
         cookie: u32,
@@ -711,7 +706,7 @@ impl TreeWatcher {
         };
         // the destination name may be excluded even though the source was tracked
         if !self.tree.conf.filters().passes(name, is_dir) {
-            if let Some(ref node) = pending.node {
+            if let Child::Dir(ref node) = pending.node {
                 self.tree.release_handles(node);
             }
             let was_dir: bool = pending.is_dir;
@@ -725,85 +720,74 @@ impl TreeWatcher {
 
         let full: PathBuf = dir_path.join(name);
         let dirty: bool = pending.dirty;
-        match pending.node {
-            Some(child) => {
-                let idx: u32 = self.tree.strings.insert(name.to_string_lossy().as_ref());
-                let same_parent: bool = pending
-                    .parent
-                    .upgrade()
-                    .is_some_and(|p: Arc<Node>| Arc::ptr_eq(&p, parent));
-                if same_parent
-                    && self
-                        .tree
-                        .attach_child_node(parent, idx, child.clone(), pending.counts)
-                {
-                    // in-place rename: subtree and watches survive intact
-                    debug!(target: "WATCH_MV", "renamed to {} (cookie {cookie})", full.display());
-                    self.tree.add_event(
-                        TreeEvent::new("Renamed").path(full.to_string_lossy().as_ref()),
-                    );
-                    if dirty {
-                        self.resync_subtree(&full);
-                    }
-                    return true;
-                }
-
-                debug!(target: "WATCH_MV", "moved to {} (cookie {cookie})", full.display());
-                let depth: u8 = full
-                    .components()
-                    .count()
-                    .saturating_sub(1)
-                    .min(u8::MAX as usize) as u8;
-                if child.node_t.is_dir() && self.tree.has_visitor() {
-                    /*
-                    A visitor's verdicts depend on a directory's ancestors
-                    (scopes, depth caps, path-aware prunes), so a subtree in
-                    a new place is walked again for the visitor to see it.
-                    */
-                    self.tree.release_handles(&child);
-                    drop(child); // release the old subtree before re-scanning
-                    self.tree.insert(&full, NodeType::Directory, None);
-                    self.tree.conf.observer().dirs_added(1);
-                    // watched directory by directory as the scan reaches them, see WATCH_MKDIR
-                    self.tree.populate_par(&full, Some(true));
-                    self.sweep_dead_watches();
-                } else if child.node_t.is_dir() {
-                    /*
-                    Rebuilt from memory under the new parent, with no disk
-                    reads. The kernel watches follow the inodes, so
-                    re-adding them hands back the same descriptors, now
-                    mapped to the new nodes; the handles moved over too, so
-                    the old subtree is just dropped.
-                    */
-                    match self.tree.graft_subtree(parent, idx, &child, depth) {
-                        Some(new_root) => self.watch_subtree(&new_root),
-                        None => self.tree.add_error(
-                            TreeEvent::new("Moved directory has no parent directory to go to")
-                                .path(full.to_string_lossy().as_ref()),
-                        ),
-                    }
-                    drop(child);
-                    self.sweep_dead_watches();
-                    if dirty {
-                        self.resync_subtree(&full);
-                    }
-                } else {
-                    // a moved file is rebuilt from its known inode and kind: no stat
-                    let ino: u64 = child.inode().unwrap_or(0);
-                    let file: FileEntry = child.as_file().copied().unwrap_or_default();
-                    drop(child);
-                    let (_, created) =
-                        self.tree.insert_child(parent, idx, NewChild::Leaf(file), ino, depth);
-                    match created && file.kind().is_special() {
-                        true => self.tree.conf.observer().specials_added(1),
-                        false if created => self.tree.conf.observer().files_added(1, 0),
-                        false => {}
-                    }
-                }
-                true
+        let child: Child = pending.node;
+        let idx: u32 = self.tree.strings.insert(name.to_string_lossy().as_ref());
+        let same_parent: bool = pending
+            .parent
+            .upgrade()
+            .is_some_and(|p: Arc<Directory>| Arc::ptr_eq(&p, parent));
+        // a file has no parent pointer: it is re-attached wherever it went
+        if (same_parent || !child.is_dir())
+            && self
+                .tree
+                .attach_child_node(parent, idx, child.clone(), pending.counts)
+        {
+            // in-place rename: subtree and watches survive intact
+            debug!(target: "WATCH_MV", "renamed to {} (cookie {cookie})", full.display());
+            self.tree.add_event(
+                TreeEvent::new("Renamed").path(full.to_string_lossy().as_ref()),
+            );
+            if dirty {
+                self.resync_subtree(&full);
             }
-            None => false,
+            return true;
         }
+        // (attaching a file cannot fail)
+        let Child::Dir(child) = child else {
+            return true;
+        };
+
+        debug!(target: "WATCH_MV", "moved to {} (cookie {cookie})", full.display());
+        let depth: u8 = full
+            .components()
+            .count()
+            .saturating_sub(1)
+            .min(u8::MAX as usize) as u8;
+        if self.tree.has_visitor() {
+            /*
+            A visitor's verdicts depend on a directory's ancestors
+            (scopes, depth caps, path-aware prunes), so a subtree in
+            a new place is walked again for the visitor to see it.
+            */
+            self.tree.release_handles(&child);
+            drop(child); // release the old subtree before re-scanning
+            self.tree.insert_dir(&full, None);
+            self.tree.conf.observer().dirs_added(1);
+            // watched directory by directory as the scan reaches them, see WATCH_MKDIR
+            self.tree.populate_par(&full, Some(true));
+            self.sweep_dead_watches();
+        } else {
+            /*
+            Rebuilt from memory under the new parent, with no disk
+            reads. The kernel watches follow the inodes, so
+            re-adding them hands back the same descriptors, now
+            mapped to the new nodes; the handles moved over too, so
+            the old subtree is just dropped.
+            */
+            match self.tree.graft_subtree(parent, idx, &child, depth) {
+                Some(new_root) => self.watch_subtree(&new_root),
+                None => self.tree.add_error(
+                    TreeEvent::new("Moved directory has no place to go to")
+                        .path(full.to_string_lossy().as_ref()),
+                ),
+            }
+            drop(child);
+            self.sweep_dead_watches();
+            if dirty {
+                self.resync_subtree(&full);
+            }
+        }
+        true
     }
 }
 

@@ -1,11 +1,10 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use super::node::{MaybeNode, Node};
+use super::node::NodeRef;
 use miniutils::{ToDebug, ToDisplay};
 use std::{
     fmt::{self, Debug, Display, Formatter},
     path::PathBuf,
-    sync::Arc,
 };
 use timesince::TimeSinceEpoch;
 
@@ -100,7 +99,7 @@ pub struct TreeEvent {
     pub info: EventInfo,
     pub oper: Option<TreeOp>,
     pub path: Option<String>,
-    pub node: MaybeNode,
+    pub node: Option<NodeRef>,
     #[cfg_attr(feature = "size_of", size_of(skip))]
     pub when: TimeSinceEpoch,
 }
@@ -121,9 +120,9 @@ impl TreeEvent {
         self
     }
 
-    /// Specify a [Node] for the event.
-    pub(super) fn node(mut self, node: &Arc<Node>) -> Self {
-        self.node = Some(node.to_owned());
+    /// Specify the tree entry the event is about.
+    pub(super) fn node(mut self, node: NodeRef) -> Self {
+        self.node = Some(node);
         self
     }
 

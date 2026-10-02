@@ -3,9 +3,7 @@
 use super::conf::{NodeCounts, TreeConf};
 use super::error::{TreeError, TreeResult};
 use super::event::{TreeEvent, TreeOp, TreeState};
-use super::node::{
-    Directory, Entry, FileEntry, FileKind, MaybeNode, Node, NodeItem, NodeIter, NodeType,
-};
+use super::node::{Child, Directory, FileEntry, FileKind, NodeIter, NodeRef, NodeView};
 use super::observer::TreeObserver;
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::visitor::*;
@@ -33,11 +31,11 @@ use std::{
     collections::VecDeque,
     ffi::{CStr, OsStr},
     fmt::{self, Display, Formatter},
-    fs::{DirEntry, read_link},
+    fs::{DirEntry, metadata, read_link},
     io::{Error, ErrorKind},
     os::fd::{AsRawFd, BorrowedFd, RawFd},
     os::unix::ffi::OsStrExt,
-    os::unix::fs::DirEntryExt,
+    os::unix::fs::{DirEntryExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Weak},
     thread,
@@ -45,10 +43,9 @@ use std::{
 
 #[cfg(feature = "size_of")]
 use {
-    super::utils::mod_atom_u32,
     size_of::{Context, SizeOf},
     std::mem::size_of,
-    std::sync::atomic::{AtomicU32, Ordering::Relaxed},
+    std::sync::atomic::{AtomicU64, Ordering::Relaxed},
     timesince::TimeSinceEpoch,
 };
 
@@ -65,10 +62,11 @@ of work.
 */
 pub(super) const ENTRY_BATCH_MIN: usize = 64;
 
-/// What [DirTree::insert_child] creates: a directory, or a file of some [FileKind].
+/// What [DirTree::insert_child] creates: a directory (with its inode), or a file.
+#[derive(Clone, Copy, Debug)]
 pub(super) enum NewChild {
-    Dir,
-    Leaf(FileEntry),
+    Dir(u64),
+    File(FileEntry),
 }
 
 /**
@@ -109,7 +107,7 @@ eprintln!("{tree}"); // print basic tree info (nodes, dirs, files etc)
 #[derive(Default, Debug)]
 pub struct DirTree {
     pub(super) conf: Arc<TreeConf>,
-    pub(super) root: Arc<Node>,
+    pub(super) root: Arc<Directory>,
     pub(super) strings: UniqueStrStore,
     pub(super) worker: Mutex<Option<thread::JoinHandle<()>>>,
     handles: OpenHandles,
@@ -119,9 +117,9 @@ pub struct DirTree {
 }
 
 impl DirTree {
-    /// Returns an Arc reference to the tree's root [[Node]].
+    /// Returns an Arc reference to the tree's root [[Directory]].
     #[inline]
-    pub fn root(&self) -> Arc<Node> {
+    pub fn root(&self) -> Arc<Directory> {
         self.root.clone()
     }
 
@@ -182,8 +180,13 @@ impl DirTree {
         self.strings.get(idx).ok().unwrap_or("")
     }
 
-    pub fn node_name(&self, node: &Arc<Node>) -> String {
-        node.name(&self.strings).unwrap_or("<unnamed>".to_owned())
+    /// The name of an entry; `/` for the root.
+    pub fn node_name(&self, node: &NodeRef) -> String {
+        match node {
+            NodeRef::Dir(dir) if dir.is_root() => PATH_SEP.to_owned(),
+            NodeRef::Dir(dir) => dir.name(&self.strings).to_owned(),
+            NodeRef::File { name, .. } => self.get_string(*name).to_owned(),
+        }
     }
 
     /// Returns the current [[TreeState]].
@@ -406,7 +409,7 @@ impl DirTree {
         let store: UniqueStrStore = UniqueStrStore::new_with_capacity(1024, ARENA_CHUNK_SIZE);
         let name_idx: u32 = store.insert("ROOT");
         DirTree {
-            root: Node::new(NodeItem::Root(Directory::new(name_idx)), None).into(),
+            root: Directory::new_root(name_idx).into(),
             conf: TreeConf::new(filemode, filters).into(),
             strings: store,
             // spelled out: a Drop type cannot take the ..Default::default() form
@@ -423,7 +426,7 @@ impl DirTree {
         self.conf.set_from(path);
         // the root actually stored: a second from_path() keeps the first
         if let Some(from) = self.conf.from() {
-            self.insert(from, NodeType::Directory, None);
+            self.insert_dir(from, None);
         }
         self.set_state(TreeState::Empty);
         self
@@ -547,7 +550,7 @@ impl DirTree {
         }
     }
 
-    /// Populate a leaf [[Node]] in the trie with the contents of a directory.
+    /// Populate a [[Directory]] in the trie with the contents of a directory.
     /// Uses the standard [std::fs::read_dir] method to get the directory entries.
     ///
     /// NOTE: If `recursive` is [None], the tree's default is used.
@@ -568,7 +571,7 @@ impl DirTree {
                                 if !self.conf.filters().passes(&name, true) {
                                     return;
                                 }
-                                self.insert(&path, NodeType::Directory, Some(entry.ino()));
+                                self.insert_dir(&path, Some(entry.ino()));
                                 self.conf.observer().dirs_added(1);
                                 // an explicit per-op flag overrides the tree default
                                 if recursive.unwrap_or(self.conf.recursive()) {
@@ -603,8 +606,7 @@ impl DirTree {
                                         FileKind::Symlink => self.link_target(&path),
                                         _ => None,
                                     };
-                                    let file: FileEntry = FileEntry::new(kind, target);
-                                    self.insert_with(&path, NodeType::File, Some(entry.ino()), file);
+                                    self.insert_file(&path, FileEntry::new(entry.ino(), kind, target));
                                 }
                                 match kind.is_special() {
                                     true => self.conf.observer().specials_added(1),
@@ -651,16 +653,17 @@ impl DirTree {
         per entry through [DirTree::insert].
         */
         let path_str = path.to_string_lossy();
-        let node: Arc<Node> = match self.get_node(path_str.as_ref()) {
+        let node: Arc<Directory> = match self.get_dir(path_str.as_ref()) {
             Some(n) => n,
             None => {
                 // an unknown walk root (e.g. a worker Scan op) is created first
-                self.insert(path, NodeType::Directory, None);
-                match self.get_node(path_str.as_ref()) {
+                self.insert_dir(path, None);
+                match self.get_dir(path_str.as_ref()) {
                     Some(n) => n,
+                    // also when a file occupies the path
                     None => {
                         self.add_error(TreeEvent::error(
-                            &format!("Cannot resolve walk root: {}", path.display()),
+                            &format!("Cannot resolve walk root as a directory: {}", path.display()),
                             &TreeOp::Scan(path.clone(), recursive),
                         ));
                         return;
@@ -668,13 +671,6 @@ impl DirTree {
                 }
             }
         };
-        if !node.is_traversable() {
-            self.add_error(TreeEvent::error(
-                &format!("Walk root is not a directory: {}", path.display()),
-                &TreeOp::Scan(path.clone(), recursive),
-            ));
-            return;
-        }
         let walk = self.initial_walk_state(path, recursive);
         // the walk root is opened by path; a symlinked root is followed
         let handle: Result<DirHandle, Error> = DirHandle::new(path);
@@ -749,7 +745,7 @@ impl DirTree {
         path: &PathBuf,
         handle: Result<DirHandle, Error>,
         walk: WalkState,
-        node: Arc<Node>,
+        node: Arc<Directory>,
         rs: &rayon::Scope<'env>,
         depth: usize,
         frames: usize,
@@ -866,9 +862,7 @@ impl DirTree {
             let mut entries = entries;
             let n_dirs: usize = partition_dirs_first(&mut entries);
             let (dirs, files) = entries.split_at(n_dirs);
-            if let Some(dir) = node.as_dir() {
-                dir.reserve_children(entries.len());
-            }
+            node.reserve_children(entries.len());
             let each_dir = |entry: &EntryExt| {
                 self.process_par_dir(
                     path,
@@ -901,10 +895,7 @@ impl DirTree {
             would leak it (no node would ever point at it for closing).
             */
             let fd: RawFd = handle.as_raw_fd();
-            if node
-                .as_dir()
-                .is_some_and(|dir: &Directory| dir.fd_set(fd).is_ok())
-            {
+            if node.fd_set(fd).is_ok() {
                 self.handles.insert(handle);
             }
         } else {
@@ -925,7 +916,7 @@ impl DirTree {
         &'env self,
         parent_path: &Path,
         parent_walk: &WalkState,
-        parent_node: &Arc<Node>,
+        parent_node: &Arc<Directory>,
         scope_for_children: ScopeTag,
         depth: usize,
         frames: usize,
@@ -973,10 +964,10 @@ impl DirTree {
         let child_idx: u32 =
             child_idx.unwrap_or_else(|| self.strings.insert(name_os.to_string_lossy().as_ref()));
         let (child, _) =
-            self.insert_child(parent_node, child_idx, NewChild::Dir, entry.ino(), depth_abs);
+            self.insert_child(parent_node, child_idx, NewChild::Dir(entry.ino()), depth_abs);
         self.conf.observer().dirs_added(1);
-        let Some(child_node) = child else {
-            // a name-only entry (or similar) blocks this slot
+        let Child::Dir(child_node) = child else {
+            // a file recorded under this name (replaced since) blocks the slot
             self.add_error(TreeEvent::error(
                 &format!("Cannot attach directory node: {:?}", name_os),
                 op,
@@ -1031,8 +1022,8 @@ impl DirTree {
 
     /**
     One batch of non-directory entries for the parallel walker. Pruning,
-    filtering and node construction run lock-free; the survivors are then
-    attached to `parent_node` under a single children-map write lock, and
+    filtering and entry construction run lock-free; the survivors are then
+    stored in `parent_node`'s map under a single write lock, and
     the shared counters are bumped once per batch instead of once per
     entry - with per-entry updates, the global `Counter` mutexes and the
     parent's map lock were contended by every worker at once.
@@ -1040,8 +1031,9 @@ impl DirTree {
     Special files are recorded with their [FileKind] and counted apart
     from regular files; a symlink's target is read through `dirfd`, the
     directory being listed. Entries of undeterminable type are reported
-    as events. No paths are constructed: the interned name and the inode
-    from the dirent are all an insertion requires.
+    as events. No paths are constructed, and nothing is allocated per
+    file: the interned name and the inode from the dirent are all a
+    [FileEntry] needs.
     */
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -1049,19 +1041,16 @@ impl DirTree {
         &self,
         parent_path: &Path,
         parent_walk: &WalkState,
-        parent_node: &Arc<Node>,
+        parent_node: &Directory,
         depth: usize,
         visitor: Option<&Arc<dyn Visitor>>,
         op: &TreeOp,
         dirfd: BorrowedFd<'_>,
         batch: &[EntryExt<'_>],
     ) {
-        let Some(dir) = parent_node.as_dir() else {
-            return;
-        };
         let store: bool = self.filemode().is_node();
         let with_size: bool = self.filemode().is_with_size();
-        let mut children: Vec<(u32, MaybeNode)> = Vec::with_capacity(batch.len());
+        let mut children: Vec<(u32, Child)> = Vec::with_capacity(batch.len());
         /*
         Names still to intern, with their inodes and kinds: interned
         together after the loop. Every new name takes stringstore's writer
@@ -1070,21 +1059,12 @@ impl DirTree {
         past 4 workers).
         */
         let mut names: Vec<Cow<str>> = Vec::with_capacity(batch.len());
-        let mut leaves: Vec<(u64, FileEntry)> = Vec::with_capacity(batch.len());
+        let mut files: Vec<FileEntry> = Vec::with_capacity(batch.len());
         // specials go in apart from the files, to be counted apart
-        let mut specials: Vec<(u32, MaybeNode)> = Vec::new();
+        let mut specials: Vec<(u32, Child)> = Vec::new();
         let mut seen: u64 = 0;
         let mut seen_specials: u64 = 0;
         let mut size: u64 = 0;
-        let file_node = |inode: u64, file: FileEntry| -> MaybeNode {
-            Some(
-                Node::new(
-                    NodeItem::File(Entry::<FileEntry>::leaf(inode, file)),
-                    Some(parent_node.clone()),
-                )
-                .into(),
-            )
-        };
 
         for entry in batch {
             let Some(entry_t) = entry.file_type() else {
@@ -1138,34 +1118,34 @@ impl DirTree {
                 FileKind::Symlink => self.link_target_at(dirfd, entry.file_name()),
                 _ => None,
             };
-            let file: FileEntry = FileEntry::new(kind, target);
+            let file: FileEntry = FileEntry::new(entry.ino(), kind, target);
             match child_idx {
                 // already interned for the visitor
-                Some(idx) if kind.is_special() => specials.push((idx, file_node(entry.ino(), file))),
-                Some(idx) => children.push((idx, file_node(entry.ino(), file))),
+                Some(idx) if kind.is_special() => specials.push((idx, Child::File(file))),
+                Some(idx) => children.push((idx, Child::File(file))),
                 None => {
                     names.push(name_os.to_string_lossy());
-                    leaves.push((entry.ino(), file));
+                    files.push(file);
                 }
             }
         }
         if !names.is_empty() {
             let indices: Vec<u32> = self.strings.insert_many(&names);
-            for (idx, (inode, file)) in indices.into_iter().zip(leaves) {
+            for (idx, file) in indices.into_iter().zip(files) {
                 match file.kind().is_special() {
-                    true => specials.push((idx, file_node(inode, file))),
-                    false => children.push((idx, file_node(inode, file))),
+                    true => specials.push((idx, Child::File(file))),
+                    false => children.push((idx, Child::File(file))),
                 }
             }
         }
 
         let added: u32 = match children.is_empty() {
             true => 0,
-            false => dir.add_children_new(children),
+            false => parent_node.add_children_new(children),
         };
         let added_specials: u32 = match specials.is_empty() {
             true => 0,
-            false => dir.add_children_new(specials),
+            false => parent_node.add_children_new(specials),
         };
         if added + added_specials > 0 {
             self.conf.nodes_mod((added + added_specials) as i32);
@@ -1185,52 +1165,41 @@ impl DirTree {
     }
 
     /**
-    O(1) child insertion under an already-resolved parent [[Node]]: one
-    children-map lock instead of a full root-to-leaf trie walk like
-    [DirTree::insert]. The inode must already be known (it comes from
-    the dirent), so construction never stats and cannot fail.
+    O(1) child insertion under an already-resolved parent [[Directory]]:
+    one children-map lock instead of a full root-to-leaf trie walk like
+    [DirTree::insert_dir]. The inode must already be known (it comes
+    from the dirent), so construction never stats and cannot fail.
 
     Returns the child (created or pre-existing) and whether this call
-    created it; `(None, false)` when the slot is occupied by a name-only
-    entry or `parent` is not a directory.
+    created it.
     */
     #[inline]
     pub(super) fn insert_child(
         &self,
-        parent: &Arc<Node>,
+        parent: &Arc<Directory>,
         name_idx: u32,
         child: NewChild,
-        inode: u64,
         depth_abs: u8,
-    ) -> (MaybeNode, bool) {
-        let dir: &Directory = match parent.as_dir() {
-            Some(d) => d,
-            None => return (None, false),
-        };
-        let kind: Option<FileKind> = match &child {
-            NewChild::Dir => None,
-            NewChild::Leaf(file) => Some(file.kind()),
-        };
-        let (node, created) = dir.get_or_add_child_with(name_idx, || {
-            let itm: NodeItem = match child {
-                NewChild::Leaf(file) => NodeItem::File(Entry::<FileEntry>::leaf(inode, file)),
-                NewChild::Dir => {
-                    let itm = NodeItem::Dir(Entry::<Directory>::with_inode(inode));
-                    itm.set_dir_name(name_idx);
-                    itm
-                }
-            };
-            Some(Node::new(itm, Some(parent.clone())).into())
+    ) -> (Child, bool) {
+        let (node, created) = parent.get_or_add_child_with(name_idx, || match child {
+            NewChild::Dir(inode) => Child::Dir(Directory::new(parent, name_idx, inode).into()),
+            NewChild::File(file) => Child::File(file),
         });
         if created {
-            self.conf.nodes_mod(1);
-            match kind {
-                Some(kind) => self.conf.leaf_mod(kind, 1),
-                None => self.conf.dirs_mod(1),
-            }
+            self.count_created(&node);
             self.conf.depth_compare(depth_abs);
         }
         (node, created)
+    }
+
+    /// Count a child just created (one node, a directory or a file by its kind).
+    #[inline]
+    fn count_created(&self, child: &Child) {
+        self.conf.nodes_mod(1);
+        match child {
+            Child::Dir(_) => self.conf.dirs_mod(1),
+            Child::File(file) => self.conf.leaf_mod(file.kind(), 1),
+        }
     }
 
     /**
@@ -1258,150 +1227,105 @@ impl DirTree {
         }
     }
 
-    /// The target of a symlink node, as read when it was recorded.
-    pub fn symlink_target(&self, node: &Node) -> Option<PathBuf> {
+    /// The target of a symlink, as read when it was recorded.
+    pub fn symlink_target(&self, node: &NodeRef) -> Option<PathBuf> {
         let idx: u32 = node.as_file()?.target()?;
         Some(PathBuf::from(unsafe { self.strings.borrow_str(idx) }))
     }
 
-    /// Add a [[RawFd]] to a directory node's [[Directory]] item.
+    /// Add a [[RawFd]] to a [[Directory]].
     #[allow(unused)]
     fn add_fd(&self, path: &Path, fd: RawFd) {
-        self.get_node(path.to_string_lossy().as_ref()).map(|node| {
-            node.as_dir().map(|dir| {
-                dir.fd_set(fd).ok();
-            })
-        });
+        if let Some(dir) = self.get_dir(path.to_string_lossy().as_ref()) {
+            dir.fd_set(fd).ok();
+        }
     }
 
     /* --------------------------------- */
 
-    /// Inserts a path into the trie. The path must be an absolute filesystem path.
-    /// The path is split on forward slash (`/`) to obtain its parts.
-    ///
-    /// Concurrency-safe: per-level child creation is atomic (check + insert
-    /// under one write lock), so parallel inserts of overlapping paths can
-    /// neither overwrite each other's nodes nor double-count.
+    /**
+    Insert a directory into the trie, with any missing intermediate
+    directories (inode 0). `path` must be an absolute filesystem path; it
+    is split on forward slash (`/`) to obtain its parts. Without an
+    `inode`, the directory is stat'ed for one; that failing (a vanished
+    directory) is recorded as an error and nothing is inserted.
+
+    Concurrency-safe: per-level child creation is atomic (check + insert
+    under one write lock), so parallel inserts of overlapping paths can
+    neither overwrite each other's entries nor double-count.
+    */
     #[instrument(level = "debug", skip(self))]
-    pub fn insert(&self, path: &PathBuf, node_t: NodeType, inode: Option<u64>) {
-        self.insert_with(path, node_t, inode, FileEntry::default());
+    pub fn insert_dir(&self, path: &PathBuf, inode: Option<u64>) {
+        let inode: u64 = match inode {
+            Some(inode) => inode,
+            None => match metadata(path) {
+                Ok(meta) => meta.ino(),
+                Err(e) => {
+                    let msg: String = format!("Cannot stat {}: {e}", path.display());
+                    self.add_error(TreeEvent::error(&msg, &TreeOp::Insert));
+                    return;
+                }
+            },
+        };
+        self.insert_path(path, NewChild::Dir(inode));
     }
 
-    /// [DirTree::insert], with a [NodeType::File] leaf recorded as `file`.
-    pub(super) fn insert_with(
-        &self,
-        path: &PathBuf,
-        node_t: NodeType,
-        inode: Option<u64>,
-        file: FileEntry,
-    ) {
-        let mut current: Arc<Node> = self.root();
+    /// [DirTree::insert_dir] for a file (of any [FileKind]).
+    #[instrument(level = "debug", skip(self))]
+    pub fn insert_file(&self, path: &PathBuf, file: FileEntry) {
+        self.insert_path(path, NewChild::File(file));
+    }
+
+    /// Insert `leaf` at `path`, with any missing intermediate directories.
+    fn insert_path(&self, path: &PathBuf, leaf: NewChild) {
+        let mut current: Arc<Directory> = self.root();
         let parts = &self.strings.store_path(path)[1..];
         let len: usize = parts.len();
-        let mut depth: usize = 0; // root node is at depth 0
-        self.conf.depth_compare(len.min(u8::MAX as usize) as u8);
         // max depth can just as well be updated at this point
+        self.conf.depth_compare(len.min(u8::MAX as usize) as u8);
 
-        for part in parts.iter().copied() {
-            depth += 1;
+        for (i, part) in parts.iter().copied().enumerate() {
+            let depth: usize = i + 1; // root is at depth 0
             let is_leaf: bool = depth == len;
-            trace!(target: "CURRENT_NODE", "{:?}", self.node_name(&current));
-
-            let dir: &Directory = match current.as_dir() {
-                Some(d) => d,
-                None => {
-                    // a non-container node occupies this path component
-                    self.add_error(TreeEvent::error(
-                        &format!("Not a directory at depth {depth}/{len}: {current:?}"),
-                        &TreeOp::Insert,
-                    ));
-                    return;
+            trace!(target: "CURRENT_NODE", "{:?}", current.name(&self.strings));
+            let (child, created) = current.get_or_add_child_with(part, || match (is_leaf, leaf) {
+                (true, NewChild::File(file)) => Child::File(file),
+                (true, NewChild::Dir(inode)) => {
+                    Child::Dir(Directory::new(&current, part, inode).into())
                 }
-            };
-
-            /*
-            Build the item for a would-be new node up front. Leaf items can
-            require a stat (when no inode is given) and thus fail on a
-            filesystem race; erroring out here keeps the creation closure
-            below infallible. If the child turns out to already exist, the
-            speculative item is simply dropped with it.
-            */
-            let itm: NodeItem = if is_leaf {
-                match node_t {
-                    NodeType::Directory => match Entry::<Directory>::new(path, inode) {
-                        Ok(e) => {
-                            let itm = NodeItem::Dir(e);
-                            itm.set_dir_name(part);
-                            itm
-                        }
-                        Err(e) => {
-                            self.add_error(TreeEvent::error(&e.to_string(), &TreeOp::Insert));
-                            return;
-                        }
-                    },
-                    NodeType::File => match Entry::<FileEntry>::new(path, inode) {
-                        Ok(e) => NodeItem::File(e.with_file(file)),
-                        Err(e) => {
-                            self.add_error(TreeEvent::error(&e.to_string(), &TreeOp::Insert));
-                            return;
-                        }
-                    },
-                    // Root / Uninitialized / Name are not insertable leaves
-                    _ => return,
-                }
-            } else {
-                trace!(target: "intermediate", "{part:?} --> depth: {depth}/{len}");
-                // must be a container (directory) so let's create the basic structure
-                let itm = NodeItem::Dir(Entry::<Directory>::default());
-                itm.set_dir_name(part);
-                itm
-            };
-
-            let kind: Option<FileKind> = itm.as_file().map(|f: &FileEntry| f.kind());
-            let (child, created) =
-                dir.get_or_add_child_with(part, || Some(Node::new(itm, Some(current.clone())).into()));
+                // an intermediate directory, created without a stat
+                (false, _) => Child::Dir(Directory::new(&current, part, 0).into()),
+            });
             if created {
-                self.conf.nodes_mod(1);
-                match kind {
-                    Some(kind) => self.conf.leaf_mod(kind, 1),
-                    None => self.conf.dirs_mod(1),
-                }
+                debug!(target: "CREATED_NODE", "{part:?} : {child:?}");
+                self.count_created(&child);
             }
-
-            current = match child {
-                Some(node) => {
-                    if created {
-                        debug!(target: "CREATED_NODE", "{part:?} : {:?}", &node);
-                    }
-                    node
-                }
-                None => {
-                    // a name-only entry occupies this slot; a full path
-                    // cannot pass through (or overwrite) it
-                    self.add_error(TreeEvent::error(
-                        &format!("Name-only entry blocks {part:?} at depth {depth}/{len}"),
-                        &TreeOp::Insert,
-                    ));
-                    return;
-                }
-            };
-
-            if is_leaf && !created {
-                // for now we don't overwrite existing nodes, but
+            if is_leaf {
+                // for now we don't overwrite existing entries, but
                 // this may change in the future to allow for updates
-                trace!(target: "SKIP_EX_NODE", "{:?} ({:?}) : {:?}",
-                    self.node_name(&current), current.node_t, current.path(&self.strings)
-                );
+                if !created {
+                    trace!(target: "SKIP_EX_NODE", "{:?}", path.display());
+                }
                 return;
             }
+            current = match child {
+                Child::Dir(dir) => dir,
+                Child::File(_) => {
+                    // a file occupies this path component
+                    self.add_error(TreeEvent::error(
+                        &format!("Not a directory at depth {depth}/{len}: {}", path.display()),
+                        &TreeOp::Insert,
+                    ));
+                    return;
+                }
+            };
         }
-        debug!(target: "INSERT_CHILD", "{current:?}");
     }
 
-    /// Remove a [[Node]] (or a leaf) from the trie. Expects an absolute path.
+    /// Remove an entry (with its subtree) from the trie. Expects an absolute path.
     ///
-    /// Returns a tuple of `(nodes, dirs, files)` removed on success and [[None]]
-    /// if the path was not found. The root node cannot be removed.
+    /// Returns the counts removed on success and [[None]] if the path was
+    /// not found. The root cannot be removed.
     ///
     /// WARNING: implementation is WIP and may yet contain bugs.
     #[instrument(level = "debug", skip(self))]
@@ -1409,38 +1333,27 @@ impl DirTree {
         let op: TreeOp = TreeOp::Remove(path.into());
         match self.get_node(path) {
             Some(node) => {
-                if node.node_t == NodeType::Root {
+                if node.as_dir().is_some_and(|dir| dir.is_root()) {
                     let msg: &str = "Cannot remove root node";
                     self.add_error(TreeEvent::error(msg, &op));
                     return Err(Error::new(ErrorKind::InvalidInput, msg));
                 };
 
-                let p: PathBuf = node.path(&self.strings);
-                match node.parent() {
-                    Some(parent) => {
-                        /*
-                        get_child_byref is a pointer-identity lookup, so a
-                        None here means the node was detached concurrently -
-                        report instead of panicking.
-                        */
-                        let (name, _c) = match parent.get_child_byref(&node) {
-                            Some(found) => found,
-                            None => {
-                                let msg: String = format!("Node detached during removal: {:?}", p);
-                                self.add_error(TreeEvent::error(&msg, &op).node(&node));
-                                return Err(Error::new(ErrorKind::NotFound, msg));
-                            }
-                        };
-                        debug!(target: "REMOVE_NODE", "{:?}", p.display());
-                        Ok(Some(self.remove_child_node(&parent, name, node.clone())))
-                    }
-
-                    None => {
-                        let msg: String = format!("Stale parent reference: {:?}", p);
-                        self.add_error(TreeEvent::error(&msg, &op).node(&node));
-                        Err(Error::new(ErrorKind::NotFound, msg))
-                    }
+                let Some(parent) = node.parent() else {
+                    let msg: String = format!("Stale parent reference: {path:?}");
+                    self.add_error(TreeEvent::error(&msg, &op).node(node));
+                    return Err(Error::new(ErrorKind::NotFound, msg));
+                };
+                debug!(target: "REMOVE_NODE", "{path:?}");
+                let counts: NodeCounts =
+                    self.remove_child_node(&parent, node.name_idx(), &node.to_child());
+                if counts.is_empty() {
+                    // removed (or replaced) concurrently since the lookup
+                    let msg: String = format!("Node detached during removal: {path:?}");
+                    self.add_error(TreeEvent::error(&msg, &op).node(node));
+                    return Err(Error::new(ErrorKind::NotFound, msg));
                 }
+                Ok(Some(counts))
             }
 
             None => {
@@ -1451,9 +1364,9 @@ impl DirTree {
     }
 
     /**
-    Detach an already-resolved child [[Node]] from its parent and adjust
-    the tree counters. The subtree below the child is dropped in a
-    cascading manner via refcounting. Returns the counts removed.
+    Detach an already-resolved child from its parent and adjust the tree
+    counters. The subtree below a directory is dropped in a cascading
+    manner via refcounting. Returns the counts removed.
 
     Nothing is removed (and empty counts returned) if `name_idx` no longer
     holds `child` itself: the caller resolved the child earlier, and a
@@ -1468,13 +1381,15 @@ impl DirTree {
     */
     pub(super) fn remove_child_node(
         &self,
-        parent: &Node,
+        parent: &Directory,
         name_idx: u32,
-        child: Arc<Node>,
+        child: &Child,
     ) -> NodeCounts {
-        let counts: NodeCounts = self.detach_child_node(parent, name_idx, child.clone());
-        if !counts.is_empty() {
-            self.release_handles(&child);
+        let counts: NodeCounts = self.detach_child_node(parent, name_idx, child);
+        if !counts.is_empty()
+            && let Child::Dir(dir) = child
+        {
+            self.release_handles(dir);
         }
         counts
     }
@@ -1487,12 +1402,15 @@ impl DirTree {
     */
     pub(super) fn detach_child_node(
         &self,
-        parent: &Node,
+        parent: &Directory,
         name_idx: u32,
-        child: Arc<Node>,
+        child: &Child,
     ) -> NodeCounts {
-        let counts: NodeCounts = self.count_from(child.clone());
-        if !parent.remove_child_exact(&name_idx, &child) {
+        let counts: NodeCounts = match child {
+            Child::Dir(dir) => self.count_from(dir),
+            Child::File(file) => NodeCounts::of_file(file),
+        };
+        if !parent.remove_child_exact(&name_idx, child) {
             return NodeCounts::default();
         }
         self.conf.counts_mod(counts, -1);
@@ -1505,12 +1423,12 @@ impl DirTree {
     handles of removed directories stay open forever, pinning deleted
     directories and eventually running the process out of fds.
     */
-    pub(super) fn release_handles(&self, node: &Arc<Node>) {
+    pub(super) fn release_handles(&self, node: &Arc<Directory>) {
         if self.handles.is_empty() {
             return;
         }
-        traverse_from(node, &mut |n: &Arc<Node>| {
-            if let Some(dir) = n.as_dir()
+        traverse_from(node, &mut |n: NodeView<'_>| {
+            if let NodeView::Dir(dir) = n
                 && dir.fd().is_open()
             {
                 self.handles.close(dir.fd().fd());
@@ -1526,7 +1444,8 @@ impl DirTree {
     they are built from memory - inodes, interned names, scan stamps,
     file kinds and pooled directory handles (resident mode) carry
     over - so nothing is read from disk, where a rescan would list every
-    directory of the subtree again. Whoever holds a node of `old` holds a
+    directory of the subtree again. Files are copied as they are: they
+    have no parent pointer to fix. Whoever holds a node of `old` holds a
     detached node afterwards.
 
     Any previous occupant of `name_idx` is removed first (a rename over
@@ -1534,49 +1453,41 @@ impl DirTree {
     ([DirTree::detach_child_node] took its nodes off the counters); the
     new nodes are counted as they are inserted. Not reported to the
     observer: nothing new appeared on disk. Returns the new subtree root,
-    or [None] if `parent` is not a directory.
+    or [None] if a file took its name in the meantime.
     */
     pub(super) fn graft_subtree(
         &self,
-        parent: &Arc<Node>,
+        parent: &Arc<Directory>,
         name_idx: u32,
-        old: &Arc<Node>,
+        old: &Arc<Directory>,
         depth_abs: u8,
-    ) -> MaybeNode {
-        let occupant: Option<MaybeNode> = parent.as_dir()?.read().get(&name_idx).cloned();
-        if let Some(Some(occupant)) = occupant {
-            self.remove_child_node(parent, name_idx, occupant);
+    ) -> Option<Arc<Directory>> {
+        if let Some(occupant) = parent.get_child(&name_idx) {
+            self.remove_child_node(parent, name_idx, &occupant);
         }
-        let inode: u64 = old.inode().unwrap_or(0);
-        let (root, _) = self.insert_child(parent, name_idx, NewChild::Dir, inode, depth_abs);
-        let root: Arc<Node> = root?;
+        let (root, _) = self.insert_child(parent, name_idx, NewChild::Dir(old.inode()), depth_abs);
+        let root: Arc<Directory> = root.as_dir()?.clone();
 
         // (old directory, its new node, the depth of the new node)
-        let mut work: Vec<(Arc<Node>, Arc<Node>, u8)> = vec![(old.clone(), root.clone(), depth_abs)];
+        let mut work: Vec<(Arc<Directory>, Arc<Directory>, u8)> =
+            vec![(old.clone(), root.clone(), depth_abs)];
         while let Some((from, to, depth)) = work.pop() {
             carry_dir_state(&from, &to);
-            let Some(children) = from.children() else {
-                continue;
-            };
-            let children: Vec<(u32, MaybeNode)> =
-                children.read().iter().map(|(idx, c)| (*idx, c.clone())).collect();
+            let children: Vec<(u32, Child)> =
+                from.children().read().iter().map(|(idx, c)| (*idx, c.clone())).collect();
             let child_depth: u8 = depth.saturating_add(1);
             for (idx, child) in children {
                 match child {
-                    Some(c) if c.is_traversable() => {
-                        let ino: u64 = c.inode().unwrap_or(0);
+                    Child::Dir(c) => {
                         let (new, _) =
-                            self.insert_child(&to, idx, NewChild::Dir, ino, child_depth);
-                        if let Some(new) = new {
+                            self.insert_child(&to, idx, NewChild::Dir(c.inode()), child_depth);
+                        if let Child::Dir(new) = new {
                             work.push((c, new, child_depth));
                         }
                     }
-                    Some(c) => {
-                        let ino: u64 = c.inode().unwrap_or(0);
-                        let file: FileEntry = c.as_file().copied().unwrap_or_default();
-                        self.insert_child(&to, idx, NewChild::Leaf(file), ino, child_depth);
+                    Child::File(file) => {
+                        self.insert_child(&to, idx, NewChild::File(file), child_depth);
                     }
-                    None => {}
                 }
             }
         }
@@ -1585,67 +1496,79 @@ impl DirTree {
 
     /**
     Re-attach a previously detached child under `parent` with the given
-    name (rename support). The child's stored parent reference must
-    still point at `parent` - the trie has no re-parenting, so
-    cross-directory moves must re-create nodes instead of using this
-    ([DirTree::graft_subtree] for a directory).
+    name (rename support). A directory's stored parent reference must
+    still point at `parent` - the trie has no re-parenting, so a directory
+    moved to another parent is re-created instead ([DirTree::graft_subtree]).
+    A file has no parent reference and goes anywhere.
 
     Any existing occupant of the destination name is removed first
     (rename-over semantics), and a directory child is re-labeled with
     the new name. The tree counters are restored from `counts` as
     captured at detach time.
 
-    Returns `false` (leaving the tree unchanged) if `parent` is not a
-    directory or is not the child's actual parent.
+    Returns `false` (leaving the tree unchanged) if `parent` is not the
+    directory child's actual parent.
     */
     pub(super) fn attach_child_node(
         &self,
-        parent: &Arc<Node>,
+        parent: &Arc<Directory>,
         name_idx: u32,
-        child: Arc<Node>,
+        child: Child,
         counts: NodeCounts,
     ) -> bool {
-        let Some(dir) = parent.as_dir() else {
-            return false;
-        };
-        match child.parent() {
-            Some(p) if Arc::ptr_eq(&p, parent) => {}
-            _ => return false,
+        if let Child::Dir(dir) = &child {
+            match dir.parent() {
+                Some(p) if Arc::ptr_eq(&p, parent) => dir.name_set(name_idx),
+                _ => return false,
+            }
         }
-
         // rename-over: drop any previous occupant of the destination name
-        let occupant: Option<MaybeNode> = dir.read().get(&name_idx).cloned();
-        if let Some(Some(old)) = occupant {
-            self.remove_child_node(parent, name_idx, old);
+        if let Some(old) = parent.get_child(&name_idx) {
+            self.remove_child_node(parent, name_idx, &old);
         }
-
-        if child.node_t.is_dir() {
-            child.set_dir_name(name_idx);
-        }
-        dir.add_child(name_idx, Some(child));
+        parent.add_child(name_idx, child);
         self.conf.counts_mod(counts, 1);
         true
     }
 
     /* --------------------------------- */
 
-    /// Get a [[Node]] from the trie. Expects an absolute path.
-    pub fn get_node(&self, path: &str) -> MaybeNode {
+    /// Get an entry from the trie. Expects an absolute path.
+    pub fn get_node(&self, path: &str) -> Option<NodeRef> {
         // short circuit if the path is not absolute or does not look like a path
         if !path.starts_with(PATH_SEP) || !path.contains(PATH_SEP) {
             return None;
         }
-        let mut current: Arc<Node> = self.root();
-        for part in path_parts(path) {
+        let mut current: Arc<Directory> = self.root();
+        let mut parts = path_parts(path).peekable();
+        while let Some(part) = parts.next() {
             /*
             Lookup only - a component not in the string store cannot be in
             the tree either. Interning here (via insert) would permanently
             grow the store with every queried nonexistent path.
             */
             let idx: u32 = self.strings.idx(part)?;
-            current = current.get_child(&idx)?;
+            match current.get_child(&idx)? {
+                Child::Dir(dir) => current = dir,
+                // a file ends the path, or the path does not exist
+                Child::File(file) => {
+                    return parts.peek().is_none().then_some(NodeRef::File {
+                        parent: current,
+                        name: idx,
+                        file,
+                    });
+                }
+            }
         }
-        Some(current) // found the node
+        Some(NodeRef::Dir(current))
+    }
+
+    /// Get a [[Directory]] from the trie. Expects an absolute path.
+    pub fn get_dir(&self, path: &str) -> Option<Arc<Directory>> {
+        match self.get_node(path)? {
+            NodeRef::Dir(dir) => Some(dir),
+            NodeRef::File { .. } => None,
+        }
     }
 
     /// Checks if a given path exists in the trie. Expects an absolute path.
@@ -1653,11 +1576,11 @@ impl DirTree {
         self.get_node(path).is_some()
     }
 
-    /// The filesystem path of a [[Node]], if it contains a file or directory.
-    pub fn fs_path(&self, node: &Arc<Node>) -> Option<PathBuf> {
-        match node.node_t.has_data() {
-            true => Some(node.path(&self.strings)),
-            false => None,
+    /// The filesystem path of an entry; [None] for the root.
+    pub fn fs_path(&self, node: &NodeRef) -> Option<PathBuf> {
+        match node {
+            NodeRef::Dir(dir) if dir.is_root() => None,
+            _ => Some(node.path(&self.strings)),
         }
     }
 
@@ -1665,116 +1588,110 @@ impl DirTree {
 
     /// If we have a directory handle for a path, return its file descriptor.
     pub fn dirfd(&self, path: &str) -> Option<DirFd> {
-        self.get_node(path).and_then(|node: Arc<Node>| {
-            node.as_dir()
-                .map(|dir: &Directory| dir.fd().clone())
-        })
+        self.get_dir(path).map(|dir: Arc<Directory>| dir.fd().clone())
     }
 
     /**
     If we have a directory handle for a path, return its [CheckedOutHandle].
-    If we don't have an open handle, but we have a [Node] for such directory,
-    we try opening a handle and returning it.
+    If we don't have an open handle, but we have a [Directory] for such
+    directory, we try opening a handle and returning it.
     */
     pub fn handle(&self, path: &str) -> Option<CheckedOutHandle<'_>> {
-        let node: Arc<Node> = self.get_node(path)?;
-        node.as_dir().and_then(|dir: &Directory| {
-            // NOTE: fd 0 is a valid open fd, hence is_open() and not `fd > 0`
-            if dir.fd().is_open() {
-                self.handles.get(dir.fd().fd())
-            } else {
-                let handle: CheckedOutHandle = self.handles.open(&node.path(&self.strings)).ok()?;
-                match dir.fd_set(handle.as_raw_fd()) {
-                    Ok(_) => Some(handle),
-                    // lost a race to another opener: keep theirs, close ours
-                    Err(existing) => {
-                        handle.close();
-                        self.handles.get(existing)
-                    }
+        let dir: Arc<Directory> = self.get_dir(path)?;
+        // NOTE: fd 0 is a valid open fd, hence is_open() and not `fd > 0`
+        if dir.fd().is_open() {
+            self.handles.get(dir.fd().fd())
+        } else {
+            let handle: CheckedOutHandle = self.handles.open(&dir.path(&self.strings)).ok()?;
+            match dir.fd_set(handle.as_raw_fd()) {
+                Ok(_) => Some(handle),
+                // lost a race to another opener: keep theirs, close ours
+                Err(existing) => {
+                    handle.close();
+                    self.handles.get(existing)
                 }
             }
-        })
+        }
     }
 
     /// Remove a handle for a directory path and clear the [DirFd] in the [Directory].
     pub fn handle_close(&self, path: &str) {
-        if let Some(node) = self.get_node(path)
-            && node.is_dir()
-            && let Some(dirfd) = node.dirfd()
-            && dirfd.is_open()
+        if let Some(dir) = self.get_dir(path)
+            && dir.fd().is_open()
         {
-            self.handles.close(dirfd.fd());
-            dirfd.clear();
+            self.handles.close(dir.fd().fd());
+            dir.fd().clear();
         }
     }
 
     /* --------------------------------- */
 
     /**
-    Walks the full tree and returns an Iterator of all nodes. WARNING: this
-    can be memory intensive for large trees. Prefer using [DirTree::iter],
-    which should be more efficient due to not building a full list beforehand.
+    Walks the full tree and returns an Iterator of all entries. WARNING:
+    this can be memory intensive for large trees. Prefer using
+    [DirTree::iter], which should be more efficient due to not building
+    a full list beforehand.
     */
     pub fn nodes<'a>(&'a self) -> Box<NodeIter<'a>> {
-        let q: SegQueue<Arc<Node>> = SegQueue::new();
+        let q: SegQueue<NodeRef> = SegQueue::new();
         trace_span!("walk:nodes").in_scope(|| walk_nodes(&self.root(), &q, true, true));
         Box::new(q.into_iter())
     }
 
-    /// Returns an Iterator of all [[Directory]] nodes in the tree.
-    pub fn dirs<'a>(&'a self) -> Box<NodeIter<'a>> {
-        let q: SegQueue<Arc<Node>> = SegQueue::new();
+    /// Returns an Iterator of all [[Directory]] nodes in the tree (see [DirTree::nodes]).
+    pub fn dirs<'a>(&'a self) -> Box<dyn Iterator<Item = Arc<Directory>> + 'a> {
+        let q: SegQueue<NodeRef> = SegQueue::new();
         trace_span!("walk:dirs").in_scope(|| walk_nodes(&self.root(), &q, true, false));
-        Box::new(q.into_iter())
+        Box::new(q.into_iter().filter_map(|node: NodeRef| match node {
+            NodeRef::Dir(dir) => Some(dir),
+            NodeRef::File { .. } => None,
+        }))
     }
 
-    /// Returns an iterator of all [[FileEntry]] nodes in the tree.
+    /// Returns an iterator of all files in the tree (see [DirTree::nodes]).
     pub fn files<'a>(&'a self) -> Box<NodeIter<'a>> {
-        let q: SegQueue<Arc<Node>> = SegQueue::new();
+        let q: SegQueue<NodeRef> = SegQueue::new();
         trace_span!("walk:files").in_scope(|| walk_nodes(&self.root(), &q, false, true));
         Box::new(q.into_iter())
     }
 
     /* --------------------------------- */
 
-    /// Creates an iterator to iterate through the tree starting from a [[Node]].
-    /// The iterator is depth-first and includes the starting node.
+    /// Creates an iterator to iterate through the tree starting from a [[Directory]].
+    /// The iterator is depth-first and includes the starting directory.
     #[instrument(level = "trace", skip(self))]
-    pub fn iter_from(&self, node: Arc<Node>) -> DirTreeIterator<'_> {
-        DirTreeIterator(VecDeque::from(vec![node]), &self.strings)
+    pub fn iter_from(&self, dir: Arc<Directory>) -> DirTreeIterator<'_> {
+        DirTreeIterator(VecDeque::from(vec![NodeRef::Dir(dir)]), &self.strings)
     }
 
-    /// Creates an iterator to walk through all [[Node]]s in the tree.
+    /// Creates an iterator to walk through all entries in the tree.
     pub fn iter(&self) -> DirTreeIterator<'_> {
         self.iter_from(self.root())
     }
 
-    /// An iterator over all [[Directory]] items in the tree.
-    pub fn iter_dirs<'a>(&'a self) -> impl Iterator<Item = Directory> + 'a {
-        self.iter()
-            .filter_map(|node: Arc<Node>| node.as_dir().cloned())
+    /// A lazy iterator over all [[Directory]] nodes in the tree (shared, not copied).
+    pub fn iter_dirs<'a>(&'a self) -> impl Iterator<Item = Arc<Directory>> + 'a {
+        self.iter().filter_map(|node: NodeRef| match node {
+            NodeRef::Dir(dir) => Some(dir),
+            NodeRef::File { .. } => None,
+        })
     }
 
-    /// An iterator over all [[FileEntry]] items in the tree.
+    /// A lazy iterator over all [[FileEntry]] items in the tree (`Copy`, 16 bytes).
     pub fn iter_files<'a>(&'a self) -> impl Iterator<Item = FileEntry> + 'a {
-        self.iter()
-            .filter_map(|node: Arc<Node>| node.as_file().cloned())
+        self.iter().filter_map(|node: NodeRef| node.as_file().copied())
     }
 
     /// An iterator over all Paths in the tree.
     pub fn iter_paths(&self) -> impl Iterator<Item = String> + '_ {
         self.iter()
-            .filter_map(|node: Arc<Node>| self.fs_path(&node))
+            .filter_map(|node: NodeRef| self.fs_path(&node))
             .map(|p: PathBuf| p.to_string_lossy().to_string())
     }
 
-    /// Count the number of directory and file nodes by iterating from a [[Node]].
-    /// Also counts the starting node. Returns a tuple of `(nodes, dirs, files)`.
-    pub fn iter_count_from(&self, node: Arc<Node>) -> NodeCounts {
-        if node.node_t.is_file() {
-            return NodeCounts::of_node(&node);
-        }
-
+    /// Count the number of directories and files by iterating from a [[Directory]].
+    /// Also counts the starting directory.
+    pub fn iter_count_from(&self, dir: Arc<Directory>) -> NodeCounts {
         let mut counts: NodeCounts = NodeCounts::default();
         /*
         NOTE: trying to convert this iterating closure to a parallel
@@ -1782,44 +1699,49 @@ impl DirTree {
         This is much more than the slowdown observed with `count_from()`,
         and I have no good explanation for it at this point.
         */
-        self.iter_from(node).for_each(|node: Arc<Node>| counts.add_node(&node));
+        self.iter_from(dir).for_each(|node: NodeRef| match node {
+            NodeRef::Dir(_) => counts.add_dir(),
+            NodeRef::File { file, .. } => counts.add_file(&file),
+        });
         counts
     }
 
-    /// Count the number of directory and file nodes by iterating the whole tree.
-    /// Does not count the root [[Node]].
+    /// Count the number of directories and files by iterating the whole tree.
+    /// Does not count the root [[Directory]].
     pub fn iter_count(&self) -> NodeCounts {
         let mut counts: NodeCounts = self.iter_count_from(self.root());
-        counts.nodes -= 1; // remove root node since we started from it
+        // remove the root since we started from it
+        counts.nodes -= 1;
+        counts.dirs -= 1;
         counts
     }
 
     /* --------------------------------- */
 
-    /// Traverses the tree from root and applies function `f` to each [[Node]].
+    /**
+    Traverses the tree from root and applies function `f` to each entry.
+    `f` must not modify the directory whose entries are being visited
+    (see [NodeView]).
+    */
     pub fn traverse<F>(&self, mut f: F)
     where
-        F: FnMut(&Arc<Node>),
+        F: FnMut(NodeView<'_>),
     {
         traverse_from(&self.root(), &mut f);
     }
 
     /// Traverses the tree from root in parallel and applies function `f`
-    /// to each [[Node]].
+    /// to each entry (see [DirTree::traverse]).
     pub fn traverse_par<F>(&self, f: F)
     where
-        F: Fn(&Arc<Node>) + Send + Sync,
+        F: Fn(NodeView<'_>) + Send + Sync,
     {
         traverse_from_par(&self.root(), &f);
     }
 
-    /// Count the number of directory and file nodes with `traverse()`. Also counts
-    /// the starting [[Node]] (except root).
-    pub fn count_from(&self, node: Arc<Node>) -> NodeCounts {
-        if node.node_t.is_file() {
-            return NodeCounts::of_node(&node);
-        }
-
+    /// Count the directories and files with `traverse()`. Also counts the
+    /// starting [[Directory]] (except the root).
+    pub fn count_from(&self, dir: &Arc<Directory>) -> NodeCounts {
         let mut counts: NodeCounts = NodeCounts::default();
         /*
         NOTE: trying to convert this iterating closure to a parallel
@@ -1827,27 +1749,37 @@ impl DirTree {
         Likely the overhead from moving stuff between threads and having
         to use Atomic versions of counters is the main reason.
         */
-        traverse_from(&node, &mut |n: &Arc<Node>| counts.add_node(n));
-
-        if node.node_t == NodeType::Root {
-            counts.nodes -= 1; // remove root node if we started from it
+        traverse_from(dir, &mut |n: NodeView<'_>| match n {
+            NodeView::Dir(_) => counts.add_dir(),
+            NodeView::File { file, .. } => counts.add_file(file),
+        });
+        if dir.is_root() {
+            // remove the root if we started from it
+            counts.nodes -= 1;
+            counts.dirs -= 1;
         };
         counts
     }
 
-    /// Calculates and returns the memory usage of directory and file nodes.
+    /**
+    Calculates and returns the memory usage of directories and files:
+    `(directories, files)`. A file has no memory of its own, only its
+    slot in its directory's children map; see `Directory::size_immediate`.
+    */
     #[cfg(feature = "size_of")]
     pub fn nodes_memuse(&self) -> (u64, u64) {
-        let dn_sz: AtomicU32 = AtomicU32::new(0);
-        let fn_sz: AtomicU32 = AtomicU32::new(0);
+        let dn_sz: AtomicU64 = AtomicU64::new(0);
+        let fn_sz: AtomicU64 = AtomicU64::new(0);
 
-        traverse_from_par(&self.root, &|n: &Arc<Node>| match n.node_t {
-            NodeType::Directory => mod_atom_u32(&dn_sz, n.size_immediate().total_bytes() as i32),
-            NodeType::File => mod_atom_u32(&fn_sz, n.size_of().total_bytes() as i32),
-            _ => (),
+        traverse_from_par(&self.root, &|n: NodeView<'_>| {
+            if let NodeView::Dir(dir) = n {
+                let (dirs, files) = dir.size_immediate();
+                dn_sz.fetch_add(dirs as u64, Relaxed);
+                fn_sz.fetch_add(files as u64, Relaxed);
+            }
         });
 
-        (dn_sz.load(Relaxed) as u64, fn_sz.load(Relaxed) as u64)
+        (dn_sz.load(Relaxed), fn_sz.load(Relaxed))
     }
 }
 
@@ -1930,40 +1862,35 @@ stamp (so the diff pre-check still skips it) and the pooled handle's fd
 (the handle stays pooled; only the old node, being dropped, stops
 pointing at it).
 */
-fn carry_dir_state(from: &Node, to: &Node) {
-    if let Some(stamp) = from.scan_stamp() {
-        to.set_scan_stamp(stamp);
-    }
-    if let (Some(old), Some(new)) = (from.as_dir(), to.as_dir())
-        && old.fd().is_open()
-    {
-        new.fd_set(old.fd().fd()).ok();
+fn carry_dir_state(from: &Directory, to: &Directory) {
+    to.set_scan_stamp(from.scan_stamp());
+    if from.fd().is_open() {
+        to.fd_set(from.fd().fd()).ok();
     }
 }
 
 /* ######################################################################### */
 
-/// Iterator for walking through a [[DirTree]].
-pub struct DirTreeIterator<'a>(VecDeque<Arc<Node>>, &'a UniqueStrStore);
+/// Iterator for walking through a [[DirTree]]. Holds no lock between items.
+pub struct DirTreeIterator<'a>(VecDeque<NodeRef>, &'a UniqueStrStore);
 
 impl<'a> Iterator for DirTreeIterator<'a> {
-    type Item = Arc<Node>;
+    type Item = NodeRef;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.pop_front().inspect(|node: &Arc<Node>| {
+        self.0.pop_front().inspect(|node: &NodeRef| {
             trace!(target: "DirTreeIterator", "{}", node.path(self.1).display());
-            let Some(children) = node.children() else {
+            let NodeRef::Dir(dir) = node else {
                 return;
             };
 
             // Push all found children to the stack
-            children.read().values().flatten().for_each(|child: &Arc<Node>| {
-                if child.is_traversable() {
-                    // push directories to the front of the queue...
-                    self.0.push_front(child.clone());
-                } else {
-                    // ...and files to the back
-                    self.0.push_back(child.clone());
+            dir.children().read().iter().for_each(|(name, child): (&u32, &Child)| match child {
+                // push directories to the front of the queue...
+                Child::Dir(d) => self.0.push_front(NodeRef::Dir(d.clone())),
+                // ...and files to the back
+                Child::File(file) => {
+                    self.0.push_back(NodeRef::File { parent: dir.clone(), name: *name, file: *file })
                 }
             });
         })

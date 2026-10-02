@@ -255,7 +255,8 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
 
 - Splitting the tree module out into its own crate so other projects
   can depend on it without pulling in statter's CLI surface.
-- Per-node tag storage (`Node::tag: AtomicU16`) so a post-walk consumer
+- Per-directory tag storage (`Directory::tag: AtomicU16`; a `FileEntry`
+  has spare bytes for one too) so a post-walk consumer
   can query the tree by tag instead of (or in addition to) the
   discovery channel.
 - Removal hooks on `TreeObserver` (`dirs_removed` / `files_removed`,

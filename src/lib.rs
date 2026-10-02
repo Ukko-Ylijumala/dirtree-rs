@@ -4,7 +4,7 @@
 Trie-based directory tree, scanned and held in memory.
 
 The module is split into several submodules for clarity:
-- `node`:     the building blocks of the trie: `Data`, `Entry<T>`, `Directory`, `FileEntry`, `FileKind`, `NodeType`, `NodeItem`, `Node`.
+- `node`:     the building blocks of the trie: `Directory` (a shared node), `FileEntry` (stored by value), `Child`, `FileKind`, `NodeRef`, `NodeView`.
 - `hash`:     [`DirTreeXxh3Hasher`] used for [`HashMap`](std::collections::HashMap) keys in the trie.
 - `conf`:     [`TreeConf`] - atomic counters and feature flags.
 - `event`:    [`TreeOp`], [`TreeState`], [`TreeEvent`], [`EventInfo`].
@@ -12,7 +12,7 @@ The module is split into several submodules for clarity:
 - `filemode`: [`FileMode`] - how a walk handles the files it finds.
 - `filters`:  [`Filters`] - regex name filters for files and directories.
 - `error`:    [`TreeError`] and [`TreeResult`] for the fallible API.
-- `traverse`: free traversal helpers over `Arc<Node>`.
+- `traverse`: free traversal helpers from an `Arc<Directory>`, calling back with a `NodeView`.
 - `observer`: [`TreeObserver`] - progress reporting out of the tree.
 - `update`:   diff-rescan (the [`TreeOp::Update`] primitive).
 - `utils`:    small shared helpers (path splitting, weak refs, atomics).
@@ -51,7 +51,7 @@ pub use event::{EventInfo, TreeEvent, TreeOp, TreeState};
 pub use filemode::FileMode;
 pub use filters::Filters;
 pub use hash::DirTreeXxh3Hasher;
-pub use node::{Directory, Entry, FileEntry, FileKind, Node, NodeItem, NodeType};
+pub use node::{Child, Directory, FileEntry, FileKind, NodeRef, NodeView};
 pub use observer::{NoopObserver, TreeObserver};
 pub use traverse::{traverse_from, traverse_from_par, walk_nodes};
 pub use update::UpdateStats;
