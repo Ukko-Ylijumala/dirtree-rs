@@ -19,6 +19,12 @@ pub enum TreeError {
     WorkerSpawn(io::Error),
     /// The background worker thread panicked; holds the panic message.
     WorkerPanicked(String),
+    /**
+    A background operation was requested, but no worker thread runs it:
+    the tree was not built with [`build()`](super::DirTree::build), or
+    its worker was stopped, is quitting or has died.
+    */
+    WorkerNotRunning,
 }
 
 impl Display for TreeError {
@@ -27,6 +33,7 @@ impl Display for TreeError {
             Self::NoRoot => f.write_str("root path must be set before building the tree"),
             Self::WorkerSpawn(e) => write!(f, "failed to start the tree worker thread: {e}"),
             Self::WorkerPanicked(msg) => write!(f, "the tree worker thread panicked: {msg}"),
+            Self::WorkerNotRunning => f.write_str("the tree worker thread is not running"),
         }
     }
 }

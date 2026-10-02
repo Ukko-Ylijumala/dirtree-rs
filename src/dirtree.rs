@@ -267,9 +267,13 @@ impl DirTree {
         self.workq.write().push_front(op);
     }
 
-    /// Whether the background worker thread has been started.
+    /**
+    Whether the background worker thread is up and taking work: started
+    by [DirTree::build], and neither stopped, quitting nor dead.
+    */
     pub fn is_worker_running(&self) -> bool {
-        self.worker.lock().is_some()
+        let alive: bool = self.worker.lock().as_ref().is_some_and(|w| !w.is_finished());
+        alive && !self.is_quitting()
     }
 
     /**
@@ -282,14 +286,16 @@ impl DirTree {
     Dropping the tree stops the worker too; this is for stopping it
     early, and for seeing a panic. The tree stays usable afterwards
     through the blocking API ([DirTree::walk], [DirTree::update] etc.),
-    but [DirTree::scan] and [DirTree::rescan] need a running worker.
+    but [DirTree::scan] and [DirTree::rescan] need a running worker and
+    fail with [TreeError::WorkerNotRunning] without one.
 
     A worker that panicked fails with [TreeError::WorkerPanicked]; the
     panic is also logged as a tree error, and if it struck during an
     operation the tree is left [TreeState::Inconsistent].
     */
     pub fn stop_worker(&self) -> TreeResult<()> {
-        if !self.is_worker_running() {
+        // a worker that is quitting or dead still gets joined, to see a panic
+        if self.worker.lock().is_none() {
             return Ok(());
         }
         let before: TreeState = self.state();
@@ -341,10 +347,12 @@ impl DirTree {
 
     NOTE: non-blocking, the actual scan is done in the background. The scan
     is finished when [TreeState::Ready]. This can also be checked with the
-    `is_ready()` method.
+    `is_ready()` method. Fails with [TreeError::WorkerNotRunning] when no
+    worker would run it (see [DirTree::is_worker_running]); [DirTree::walk]
+    is the blocking form.
     */
-    pub fn scan(&self, path: &str, recursive: Option<bool>) {
-        self.queue_op(TreeOp::Scan(PathBuf::from(path), recursive));
+    pub fn scan(&self, path: &str, recursive: Option<bool>) -> TreeResult<()> {
+        self.queue_bg_op(TreeOp::Scan(PathBuf::from(path), recursive))
     }
 
     /**
@@ -352,10 +360,20 @@ impl DirTree {
     path: entries that appeared on disk are inserted, entries that
     vanished are removed, entries whose inode changed are replaced.
 
-    NOTE: non-blocking; see [DirTree::update] for the direct form.
+    NOTE: non-blocking; see [DirTree::update] for the direct form. Fails
+    with [TreeError::WorkerNotRunning] when no worker would run it.
     */
-    pub fn rescan(&self, path: &str) {
-        self.queue_op(TreeOp::Update(PathBuf::from(path)));
+    pub fn rescan(&self, path: &str) -> TreeResult<()> {
+        self.queue_bg_op(TreeOp::Update(PathBuf::from(path)))
+    }
+
+    /// Queue `op` for the worker, or fail if there is no worker to run it.
+    fn queue_bg_op(&self, op: TreeOp) -> TreeResult<()> {
+        if !self.is_worker_running() {
+            return Err(TreeError::WorkerNotRunning);
+        }
+        self.queue_op(op);
+        Ok(())
     }
 
     /// Returns `true` if the tree is uninitialized.

@@ -124,7 +124,7 @@ fn test_tree_build_thread() {
     assert!(tree.worker.lock().is_some(), "Worker not initialized");
 
     // scan is non-blocking, so we must wait for it to finish
-    tree.scan(path, Some(true));
+    tree.scan(path, Some(true)).unwrap();
     while !tree.is_ready() {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -750,7 +750,7 @@ fn test_tree_stop_worker() {
         .from_path(dir)
         .build()
         .unwrap();
-    tree.scan(dir, Some(true));
+    tree.scan(dir, Some(true)).unwrap();
     while !tree.is_ready() {
         thread::sleep(Duration::from_millis(10));
     }
@@ -761,6 +761,10 @@ fn test_tree_stop_worker() {
     assert_eq!(Arc::strong_count(&tree), 1);
     // stopping again is a no-op
     tree.stop_worker().unwrap();
+    // nothing would run background ops: refused, not queued
+    assert!(matches!(tree.scan(dir, None), Err(TreeError::WorkerNotRunning)));
+    assert!(matches!(tree.rescan(dir), Err(TreeError::WorkerNotRunning)));
+    assert!(tree.no_work());
 
     // the blocking API still works
     std::fs::write(temp.path().join("new.bin"), b"").unwrap();
@@ -781,7 +785,7 @@ fn test_tree_drop_stops_worker() {
         .with_observer(obs.clone())
         .build()
         .unwrap();
-    tree.scan(dir, Some(true));
+    tree.scan(dir, Some(true)).unwrap();
     while !tree.is_ready() {
         thread::sleep(Duration::from_millis(10));
     }
@@ -841,7 +845,7 @@ fn test_tree_drop_mid_scan() {
         .with_observer(gate.clone())
         .build()
         .unwrap();
-    tree.scan(dir, Some(true));
+    tree.scan(dir, Some(true)).unwrap();
     while !gate.entered.load(Relaxed) {
         thread::yield_now();
     }
@@ -876,7 +880,15 @@ fn test_tree_worker_panicked() {
         if mid_op {
             tree.set_state(TreeState::Active(TreeOp::Insert));
         }
+        // a tree never built has no worker
+        assert!(matches!(tree.rescan("/"), Err(TreeError::WorkerNotRunning)));
         *tree.worker.lock() = Some(thread::spawn(worker));
+        while !tree.worker.lock().as_ref().unwrap().is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // a dead worker takes no more work, even before it is joined
+        assert!(!tree.is_worker_running());
+        assert!(matches!(tree.scan("/", None), Err(TreeError::WorkerNotRunning)));
         let res = tree.stop_worker();
         assert!(
             matches!(res, Err(TreeError::WorkerPanicked(ref msg)) if msg == "worker boom"),
@@ -1001,14 +1013,14 @@ fn test_tree_rescan_via_worker() {
         .from_path(dir)
         .build()
         .unwrap();
-    tree.scan(dir, Some(true));
+    tree.scan(dir, Some(true)).unwrap();
     let p_a: String = format!("{dir}/a.bin");
     wait_for(|| tree.contains(&p_a), "initial scan should find a.bin");
 
     // mutate and let the queued Update op reconcile the tree
     std::fs::write(temp.path().join("b.bin"), b"y").unwrap();
     std::fs::remove_file(temp.path().join("a.bin")).unwrap();
-    tree.rescan(dir);
+    tree.rescan(dir).unwrap();
     wait_for(|| tree.contains(&format!("{dir}/b.bin")), "rescan should add b.bin");
     wait_for(|| !tree.contains(&p_a), "rescan should remove a.bin");
 
