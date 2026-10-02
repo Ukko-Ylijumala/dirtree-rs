@@ -4,9 +4,12 @@
 
 #![allow(dead_code)]
 
-use std::sync::{
-    atomic::{AtomicU32, Ordering::Relaxed},
-    Arc, Weak,
+use std::{
+    any::Any,
+    sync::{
+        atomic::{AtomicU32, Ordering::Relaxed},
+        Arc, Weak,
+    },
 };
 
 /// Path component separator of the paths the tree stores.
@@ -68,5 +71,16 @@ pub fn mod_atom_u32(a: &AtomicU32, n: i32) {
         a.fetch_add(n as u32, Relaxed);
     } else if n < 0 {
         a.fetch_sub(n.unsigned_abs(), Relaxed);
+    }
+}
+
+/// The message of a thread's panic, from the payload `JoinHandle::join` returns.
+pub(crate) fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(msg) => *msg,
+        Err(payload) => match payload.downcast_ref::<&str>() {
+            Some(msg) => msg.to_string(),
+            None => "<non-string panic payload>".to_owned(),
+        },
     }
 }

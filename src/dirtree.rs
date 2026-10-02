@@ -9,7 +9,7 @@ use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::visitor::*;
 use super::worker::tree_worker;
 use super::{FileMode, Filters};
-use super::utils::{PATH_SEP, path_parts};
+use super::utils::{PATH_SEP, panic_message, path_parts};
 
 use dirhandle::{
     CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles,
@@ -28,7 +28,6 @@ use rayon::prelude::*;
 use tracing::{debug, error, instrument, trace, trace_span, warn};
 
 use std::{
-    any::Any,
     borrow::Cow,
     collections::VecDeque,
     ffi::OsStr,
@@ -39,7 +38,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::DirEntryExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
     thread,
 };
 
@@ -264,6 +263,53 @@ impl DirTree {
     }
 
     /**
+    Stop the background worker thread started by [DirTree::build] and
+    wait for it to exit. The operation in progress, if any, finishes;
+    operations still queued are dropped. The tree then returns to the
+    state it was in before the stop ([TreeState::Ready] if the stop
+    caught an operation in progress). A no-op without a worker.
+
+    Dropping the tree stops the worker too; this is for stopping it
+    early, and for seeing a panic. The tree stays usable afterwards
+    through the blocking API ([DirTree::walk], [DirTree::update] etc.),
+    but [DirTree::scan] and [DirTree::rescan] need a running worker.
+
+    A worker that panicked fails with [TreeError::WorkerPanicked]; the
+    panic is also logged as a tree error, and if it struck during an
+    operation the tree is left [TreeState::Inconsistent].
+    */
+    pub fn stop_worker(&self) -> TreeResult<()> {
+        if !self.is_worker_running() {
+            return Ok(());
+        }
+        let before: TreeState = self.state();
+        let res: TreeResult<()> = self.quit_worker(true);
+        /*
+        Nothing runs the queue any more. It still holds the extra Quit
+        that set_state(Quitting) queues behind the one the worker took
+        (or ours, if the worker died first), and that would block the
+        Ready state below.
+        */
+        self.workq.write().clear();
+        match res {
+            // the worker left Quitting; an op it was running has finished
+            Ok(()) => self.set_state(match before {
+                TreeState::Active(_) => TreeState::Ready,
+                state => state,
+            }),
+            Err(ref e) => {
+                let ev: TreeEvent = TreeEvent::new(&e.to_string());
+                self.add_error(ev.clone());
+                // the state the worker died in; Active = an op half-applied
+                if self.active_op().is_some() {
+                    self.set_state(TreeState::Inconsistent(ev));
+                }
+            }
+        }
+        res
+    }
+
+    /**
     Tell the background worker thread to quit. Optionally wait till
     the worker thread exits; a worker that panicked is reported as
     [TreeError::WorkerPanicked]. Never fails without `block`.
@@ -271,16 +317,9 @@ impl DirTree {
     pub(super) fn quit_worker(&self, block: bool) -> TreeResult<()> {
         self.queue_op_prio(TreeOp::Quit);
         if block && let Some(worker) = self.worker.lock().take() {
-            worker.join().map_err(|payload: Box<dyn Any + Send>| {
-                let msg: String = match payload.downcast::<String>() {
-                    Ok(msg) => *msg,
-                    Err(payload) => match payload.downcast_ref::<&str>() {
-                        Some(msg) => msg.to_string(),
-                        None => "<non-string panic payload>".to_owned(),
-                    },
-                };
-                TreeError::WorkerPanicked(msg)
-            })?;
+            worker
+                .join()
+                .map_err(|payload| TreeError::WorkerPanicked(panic_message(payload)))?;
         }
         Ok(())
     }
@@ -363,7 +402,12 @@ impl DirTree {
             root: Node::new(NodeItem::Root(Directory::new(name_idx)), None).into(),
             conf: TreeConf::new(filemode, filters).into(),
             strings: store,
-            ..Default::default()
+            // spelled out: a Drop type cannot take the ..Default::default() form
+            worker: Mutex::default(),
+            handles: OpenHandles::default(),
+            state: RwLock::default(),
+            workq: RwLock::default(),
+            events: RwLock::default(),
         }
     }
 
@@ -471,11 +515,11 @@ impl DirTree {
     pub fn build(self) -> TreeResult<Arc<Self>> {
         self.from()?;
         let tree: Arc<Self> = self.into();
-        let tree_c: Arc<Self> = tree.clone();
+        let tree_w: Weak<Self> = Arc::downgrade(&tree);
         let worker: thread::JoinHandle<()> = thread::Builder::new()
             .stack_size(256 * 1024) // 256 KiB
             .name("tree_worker".into())
-            .spawn(|| tree_worker(tree_c))
+            .spawn(|| tree_worker(tree_w))
             .map_err(TreeError::WorkerSpawn)?;
         *tree.worker.lock() = Some(worker);
         Ok(tree)
@@ -1801,6 +1845,27 @@ impl DirTree {
         });
 
         (dn_sz.load(Relaxed) as u64, fn_sz.load(Relaxed) as u64)
+    }
+}
+
+/**
+Stops the background worker thread, if any. The worker holds only a
+`Weak` reference, so once this runs it can no longer reach the tree and
+exits on its next round; this waits for that. If the worker itself let go
+of the last reference (an operation finishing after every outside `Arc`
+was dropped), this runs on the worker thread, which exits right after.
+*/
+impl Drop for DirTree {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.get_mut().take() else {
+            return;
+        };
+        if worker.thread().id() == thread::current().id() {
+            return;
+        }
+        if let Err(payload) = worker.join() {
+            error!("tree worker thread panicked: {}", panic_message(payload));
+        }
     }
 }
 

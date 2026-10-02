@@ -12,10 +12,11 @@ use std::{
     collections::HashSet,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    panic,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        Arc, Once, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
     },
     thread,
     time::Duration,
@@ -31,6 +32,8 @@ const EXP_NODES: u32 = EXP_DIRS + EXP_FILES;
 // statics for all tests
 static mut TESTDIR: Option<TempDir> = None;
 static INITIALIZED: Mutex<bool> = Mutex::new(false);
+/// Panics on tree worker threads, counted by [count_worker_panics].
+static WORKER_PANICS: AtomicU32 = AtomicU32::new(0);
 
 /// Setup common test environment for all tests. Will initialize
 /// the needed statics only once (due to the Mutex).
@@ -126,7 +129,7 @@ fn test_tree_build_thread() {
     let (nodes, dirs, files, depth) = counts(&tree);
     let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
     check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
-    tree.quit_worker(true).unwrap();
+    tree.stop_worker().unwrap();
 }
 
 #[test]
@@ -684,17 +687,160 @@ fn test_node_name_detached() {
 }
 
 #[test]
+fn test_tree_stop_worker() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(2).level(2, 3).create(temp.path()).unwrap();
+
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .build()
+        .unwrap();
+    assert_eq!(tree.state(), TreeState::Empty);
+    tree.stop_worker().unwrap();
+    // back to where it was, with nothing left queued
+    assert_eq!(tree.state(), TreeState::Empty);
+    assert!(tree.no_work());
+
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .build()
+        .unwrap();
+    tree.scan(dir, Some(true));
+    while !tree.is_ready() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    tree.stop_worker().unwrap();
+    assert!(!tree.is_worker_running());
+    assert!(tree.is_ready(), "{:?}", tree.state());
+    // the worker's reference to the tree is gone
+    assert_eq!(Arc::strong_count(&tree), 1);
+    // stopping again is a no-op
+    tree.stop_worker().unwrap();
+
+    // the blocking API still works
+    std::fs::write(temp.path().join("new.bin"), b"").unwrap();
+    tree.update(dir, None).unwrap();
+    assert!(tree.is_ready(), "{:?}", tree.state());
+    assert!(tree.contains(&format!("{dir}/new.bin")));
+}
+
+#[test]
+fn test_tree_drop_stops_worker() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().level(3, 4).create(temp.path()).unwrap();
+
+    let obs: Arc<CountingObserver> = Arc::new(CountingObserver::default());
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_observer(obs.clone())
+        .build()
+        .unwrap();
+    tree.scan(dir, Some(true));
+    while !tree.is_ready() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let weak: Weak<DirTree> = Arc::downgrade(&tree);
+    // the worker holds no reference while idle: this frees the tree now
+    drop(tree);
+    assert_eq!(weak.strong_count(), 0);
+    // and with it the tree's conf, which holds the observer
+    assert_eq!(Arc::strong_count(&obs), 1);
+}
+
+/**
+Count panics on tree worker threads into [WORKER_PANICS]: such a panic
+never reaches the test thread. Installed once, chained to the previous
+hook, so panic output is unchanged.
+*/
+fn count_worker_panics() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if thread::current().name() == Some("tree_worker") {
+                WORKER_PANICS.fetch_add(1, Relaxed);
+            }
+            prev(info);
+        }));
+    });
+}
+
+/// Holds the walk in `files_added` until released, to drop a tree mid-scan.
+#[derive(Default, Debug)]
+struct GateObserver {
+    entered: AtomicBool,
+    released: AtomicBool,
+}
+
+impl TreeObserver for GateObserver {
+    fn files_added(&self, _n: u64, _bytes: u64) {
+        self.entered.store(true, Relaxed);
+        while !self.released.load(Relaxed) {
+            thread::yield_now();
+        }
+    }
+}
+
+#[test]
+fn test_tree_drop_mid_scan() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().level(3, 4).create(temp.path()).unwrap();
+
+    count_worker_panics();
+    let panics: u32 = WORKER_PANICS.load(Relaxed);
+    let gate: Arc<GateObserver> = Arc::new(GateObserver::default());
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_observer(gate.clone())
+        .build()
+        .unwrap();
+    tree.scan(dir, Some(true));
+    while !gate.entered.load(Relaxed) {
+        thread::yield_now();
+    }
+    /*
+    The worker is mid-scan and holds the only other reference; dropping
+    ours leaves the last one to the worker, so the tree's Drop runs on
+    the worker thread when the scan ends. It must not join itself.
+    */
+    let weak: Weak<DirTree> = Arc::downgrade(&tree);
+    drop(tree);
+    assert_eq!(weak.strong_count(), 1, "the worker holds the tree mid-scan");
+    gate.released.store(true, Relaxed);
+    for _ in 0..500 {
+        if Arc::strong_count(&gate) == 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(weak.strong_count(), 0, "tree not freed after the scan");
+    assert_eq!(Arc::strong_count(&gate), 1, "tree not fully dropped");
+    assert_eq!(WORKER_PANICS.load(Relaxed), panics, "the worker panicked");
+}
+
+#[test]
 fn test_tree_worker_panicked() {
     // both panic payload types: a literal (&str) and a formatted String
     let workers: [fn(); 2] = [|| panic!("worker boom"), || panic!("worker {}", "boom")];
-    for worker in workers {
+    for (i, worker) in workers.into_iter().enumerate() {
         let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default());
+        // the second one dies mid-operation
+        let mid_op: bool = i == 1;
+        if mid_op {
+            tree.set_state(TreeState::Active(TreeOp::Insert));
+        }
         *tree.worker.lock() = Some(thread::spawn(worker));
-        let res = tree.quit_worker(true);
+        let res = tree.stop_worker();
         assert!(
             matches!(res, Err(TreeError::WorkerPanicked(ref msg)) if msg == "worker boom"),
             "{res:?}"
         );
+        assert!(!tree.is_worker_running() && tree.no_work());
+        assert_eq!(tree.conf().errors(), 1);
+        assert_eq!(tree.is_error(), mid_op, "{:?}", tree.state());
     }
 }
 
@@ -784,7 +930,7 @@ fn test_tree_rescan_via_worker() {
     wait_for(|| tree.contains(&format!("{dir}/b.bin")), "rescan should add b.bin");
     wait_for(|| !tree.contains(&p_a), "rescan should remove a.bin");
 
-    tree.quit_worker(true).unwrap();
+    tree.stop_worker().unwrap();
     tree_validate_counts(&tree);
 }
 
