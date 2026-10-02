@@ -268,6 +268,8 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
 
 - Splitting the tree module out into its own crate so other projects
   can depend on it without pulling in statter's CLI surface.
+- Tree snapshots (save to / load from a file, then `update()` to
+  resync), planned for after the split: see `docs/snapshot.md`.
 - Removal hooks on `TreeObserver` (`dirs_removed` / `files_removed`,
   default no-ops), so an observer can track the live tree size through
   `update()` and the watcher. `UpdateStats` already carries the removal
