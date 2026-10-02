@@ -8,8 +8,8 @@ use std::{
     str::FromStr,
 };
 
-/// Bitmap of options for file handling during directory tree scanning.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// Bitmap of options for file handling during directory tree scanning. Defaults to [FileMode::UNSET].
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FileMode(u8);
 
 impl FileMode {
@@ -122,12 +122,6 @@ impl From<FileMode> for u8 {
 impl From<u8> for FileMode {
     fn from(bits: u8) -> Self {
         FileMode(bits)
-    }
-}
-
-impl Default for FileMode {
-    fn default() -> Self {
-        FileMode(0) // unset
     }
 }
 

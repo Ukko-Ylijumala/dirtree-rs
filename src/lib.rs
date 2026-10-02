@@ -4,8 +4,7 @@
 Trie-based directory tree, scanned and held in memory.
 
 The module is split into several submodules for clarity:
-- [`node`]:     `Data`, `Entry<T>`, `Directory`, `FileEntry`, `NodeType`,
-                `NodeItem`, and `Node` - the building blocks of the trie.
+- [`node`]:     the building blocks of the trie: `Data`, `Entry<T>`, `Directory`, `FileEntry`, `NodeType`, `NodeItem`, `Node`.
 - [`hash`]:     [`DirTreeXxh3Hasher`] used for [`HashMap`] keys in the trie.
 - [`conf`]:     [`TreeConf`] - atomic counters and feature flags.
 - [`event`]:    [`TreeOp`], [`TreeState`], [`TreeEvent`], [`EventInfo`].

@@ -37,7 +37,7 @@ use std::{
     io::{Error, ErrorKind},
     os::unix::ffi::OsStrExt,
     os::unix::fs::MetadataExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering::Relaxed},
 };
@@ -477,7 +477,7 @@ impl DirTree {
         name_idx: u32,
         inode: u64,
         depth: u8,
-        child_p: &PathBuf,
+        child_p: &Path,
         recursive: bool,
         ctr: &UpdateCtr,
     ) {

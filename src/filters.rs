@@ -38,26 +38,26 @@ impl Filters {
     pub fn passes(&self, name: &OsStr, is_dir: bool) -> bool {
         let name = name.to_string_lossy();
         if is_dir {
-            if let Some(ref re) = self.exclude_dirs {
-                if re.is_match(&name) {
-                    return false;
-                }
+            if let Some(ref re) = self.exclude_dirs
+                && re.is_match(&name)
+            {
+                return false;
             }
-            if let Some(ref re) = self.include_dirs {
-                if !re.is_match(&name) {
-                    return false;
-                }
+            if let Some(ref re) = self.include_dirs
+                && !re.is_match(&name)
+            {
+                return false;
             }
         } else {
-            if let Some(ref re) = self.exclude_files {
-                if re.is_match(&name) {
-                    return false;
-                }
+            if let Some(ref re) = self.exclude_files
+                && re.is_match(&name)
+            {
+                return false;
             }
-            if let Some(ref re) = self.include_files {
-                if !re.is_match(&name) {
-                    return false;
-                }
+            if let Some(ref re) = self.include_files
+                && !re.is_match(&name)
+            {
+                return false;
             }
         }
         true

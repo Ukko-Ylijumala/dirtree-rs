@@ -55,7 +55,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::MetadataExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
     sync::{Arc, Weak},
@@ -649,7 +649,7 @@ impl TreeWatcher {
     fn on_moved_to(
         &self,
         parent: &Arc<Node>,
-        dir_path: &PathBuf,
+        dir_path: &Path,
         name: &OsStr,
         cookie: u32,
         is_dir: bool,

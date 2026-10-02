@@ -143,10 +143,7 @@ trait DirectoryEntry {
     fn data_mut(&mut self) -> &mut Data;
 
     fn stat(&self, path: &PathBuf) -> Option<Metadata> {
-        match metadata(path) {
-            Ok(meta) => return Some(meta),
-            Err(_) => return None,
-        };
+        metadata(path).ok()
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -330,7 +327,7 @@ impl Directory {
     /// Get a child node by name.
     #[inline]
     pub fn get_child(&self, name_idx: &u32) -> MaybeNode {
-        self.read().get(name_idx).map(|v: &MaybeNode| v.clone())?
+        self.read().get(name_idx).cloned()?
     }
 
     /// Remove a child node (or a file name entry) by name. The removal is
@@ -493,7 +490,7 @@ impl Hash for Directory {
             .iter()
             .map(|(name, child)| (name.to_owned(), child.clone()))
             .collect();
-        children.sort_by_key(|(name, _)| name.clone());
+        children.sort_by_key(|(name, _)| *name);
         children.hash(state);
     }
 }
@@ -511,7 +508,7 @@ impl PartialEq for Directory {
         let (a, b) = (self.children.read(), other.children.read());
         a.len() == b.len()
             && a.iter()
-                .all(|(name, child)| b.get(name).map_or(false, |ov: &MaybeNode| *child == *ov))
+                .all(|(name, child)| b.get(name).is_some_and(|ov: &MaybeNode| *child == *ov))
     }
 }
 
@@ -683,7 +680,7 @@ impl NodeItem {
         if let Self::Dir(v) = self {
             Some(&v.1)
         } else if let Self::Root(v) = self {
-            Some(&v)
+            Some(v)
         } else {
             None
         }
@@ -750,7 +747,7 @@ impl Node {
                 _ => item.into(),
             },
             node_t,
-            parent: parent.map_or_else(|| Weak::new(), |p: Arc<Node>| make_weak_ref(p)),
+            parent: parent.map_or_else(Weak::new, |p: Arc<Node>| make_weak_ref(p)),
         }
     }
 
@@ -919,21 +916,22 @@ impl Node {
     #[inline]
     pub fn has_child(&self, name_idx: &u32) -> bool {
         self.as_dir()
-            .map_or(false, |dir: &Directory| dir.has_child(name_idx))
+            .is_some_and(|dir: &Directory| dir.has_child(name_idx))
     }
 
     /// Add a child [[Node]] to the current node's children.
     #[inline]
     pub(super) fn add_child(&self, name_idx: u32, node: Arc<Node>) {
-        self.as_dir()
-            .map(|dir: &Directory| dir.add_child(name_idx, Some(node)));
+        if let Some(dir) = self.as_dir() {
+            dir.add_child(name_idx, Some(node));
+        }
     }
 
     /// Get a child [[Node]] by name.
     #[inline]
     pub fn get_child(&self, name_idx: &u32) -> MaybeNode {
         self.as_dir()
-            .map_or(None, |dir: &Directory| dir.get_child(name_idx))
+            .and_then(|dir: &Directory| dir.get_child(name_idx))
     }
 
     /**
@@ -946,8 +944,9 @@ impl Node {
     the node is dropped as well due to refcounting.
     */
     pub(super) fn remove_child(&self, name_idx: &u32) {
-        self.as_dir()
-            .map(|dir: &Directory| dir.remove_child(name_idx));
+        if let Some(dir) = self.as_dir() {
+            dir.remove_child(name_idx);
+        }
     }
 
     /// Remove the child under `name_idx` only if it is `child` itself.
@@ -1033,7 +1032,7 @@ impl Hash for Node {
 impl PartialEq for Node {
     fn eq(&self, other: &Self) -> bool {
         // we could use plain `self` here due to impl Deref, but let's be explicit
-        &self.item == &other.item
+        self.item == other.item
     }
 }
 
@@ -1041,7 +1040,7 @@ impl PartialEq for Node {
 impl PartialEq<MaybeNode> for Node {
     fn eq(&self, other: &Option<Arc<Self>>) -> bool {
         match other {
-            Some(other) => &self.item == &other.item,
+            Some(other) => self.item == other.item,
             None => false,
         }
     }
@@ -1051,7 +1050,7 @@ impl PartialEq<MaybeNode> for Node {
 impl PartialEq<Node> for MaybeNode {
     fn eq(&self, other: &Node) -> bool {
         match self {
-            Some(node) => &node.item == &other.item,
+            Some(node) => node.item == other.item,
             None => false,
         }
     }
@@ -1060,14 +1059,14 @@ impl PartialEq<Node> for MaybeNode {
 // Implement <Node> == <NodeItem> comparisons
 impl PartialEq<NodeItem> for Node {
     fn eq(&self, other: &NodeItem) -> bool {
-        &*self.item() == &*other
+        self.item() == other
     }
 }
 
 // Implement <NodeItem> == <Node> comparisons
 impl PartialEq<Node> for NodeItem {
     fn eq(&self, other: &Node) -> bool {
-        &*self == &*other.item()
+        self == other.item()
     }
 }
 

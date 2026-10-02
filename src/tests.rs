@@ -50,13 +50,12 @@ fn teardown() {
     // println! or eprintln! in `dtor` will panic as Rust has already
     // shut down certain facilities. We can use libc::printf instead.
     unsafe {
-        libc::printf("*** DirTree tests done, tearing down ***\n\0".as_ptr() as *const i8);
-        if let Some(_) = TESTDIR {
-            libc::printf(" - Deleting temp directory...\n\0".as_ptr() as *const i8);
-            let temp: TempDir = TESTDIR.take().unwrap();
+        libc::printf(c"*** DirTree tests done, tearing down ***\n".as_ptr());
+        if let Some(temp) = TESTDIR.take() {
+            libc::printf(c" - Deleting temp directory...\n".as_ptr());
             temp.close().unwrap();
         }
-        libc::printf("*** Teardown finished ***\n\n\0".as_ptr() as *const i8);
+        libc::printf(c"*** Teardown finished ***\n\n".as_ptr());
     }
 }
 
@@ -140,7 +139,7 @@ fn test_tree_contains() {
         assert!(tree.contains(&p), "Not found: {}", p);
         ctr += 1;
     }
-    assert!(tree.contains(&path), "Root not found: {}", path);
+    assert!(tree.contains(path), "Root not found: {}", path);
     assert!(!tree.contains(""), "Found an empty path");
     assert_eq!(ctr, EXP_DIRS + EXP_FILES, "All paths not accounted for");
     for &p in ["foo", "bar/foo", "/foo/baz", ".", "..", "../"].iter() {

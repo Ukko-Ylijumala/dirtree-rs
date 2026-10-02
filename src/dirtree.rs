@@ -129,7 +129,7 @@ impl DirTree {
     }
 
     /// `path` relative to the tree root, for log and trace output; as is without a root.
-    fn rel_path<'p>(&self, path: &'p PathBuf) -> &'p Path {
+    fn rel_path<'p>(&self, path: &'p Path) -> &'p Path {
         self.conf
             .from()
             .and_then(|from: &PathBuf| path.strip_prefix(from).ok())
@@ -199,13 +199,11 @@ impl DirTree {
             return;
         }
 
-        match self.active_op() {
-            Some(ref op) => self.add_event(TreeEvent::op_end(op)),
-            _ => {}
+        if let Some(ref op) = self.active_op() {
+            self.add_event(TreeEvent::op_end(op));
         }
-        match state {
-            TreeState::Active(ref op) => self.add_event(TreeEvent::op_beg(op)),
-            _ => {}
+        if let TreeState::Active(ref op) = state {
+            self.add_event(TreeEvent::op_beg(op));
         }
         *self.state.write() = state;
     }
@@ -267,10 +265,8 @@ impl DirTree {
     /// the worker thread exits.
     pub(super) fn quit_worker(&self, block: bool) {
         self.queue_op_prio(TreeOp::Quit);
-        if block {
-            if let Some(worker) = self.worker.lock().take() {
-                worker.join().expect("Failed to join DirTree worker thread");
-            }
+        if block && let Some(worker) = self.worker.lock().take() {
+            worker.join().expect("Failed to join DirTree worker thread");
         }
     }
 
@@ -478,7 +474,7 @@ impl DirTree {
 
     NOTE: If `recursive` is [None], the tree's default is used.
     */
-    pub fn populate_auto(&self, path: &PathBuf, recursive: Option<bool>) {
+    pub fn populate_auto(&self, path: &Path, recursive: Option<bool>) {
         match !self.conf.sync() || self.has_visitor() {
             true => self.populate_par(path, recursive),
             false => self.populate(path, recursive),
@@ -492,7 +488,7 @@ impl DirTree {
     ///
     /// NOTE: single threaded, potentially slow with large directory trees.
     #[instrument(level = "debug", skip_all, fields(p = self.rel_path(path).to_str()))]
-    pub fn populate(&self, path: &PathBuf, recursive: Option<bool>) {
+    pub fn populate(&self, path: &Path, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
         match path.read_dir() {
             Ok(entries) => {
@@ -530,7 +526,7 @@ impl DirTree {
                                         Err(e) => {
                                             self.add_error(TreeEvent::error(
                                                 &e.to_string(),
-                                                &TreeOp::Scan(path.clone(), recursive),
+                                                &TreeOp::Scan(path.to_path_buf(), recursive),
                                             ));
                                             return;
                                         }
@@ -547,7 +543,7 @@ impl DirTree {
                         Err(e) => {
                             self.add_error(TreeEvent::error(
                                 &e.to_string(),
-                                &TreeOp::Scan(path.clone(), recursive),
+                                &TreeOp::Scan(path.to_path_buf(), recursive),
                             ));
                             debug!("Error with {}: {e}", path.display());
                         }
@@ -557,7 +553,7 @@ impl DirTree {
             Err(e) => {
                 self.add_error(TreeEvent::error(
                     &e.to_string(),
-                    &TreeOp::Scan(path.clone(), recursive),
+                    &TreeOp::Scan(path.to_path_buf(), recursive),
                 ));
                 debug!(target: "ERROR", "Cannot read directory {}: {e}", path.display());
             }
@@ -573,7 +569,9 @@ impl DirTree {
     buffer to look ahead in the directory stream.
     */
     /// NOTE: If `recursive` is [None], the tree's default is used.
-    pub fn populate_par(&self, path: &PathBuf, recursive: Option<bool>) {
+    pub fn populate_par(&self, path: &Path, recursive: Option<bool>) {
+        // the walker passes owned paths down; one conversion per walk root
+        let path: &PathBuf = &path.to_path_buf();
         /*
         Resolve the walk root's node up front - children are attached
         directly to their parent's node during the walk (one intern and
@@ -616,7 +614,7 @@ impl DirTree {
     The interned name is the basename of `path`; if `path` has no
     basename (e.g. `/`) we fall back to interning the empty string.
     */
-    fn initial_walk_state(&self, path: &PathBuf, recursive: Option<bool>) -> WalkState {
+    fn initial_walk_state(&self, path: &Path, recursive: Option<bool>) -> WalkState {
         let name_idx = path
             .file_name()
             .map(|n| self.strings.insert(n.to_string_lossy().as_ref()))
@@ -640,7 +638,7 @@ impl DirTree {
     /// No-op if no consumer is attached or the receiver has been dropped.
     fn emit_walk_event(
         &self,
-        path: &PathBuf,
+        path: &Path,
         tag: ScopeTag,
         scope: ScopeTag,
         depth: usize,
@@ -648,7 +646,7 @@ impl DirTree {
     ) {
         if let Some(tx) = self.conf.discovery_tx() {
             let _ = tx.send(WalkEvent {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 tag,
                 scope,
                 depth,
@@ -847,7 +845,7 @@ impl DirTree {
     #[allow(clippy::too_many_arguments)]
     fn process_par_dir<'env>(
         &'env self,
-        parent_path: &PathBuf,
+        parent_path: &Path,
         parent_walk: &WalkState,
         parent_node: &Arc<Node>,
         scope_for_children: ScopeTag,
@@ -880,7 +878,7 @@ impl DirTree {
             let idx: u32 = self.strings.insert(name_os.to_string_lossy().as_ref());
             child_idx = Some(idx);
             let parent_ctx = WalkContext {
-                path: parent_path.as_path(),
+                path: parent_path,
                 name_idx: parent_walk.name_idx,
                 parent_name_idx: parent_walk.parent_name_idx,
                 depth,
@@ -970,7 +968,7 @@ impl DirTree {
     #[allow(clippy::too_many_arguments)]
     fn process_par_files(
         &self,
-        parent_path: &PathBuf,
+        parent_path: &Path,
         parent_walk: &WalkState,
         parent_node: &Arc<Node>,
         depth: usize,
@@ -1032,7 +1030,7 @@ impl DirTree {
                 let idx: u32 = self.strings.insert(name_os.to_string_lossy().as_ref());
                 child_idx = Some(idx);
                 let parent_ctx = WalkContext {
-                    path: parent_path.as_path(),
+                    path: parent_path,
                     name_idx: parent_walk.name_idx,
                     parent_name_idx: parent_walk.parent_name_idx,
                     depth,
@@ -1139,7 +1137,7 @@ impl DirTree {
 
     /// Add a [[RawFd]] to a directory node's [[Directory]] item.
     #[allow(unused)]
-    fn add_fd(&self, path: &PathBuf, fd: RawFd) {
+    fn add_fd(&self, path: &Path, fd: RawFd) {
         self.get_node(path.to_string_lossy().as_ref()).map(|node| {
             node.as_dir().map(|dir| {
                 dir.fd_set(fd).ok();
@@ -1164,7 +1162,7 @@ impl DirTree {
         self.conf.depth_compare(len.min(u8::MAX as usize) as u8);
         // max depth can just as well be updated at this point
 
-        for part in parts.iter().map(|i: &u32| *i) {
+        for part in parts.iter().copied() {
             depth += 1;
             let is_leaf: bool = depth == len;
             trace!(target: "CURRENT_NODE", "{:?}", self.node_name(&current));
@@ -1308,13 +1306,13 @@ impl DirTree {
                             }
                         };
                         debug!(target: "REMOVE_NODE", "{:?}", p.display());
-                        return Ok(Some(self.remove_child_node(&parent, name, node.clone())));
+                        Ok(Some(self.remove_child_node(&parent, name, node.clone())))
                     }
 
                     None => {
                         let msg: String = format!("Stale parent reference: {:?}", p);
                         self.add_error(TreeEvent::error(&msg, &op).node(&node));
-                        return Err(Error::new(ErrorKind::NotFound, msg));
+                        Err(Error::new(ErrorKind::NotFound, msg))
                     }
                 }
             }
@@ -1330,7 +1328,7 @@ impl DirTree {
                     return Ok(Some((0, 0, 1)));
                 }
                 warn!("Node not found: {path:?}");
-                return Ok(None);
+                Ok(None)
             }
         }
     }
@@ -1442,12 +1440,10 @@ impl DirTree {
             Some(Some(old)) => {
                 self.remove_child_node(parent, name_idx, old);
             }
-            Some(None) => {
-                if dir.remove_name_child(&name_idx) {
-                    self.conf.files_mod(-1);
-                }
+            Some(None) if dir.remove_name_child(&name_idx) => {
+                self.conf.files_mod(-1);
             }
-            None => {}
+            _ => {}
         }
 
         if child.node_t.is_dir() {
@@ -1497,10 +1493,7 @@ impl DirTree {
             grow the store with every queried nonexistent path.
             */
             let idx: u32 = self.strings.idx(part)?;
-            match current.get_child(&idx) {
-                Some(node) => current = node,
-                None => return None,
-            }
+            current = current.get_child(&idx)?;
         }
         Some(current) // found the node
     }
@@ -1524,7 +1517,7 @@ impl DirTree {
     pub fn dirfd(&self, path: &str) -> Option<DirFd> {
         self.get_node(path).and_then(|node: Arc<Node>| {
             node.as_dir()
-                .and_then(|dir: &Directory| Some(dir.fd().clone()))
+                .map(|dir: &Directory| dir.fd().clone())
         })
     }
 
@@ -1555,13 +1548,13 @@ impl DirTree {
 
     /// Remove a handle for a directory path and clear the [DirFd] in the [Directory].
     pub fn handle_close(&self, path: &str) {
-        if let Some(node) = self.get_node(path) {
-            if node.is_dir() {
-                let dirfd: &DirFd = node.dirfd().unwrap();
-                if dirfd.is_open() {
-                    self.handles.close(dirfd.fd());
-                    dirfd.clear();
-                }
+        if let Some(node) = self.get_node(path)
+            && node.is_dir()
+        {
+            let dirfd: &DirFd = node.dirfd().unwrap();
+            if dirfd.is_open() {
+                self.handles.close(dirfd.fd());
+                dirfd.clear();
             }
         }
     }
@@ -1768,13 +1761,13 @@ should one be swapped for a symlink before the open, following it would
 walk a foreign subtree into the tree (or loop, via `link -> .`). With
 `O_NOFOLLOW` the open fails with `ELOOP` instead.
 */
-fn open_dir_nofollow(path: &PathBuf) -> Result<DirHandle, Error> {
+fn open_dir_nofollow(path: &Path) -> Result<DirHandle, Error> {
     let flags: OFlag = OFlag::O_RDONLY
         | OFlag::O_DIRECTORY
         | OFlag::O_NOFOLLOW
         | OFlag::O_CLOEXEC
         | OFlag::O_NONBLOCK;
-    DirHandle::from_fd(open(path.as_path(), flags, Mode::empty())?)
+    DirHandle::from_fd(open(path, flags, Mode::empty())?)
 }
 
 /* ######################################################################### */
@@ -1786,29 +1779,22 @@ impl<'a> Iterator for DirTreeIterator<'a> {
     type Item = Arc<Node>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.pop_front().map(|node: Arc<Node>| {
-            trace!(target: "DirTreeIterator", "{}", node.path(&self.1).display());
-            if node.children().is_none() {
-                return node;
-            }
+        self.0.pop_front().inspect(|node: &Arc<Node>| {
+            trace!(target: "DirTreeIterator", "{}", node.path(self.1).display());
+            let Some(children) = node.children() else {
+                return;
+            };
 
             // Push all found children to the stack
-            node.children()
-                .unwrap()
-                .read()
-                .values()
-                .for_each(|c: &MaybeNode| {
-                    c.as_ref().map(|child: &Arc<Node>| {
-                        if child.is_traversable() {
-                            // push directories to the front of the queue...
-                            self.0.push_front(child.clone());
-                        } else {
-                            // ...and files to the back
-                            self.0.push_back(child.clone());
-                        }
-                    });
-                });
-            node
+            children.read().values().flatten().for_each(|child: &Arc<Node>| {
+                if child.is_traversable() {
+                    // push directories to the front of the queue...
+                    self.0.push_front(child.clone());
+                } else {
+                    // ...and files to the back
+                    self.0.push_back(child.clone());
+                }
+            });
         })
     }
 }

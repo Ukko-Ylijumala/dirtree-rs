@@ -67,6 +67,6 @@ pub fn mod_atom_u32(a: &AtomicU32, n: i32) {
     if n > 0 {
         a.fetch_add(n as u32, Relaxed);
     } else if n < 0 {
-        a.fetch_sub(n.abs() as u32, Relaxed);
+        a.fetch_sub(n.unsigned_abs(), Relaxed);
     }
 }

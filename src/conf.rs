@@ -24,7 +24,10 @@ watch is then in the listing, one created after it produces an event,
 and none falls in between.
 */
 #[derive(Clone)]
-pub(super) struct ListHook(pub(super) Arc<dyn Fn(&Arc<Node>) + Send + Sync>);
+pub(super) struct ListHook(pub(super) Arc<ListHookFn>);
+
+/// The function a [ListHook] runs, given the directory's node.
+pub(super) type ListHookFn = dyn Fn(&Arc<Node>) + Send + Sync;
 
 impl Debug for ListHook {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

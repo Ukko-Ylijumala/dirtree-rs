@@ -1,6 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use super::node::{MaybeNode, Node};
+use super::node::Node;
 use crossbeam::queue::SegQueue;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -16,18 +16,15 @@ pub fn walk_nodes(node: &Arc<Node>, q: &SegQueue<Arc<Node>>, dirs: bool, files: 
             .unwrap()
             .read()
             .values()
+            .flatten()
             .par_bridge()
-            .for_each(|c: &MaybeNode| {
-                c.as_ref().map(|child: &Arc<Node>| {
-                    if dirs && child.node_t.is_dir() {
-                        q.push(child.clone());
-                    } else if files && child.node_t.is_file() {
-                        q.push(child.clone());
-                    }
-                    if child.is_traversable() {
-                        walk_nodes(child, q, dirs, files);
-                    }
-                });
+            .for_each(|child: &Arc<Node>| {
+                if (dirs && child.node_t.is_dir()) || (files && child.node_t.is_file()) {
+                    q.push(child.clone());
+                }
+                if child.is_traversable() {
+                    walk_nodes(child, q, dirs, files);
+                }
             });
     }
 }
@@ -45,15 +42,14 @@ where
             .unwrap()
             .read()
             .values()
-            .for_each(|c: &MaybeNode| {
-                c.as_ref().map(|child: &Arc<Node>| {
-                    if child.is_traversable() {
-                        // traverse directories first (depth-first search)
-                        traverse_from(child, f);
-                    } else {
-                        f(child);
-                    }
-                });
+            .flatten()
+            .for_each(|child: &Arc<Node>| {
+                if child.is_traversable() {
+                    // traverse directories first (depth-first search)
+                    traverse_from(child, f);
+                } else {
+                    f(child);
+                }
             });
     }
 }
@@ -84,16 +80,15 @@ where
             .unwrap()
             .read()
             .values()
+            .flatten()
             .par_bridge()
-            .for_each(|c: &MaybeNode| {
-                c.as_ref().map(|child: &Arc<Node>| {
-                    if child.is_traversable() {
-                        // traverse directories first (depth-first search)
-                        traverse_from_par(child, f);
-                    } else {
-                        f(child);
-                    }
-                });
+            .for_each(|child: &Arc<Node>| {
+                if child.is_traversable() {
+                    // traverse directories first (depth-first search)
+                    traverse_from_par(child, f);
+                } else {
+                    f(child);
+                }
             });
     }
 }

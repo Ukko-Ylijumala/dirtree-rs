@@ -55,7 +55,7 @@ impl Visitor for NamePruneVisitor {
         sorted binary search could win, but the breakpoint is high enough
         that the simple loop is the right default.
         */
-        is_dir && self.names.iter().any(|&n| n == child)
+        is_dir && self.names.contains(&child)
     }
 }
 
@@ -290,6 +290,8 @@ impl CompositeVisitor {
         Self::default()
     }
 
+    // a builder method, not addition
+    #[allow(clippy::should_implement_trait)]
     pub fn add<V: Visitor + 'static>(mut self, v: V) -> Self {
         self.inner.push(Arc::new(v));
         self

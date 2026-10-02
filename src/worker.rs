@@ -54,11 +54,11 @@ pub(super) fn tree_worker(t: Arc<DirTree>) {
                     TreeOp::Remove(ref path) => {
                         let p: String = path.clone();
                         t.set_state(TreeState::Active(op.clone()));
-                        t.remove(&p).ok().and_then(|r| r).map(|x| {
+                        if let Ok(Some(x)) = t.remove(&p) {
                             let msg: String =
                                 format!("Removed: {} nodes, {} dirs, {} files", x.0, x.1, x.2);
                             t.add_event(TreeEvent::new(&msg).path(&p).op(&op));
-                        });
+                        }
                     }
 
                     TreeOp::Update(ref path) => {
