@@ -5,7 +5,7 @@
 use super::hash::DirTreeXxh3Hasher;
 use super::utils::{PATH_SEP, make_weak_ref};
 
-use dirhandle::DirFd;
+use dirhandle::{DirFd, nix::dir::Type};
 use stringstore::UniqueStrStore;
 
 use parking_lot::RwLock;
@@ -15,12 +15,12 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     collections::hash_map::Entry as HmEntry,
-    fs::{Metadata, metadata},
+    fs::{FileType, Metadata, metadata},
     hash::{Hash, Hasher},
     io::{Error, ErrorKind},
     ops::{Deref, DerefMut},
     os::fd::RawFd,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::PathBuf,
     ptr,
     sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
@@ -231,6 +231,18 @@ impl<T: Default> Entry<T> {
     /// (e.g. from a dirent) - no stat is performed.
     pub fn with_inode(inode: u64) -> Self {
         Self(Data::new(inode), Default::default())
+    }
+}
+
+impl Entry<FileEntry> {
+    /// A non-directory entry with a known inode - no stat is performed.
+    pub fn leaf(inode: u64, file: FileEntry) -> Self {
+        Self(Data::new(inode), file)
+    }
+
+    /// This entry as `file` (a kind and a symlink target).
+    pub fn with_file(self, file: FileEntry) -> Self {
+        Self(self.0, file)
     }
 }
 
@@ -544,13 +556,97 @@ impl DerefMut for Directory {
     }
 }
 
-/// An empty struct, used as a type parameter T for [Entry].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FileEntry;
+/**
+What a non-directory entry is, from its directory entry type (`d_type`,
+so knowing it costs no syscall). A regular file is [FileKind::File];
+everything else is a special file, counted apart from the files (see
+[TreeConf::specials](super::TreeConf::specials)). Symlinks are recorded,
+never followed.
+*/
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FileKind {
+    #[default]
+    File,
+    Symlink,
+    Fifo,
+    Socket,
+    CharDevice,
+    BlockDevice,
+}
 
+impl FileKind {
+    /// The kind of a directory entry type; [None] for a directory.
+    pub fn from_type(t: Type) -> Option<Self> {
+        Some(match t {
+            Type::File => Self::File,
+            Type::Symlink => Self::Symlink,
+            Type::Fifo => Self::Fifo,
+            Type::Socket => Self::Socket,
+            Type::CharacterDevice => Self::CharDevice,
+            Type::BlockDevice => Self::BlockDevice,
+            Type::Directory => return None,
+        })
+    }
+
+    /// The kind of a [std::fs::FileType] (not followed); [None] for a directory.
+    pub fn from_std(t: FileType) -> Option<Self> {
+        Some(match t {
+            t if t.is_file() => Self::File,
+            t if t.is_symlink() => Self::Symlink,
+            t if t.is_fifo() => Self::Fifo,
+            t if t.is_socket() => Self::Socket,
+            t if t.is_char_device() => Self::CharDevice,
+            t if t.is_block_device() => Self::BlockDevice,
+            _ => return None,
+        })
+    }
+
+    /// Whether this is anything but a regular file.
+    #[inline]
+    pub fn is_special(self) -> bool {
+        self != Self::File
+    }
+}
+
+/// [FileEntry::target] of an entry that is not a symlink, or whose target is unknown.
+const NO_TARGET: u32 = u32::MAX;
+
+/**
+The [Entry] type parameter of a non-directory node: its [FileKind], and
+for a symlink the interned index of its target (read with `readlink`
+when the symlink is recorded; symlinks never change in place, so a new
+target always comes with a new inode).
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileEntry {
+    target: u32,
+    kind: FileKind,
+}
+
+impl FileEntry {
+    /// An entry of `kind`; `target` is the interned target of a symlink.
+    pub fn new(kind: FileKind, target: Option<u32>) -> Self {
+        Self {
+            target: target.unwrap_or(NO_TARGET),
+            kind,
+        }
+    }
+
+    pub fn kind(&self) -> FileKind {
+        self.kind
+    }
+
+    /// The interned target of a symlink, if it could be read.
+    pub fn target(&self) -> Option<u32> {
+        (self.target != NO_TARGET).then_some(self.target)
+    }
+}
+
+// a regular file
 impl Default for FileEntry {
     fn default() -> Self {
-        FileEntry
+        Self::new(FileKind::File, None)
     }
 }
 
@@ -875,6 +971,11 @@ impl Node {
                 Err(Error::new(ErrorKind::NotFound, msg))
             }
         }
+    }
+
+    /// The [FileKind] of a non-directory node.
+    pub fn file_kind(&self) -> Option<FileKind> {
+        self.as_file().map(|f: &FileEntry| f.kind())
     }
 
     /// Returns the [[DirFd]] for this node if it's a directory.

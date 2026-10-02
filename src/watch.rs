@@ -45,7 +45,9 @@ use super::dirtree::DirTree;
 use super::conf::ListHook;
 use super::error::TreeError;
 use super::event::{TreeEvent, TreeOp, TreeState};
-use super::node::{MaybeNode, Node, NodeType};
+use super::conf::NodeCounts;
+use super::dirtree::NewChild;
+use super::node::{FileEntry, FileKind, MaybeNode, Node, NodeType};
 use super::traverse::traverse_from;
 
 use dashmap::DashMap;
@@ -106,8 +108,8 @@ re-attach.
 struct PendingMove {
     /// The detached child; `None` for a Name-mode (node-less) entry.
     node: MaybeNode,
-    /// `(nodes, dirs, files)` counts captured at detach time.
-    counts: (u32, u32, u32),
+    /// Counts captured at detach time.
+    counts: NodeCounts,
     /// The parent the child was detached from.
     parent: Weak<Node>,
     /// When the `IN_MOVED_FROM` was seen (for expiry).
@@ -580,14 +582,18 @@ impl TreeWatcher {
             } else {
                 /*
                 IN_CREATE fires for every entry type. Like the walker and the
-                diff, record regular files only: symlinks, FIFOs, sockets and
-                device nodes are not modelled (a later update would remove
-                them again). lstat, so a symlink is not followed - that also
-                yields the inode, and the insert needs no stat of its own.
+                diff, record each with its FileKind, special files included
+                (but not in Name mode, which cannot tell them apart). lstat,
+                so a symlink is not followed - that also yields the inode,
+                and the insert needs no stat of its own.
                 */
-                let ino: u64 = match symlink_metadata(&full) {
-                    Ok(meta) if meta.file_type().is_file() => meta.ino(),
-                    _ => return, // not a regular file, or already gone again
+                let mode = self.tree.filemode();
+                let (ino, kind): (u64, FileKind) = match symlink_metadata(&full) {
+                    Ok(meta) => match FileKind::from_std(meta.file_type()) {
+                        Some(kind) if !(kind.is_special() && mode.is_name()) => (meta.ino(), kind),
+                        _ => return,
+                    },
+                    Err(_) => return, // already gone again
                 };
                 debug!(target: "WATCH_CREATE", "{}", full.display());
                 let idx: u32 = self.tree.strings.insert(name.to_string_lossy().as_ref());
@@ -596,7 +602,6 @@ impl TreeWatcher {
                     .count()
                     .saturating_sub(1)
                     .min(u8::MAX as usize) as u8;
-                let mode = self.tree.filemode();
                 let counted: bool = if mode.is_name() {
                     let added: bool = node
                         .as_dir()
@@ -607,21 +612,27 @@ impl TreeWatcher {
                     }
                     added
                 } else if mode.is_node() {
-                    self.tree.insert_child(&node, idx, NodeType::File, ino, depth).1
+                    let target: Option<u32> = match kind {
+                        FileKind::Symlink => self.tree.link_target(&full),
+                        _ => None,
+                    };
+                    let file: FileEntry = FileEntry::new(kind, target);
+                    self.tree.insert_child(&node, idx, NewChild::Leaf(file), ino, depth).1
                 } else {
                     true // counted, but not stored
                 };
-                if counted {
-                    self.tree.conf.observer().files_added(1, 0);
+                match counted && kind.is_special() {
+                    true => self.tree.conf.observer().specials_added(1),
+                    false if counted => self.tree.conf.observer().files_added(1, 0),
+                    false => {}
                 }
             }
         } else if mask & libc::IN_DELETE != 0 {
             debug!(target: "WATCH_RM", "{}", full.display());
             let op: TreeOp = TreeOp::Remove(full.to_string_lossy().to_string());
             match self.tree.remove(full.to_string_lossy().as_ref()) {
-                Ok(Some((nodes, dirs, files))) => {
-                    let msg: String =
-                        format!("Removed: {nodes} nodes, {dirs} dirs, {files} files");
+                Ok(Some(counts)) => {
+                    let msg: String = format!("Removed: {counts}");
                     self.tree.add_event(
                         TreeEvent::new(&msg)
                             .path(full.to_string_lossy().as_ref())
@@ -660,7 +671,7 @@ impl TreeWatcher {
             return; // not in the tree (filtered out or never scanned)
         };
 
-        let counts: (u32, u32, u32) = match &child_opt {
+        let counts: NodeCounts = match &child_opt {
             // detach only: an in-place rename re-attaches it, handles and all
             Some(child) => self.tree.detach_child_node(parent, idx, child.clone()),
             None => {
@@ -669,14 +680,14 @@ impl TreeWatcher {
                     .as_dir()
                     .is_some_and(|d| d.remove_name_child(&idx))
                 {
-                    self.tree.conf.files_mod(-1);
-                    (0, 0, 1)
+                    self.tree.conf.counts_mod(NodeCounts::NAME_ENTRY, -1);
+                    NodeCounts::NAME_ENTRY
                 } else {
-                    (0, 0, 0)
+                    NodeCounts::default()
                 }
             }
         };
-        if counts == (0, 0, 0) {
+        if counts.is_empty() {
             /*
             Nothing was detached: the slot changed under us (a concurrent
             remove or re-create). Parking the stale child would re-attach
@@ -799,13 +810,16 @@ impl TreeWatcher {
                         self.resync_subtree(&full);
                     }
                 } else {
-                    // a moved file is rebuilt from its known inode: no stat
+                    // a moved file is rebuilt from its known inode and kind: no stat
                     let ino: u64 = child.inode().unwrap_or(0);
+                    let file: FileEntry = child.as_file().copied().unwrap_or_default();
                     drop(child);
                     let (_, created) =
-                        self.tree.insert_child(parent, idx, NodeType::File, ino, depth);
-                    if created {
-                        self.tree.conf.observer().files_added(1, 0);
+                        self.tree.insert_child(parent, idx, NewChild::Leaf(file), ino, depth);
+                    match created && file.kind().is_special() {
+                        true => self.tree.conf.observer().specials_added(1),
+                        false if created => self.tree.conf.observer().files_added(1, 0),
+                        false => {}
                     }
                 }
                 true

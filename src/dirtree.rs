@@ -1,9 +1,11 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use super::conf::TreeConf;
+use super::conf::{NodeCounts, TreeConf};
 use super::error::{TreeError, TreeResult};
 use super::event::{TreeEvent, TreeOp, TreeState};
-use super::node::{Directory, Entry, FileEntry, MaybeNode, Node, NodeItem, NodeIter, NodeType};
+use super::node::{
+    Directory, Entry, FileEntry, FileKind, MaybeNode, Node, NodeItem, NodeIter, NodeType,
+};
 use super::observer::TreeObserver;
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::visitor::*;
@@ -14,8 +16,7 @@ use super::utils::{PATH_SEP, panic_message, path_parts};
 use dirhandle::{
     CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles,
     nix::{
-        dir::Type,
-        fcntl::{OFlag, open},
+        fcntl::{OFlag, open, readlinkat},
         sys::stat::Mode,
     },
 };
@@ -30,11 +31,11 @@ use tracing::{debug, error, instrument, trace, trace_span, warn};
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    ffi::OsStr,
+    ffi::{CStr, OsStr},
     fmt::{self, Display, Formatter},
-    fs::DirEntry,
+    fs::{DirEntry, read_link},
     io::{Error, ErrorKind},
-    os::fd::{AsRawFd, RawFd},
+    os::fd::{AsRawFd, BorrowedFd, RawFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::DirEntryExt,
     path::{Path, PathBuf},
@@ -63,6 +64,12 @@ the walk. Subdirectories are never batched: each one is a whole subtree
 of work.
 */
 pub(super) const ENTRY_BATCH_MIN: usize = 64;
+
+/// What [DirTree::insert_child] creates: a directory, or a file of some [FileKind].
+pub(super) enum NewChild {
+    Dir,
+    Leaf(FileEntry),
+}
 
 /**
 Lightweight state that flows down the parallel walk: the active
@@ -571,12 +578,16 @@ impl DirTree {
                                         self.populate(&path, recursive);
                                     }
                                 }
-                            } else if entry_t.is_file() {
+                            } else if let Some(kind) = FileKind::from_std(entry_t) {
+                                // a name-only entry could not tell a special file apart
+                                if kind.is_special() && self.filemode().is_name() {
+                                    return;
+                                }
                                 if !self.conf.filters().passes(&name, false) {
                                     return;
                                 }
                                 let mut size: u64 = 0;
-                                if self.filemode().is_with_size() {
+                                if !kind.is_special() && self.filemode().is_with_size() {
                                     match entry.metadata() {
                                         Ok(meta) => {
                                             size = meta.len();
@@ -594,9 +605,17 @@ impl DirTree {
                                 if self.filemode().is_name() {
                                     self.insert(&path, NodeType::Name, None);
                                 } else if self.filemode().is_node() {
-                                    self.insert(&path, NodeType::File, Some(entry.ino()));
+                                    let target: Option<u32> = match kind {
+                                        FileKind::Symlink => self.link_target(&path),
+                                        _ => None,
+                                    };
+                                    let file: FileEntry = FileEntry::new(kind, target);
+                                    self.insert_with(&path, NodeType::File, Some(entry.ino()), file);
                                 }
-                                self.conf.observer().files_added(1, size);
+                                match kind.is_special() {
+                                    true => self.conf.observer().specials_added(1),
+                                    false => self.conf.observer().files_added(1, size),
+                                }
                             }
                         }
                         Err(e) => {
@@ -793,6 +812,12 @@ impl DirTree {
         */
         // a watcher watches this directory before it is read (see ListHook)
         self.conf.before_listing(&node);
+        /*
+        For readlinkat() on the symlinks listed here. Taken before the
+        listing borrows the handle mutably; the handle is only moved once
+        every entry has been processed, so the fd stays open meanwhile.
+        */
+        let dirfd: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(handle.as_raw_fd()) };
         let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
         if let Some(e) = iter.error() {
@@ -865,7 +890,7 @@ impl DirTree {
                 );
             };
             let each_files = |chunk: &[EntryExt]| {
-                self.process_par_files(path, &walk, &node, depth, visitor_ref, &op, chunk);
+                self.process_par_files(path, &walk, &node, depth, visitor_ref, &op, dirfd, chunk);
             };
             rayon::join(
                 || dirs.par_iter().for_each(each_dir),
@@ -954,7 +979,7 @@ impl DirTree {
         let child_idx: u32 =
             child_idx.unwrap_or_else(|| self.strings.insert(name_os.to_string_lossy().as_ref()));
         let (child, _) =
-            self.insert_child(parent_node, child_idx, NodeType::Directory, entry.ino(), depth_abs);
+            self.insert_child(parent_node, child_idx, NewChild::Dir, entry.ino(), depth_abs);
         self.conf.observer().dirs_added(1);
         let Some(child_node) = child else {
             // a name-only entry (or similar) blocks this slot
@@ -1018,10 +1043,12 @@ impl DirTree {
     entry - with per-entry updates, the global `Counter` mutexes and the
     parent's map lock were contended by every worker at once.
 
-    Only regular files are recorded (symlinks and special files are not
-    modelled); entries of undeterminable type are reported as events.
-    No paths are constructed: the interned name and the inode from the
-    dirent are all an insertion requires.
+    Special files are recorded with their [FileKind] (Node filemode only:
+    a name-only entry could not tell them apart) and counted apart from
+    regular files; a symlink's target is read through `dirfd`, the
+    directory being listed. Entries of undeterminable type are reported
+    as events. No paths are constructed: the interned name and the inode
+    from the dirent are all an insertion requires.
     */
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -1033,6 +1060,7 @@ impl DirTree {
         depth: usize,
         visitor: Option<&Arc<dyn Visitor>>,
         op: &TreeOp,
+        dirfd: BorrowedFd<'_>,
         batch: &[EntryExt<'_>],
     ) {
         let Some(dir) = parent_node.as_dir() else {
@@ -1043,22 +1071,26 @@ impl DirTree {
         let with_size: bool = self.filemode().is_with_size();
         let mut children: Vec<(u32, MaybeNode)> = Vec::with_capacity(batch.len());
         /*
-        Names still to intern, with their inodes: interned together after
-        the loop. Every new name takes stringstore's writer mutex, and with
-        a mutex round per name the handoffs between workers dominated the
-        walk of a tree of unique file names (it got slower past 4 workers).
+        Names still to intern, with their inodes and kinds: interned
+        together after the loop. Every new name takes stringstore's writer
+        mutex, and with a mutex round per name the handoffs between workers
+        dominated the walk of a tree of unique file names (it got slower
+        past 4 workers).
         */
         let mut names: Vec<Cow<str>> = Vec::with_capacity(batch.len());
-        let mut inodes: Vec<u64> = Vec::with_capacity(batch.len());
+        let mut leaves: Vec<(u64, FileEntry)> = Vec::with_capacity(batch.len());
+        // specials go in apart from the files, to be counted apart
+        let mut specials: Vec<(u32, MaybeNode)> = Vec::new();
         let mut seen: u64 = 0;
+        let mut seen_specials: u64 = 0;
         let mut size: u64 = 0;
         // name-only files get no node, just a (name -> None) entry
-        let file_node = |inode: u64| -> MaybeNode {
+        let file_node = |inode: u64, file: FileEntry| -> MaybeNode {
             match name_only {
                 true => None,
                 false => Some(
                     Node::new(
-                        NodeItem::File(Entry::<FileEntry>::with_inode(inode)),
+                        NodeItem::File(Entry::<FileEntry>::leaf(inode, file)),
                         Some(parent_node.clone()),
                     )
                     .into(),
@@ -1077,7 +1109,10 @@ impl DirTree {
                 debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
                 continue;
             };
-            if entry_t != Type::File {
+            let Some(kind) = FileKind::from_type(entry_t) else {
+                continue;
+            };
+            if kind.is_special() && name_only {
                 continue;
             }
             let name_os: &OsStr = OsStr::from_bytes(entry.name_as_bytes());
@@ -1103,41 +1138,57 @@ impl DirTree {
             if !self.conf.filters().passes(name_os, false) {
                 continue;
             }
-            seen += 1;
-            if with_size {
-                size += entry.len();
+            if kind.is_special() {
+                seen_specials += 1;
+            } else {
+                seen += 1;
+                if with_size {
+                    size += entry.len();
+                }
             }
-            if store {
-                match child_idx {
-                    // already interned for the visitor
-                    Some(idx) => children.push((idx, file_node(entry.ino()))),
-                    None => {
-                        names.push(name_os.to_string_lossy());
-                        inodes.push(entry.ino());
-                    }
+            if !store {
+                continue;
+            }
+            let target: Option<u32> = match kind {
+                FileKind::Symlink => self.link_target_at(dirfd, entry.file_name()),
+                _ => None,
+            };
+            let file: FileEntry = FileEntry::new(kind, target);
+            match child_idx {
+                // already interned for the visitor
+                Some(idx) if kind.is_special() => specials.push((idx, file_node(entry.ino(), file))),
+                Some(idx) => children.push((idx, file_node(entry.ino(), file))),
+                None => {
+                    names.push(name_os.to_string_lossy());
+                    leaves.push((entry.ino(), file));
                 }
             }
         }
         if !names.is_empty() {
             let indices: Vec<u32> = self.strings.insert_many(&names);
-            children.extend(
-                indices
-                    .into_iter()
-                    .zip(inodes)
-                    .map(|(idx, inode)| (idx, file_node(inode))),
-            );
+            for (idx, (inode, file)) in indices.into_iter().zip(leaves) {
+                match file.kind().is_special() {
+                    true => specials.push((idx, file_node(inode, file))),
+                    false => children.push((idx, file_node(inode, file))),
+                }
+            }
         }
 
         let added: u32 = match children.is_empty() {
             true => 0,
             false => dir.add_children_new(children),
         };
-        if added > 0 {
+        let added_specials: u32 = match specials.is_empty() {
+            true => 0,
+            false => dir.add_children_new(specials),
+        };
+        if added + added_specials > 0 {
             // name-only entries are files, but not nodes
             if !name_only {
-                self.conf.nodes_mod(added as i32);
+                self.conf.nodes_mod((added + added_specials) as i32);
             }
             self.conf.files_mod(added as i32);
+            self.conf.specials_mod(added_specials as i32);
             // files live one path component below their directory
             let depth_abs: u8 =
                 (parent_walk.base_depth as usize + depth + 1).min(u8::MAX as usize) as u8;
@@ -1145,6 +1196,9 @@ impl DirTree {
         }
         if seen > 0 {
             self.conf.observer().files_added(seen, size);
+        }
+        if seen_specials > 0 {
+            self.conf.observer().specials_added(seen_specials);
         }
     }
 
@@ -1163,7 +1217,7 @@ impl DirTree {
         &self,
         parent: &Arc<Node>,
         name_idx: u32,
-        node_t: NodeType,
+        child: NewChild,
         inode: u64,
         depth_abs: u8,
     ) -> (MaybeNode, bool) {
@@ -1171,27 +1225,61 @@ impl DirTree {
             Some(d) => d,
             None => return (None, false),
         };
-        let is_file: bool = node_t == NodeType::File;
-        let (child, created) = dir.get_or_add_child_with(name_idx, || {
-            let itm: NodeItem = if is_file {
-                NodeItem::File(Entry::<FileEntry>::with_inode(inode))
-            } else {
-                let itm = NodeItem::Dir(Entry::<Directory>::with_inode(inode));
-                itm.set_dir_name(name_idx);
-                itm
+        let kind: Option<FileKind> = match &child {
+            NewChild::Dir => None,
+            NewChild::Leaf(file) => Some(file.kind()),
+        };
+        let (node, created) = dir.get_or_add_child_with(name_idx, || {
+            let itm: NodeItem = match child {
+                NewChild::Leaf(file) => NodeItem::File(Entry::<FileEntry>::leaf(inode, file)),
+                NewChild::Dir => {
+                    let itm = NodeItem::Dir(Entry::<Directory>::with_inode(inode));
+                    itm.set_dir_name(name_idx);
+                    itm
+                }
             };
             Some(Node::new(itm, Some(parent.clone())).into())
         });
         if created {
             self.conf.nodes_mod(1);
-            if is_file {
-                self.conf.files_mod(1);
-            } else {
-                self.conf.dirs_mod(1);
+            match kind {
+                Some(kind) => self.conf.leaf_mod(kind, 1),
+                None => self.conf.dirs_mod(1),
             }
             self.conf.depth_compare(depth_abs);
         }
-        (child, created)
+        (node, created)
+    }
+
+    /**
+    The interned target of the symlink `name` in the directory `dirfd`,
+    or [None] if it cannot be read (e.g. removed since it was listed).
+    */
+    pub(super) fn link_target_at(&self, dirfd: BorrowedFd<'_>, name: &CStr) -> Option<u32> {
+        match readlinkat(dirfd, name) {
+            Ok(target) => Some(self.strings.insert(target.to_string_lossy())),
+            Err(e) => {
+                debug!(target: "WARN", "Cannot read symlink {name:?}: {e}");
+                None
+            }
+        }
+    }
+
+    /// [DirTree::link_target_at] for a symlink given by its path.
+    pub(super) fn link_target(&self, path: &Path) -> Option<u32> {
+        match read_link(path) {
+            Ok(target) => Some(self.strings.insert(target.to_string_lossy())),
+            Err(e) => {
+                debug!(target: "WARN", "Cannot read symlink {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// The target of a symlink node, as read when it was recorded.
+    pub fn symlink_target(&self, node: &Node) -> Option<PathBuf> {
+        let idx: u32 = node.as_file()?.target()?;
+        Some(PathBuf::from(unsafe { self.strings.borrow_str(idx) }))
     }
 
     /// Add a [[RawFd]] to a directory node's [[Directory]] item.
@@ -1214,6 +1302,17 @@ impl DirTree {
     /// neither overwrite each other's nodes nor double-count.
     #[instrument(level = "debug", skip(self))]
     pub fn insert(&self, path: &PathBuf, node_t: NodeType, inode: Option<u64>) {
+        self.insert_with(path, node_t, inode, FileEntry::default());
+    }
+
+    /// [DirTree::insert], with a [NodeType::File] leaf recorded as `file`.
+    pub(super) fn insert_with(
+        &self,
+        path: &PathBuf,
+        node_t: NodeType,
+        inode: Option<u64>,
+        file: FileEntry,
+    ) {
         let mut current: Arc<Node> = self.root();
         let parts = &self.strings.store_path(path)[1..];
         let len: usize = parts.len();
@@ -1272,7 +1371,7 @@ impl DirTree {
                         }
                     },
                     NodeType::File => match Entry::<FileEntry>::new(path, inode) {
-                        Ok(e) => NodeItem::File(e),
+                        Ok(e) => NodeItem::File(e.with_file(file)),
                         Err(e) => {
                             self.add_error(TreeEvent::error(&e.to_string(), &TreeOp::Insert));
                             return;
@@ -1289,15 +1388,14 @@ impl DirTree {
                 itm
             };
 
-            let is_file: bool = itm.is_file();
+            let kind: Option<FileKind> = itm.as_file().map(|f: &FileEntry| f.kind());
             let (child, created) =
                 dir.get_or_add_child_with(part, || Some(Node::new(itm, Some(current.clone())).into()));
             if created {
                 self.conf.nodes_mod(1);
-                if is_file {
-                    self.conf.files_mod(1);
-                } else {
-                    self.conf.dirs_mod(1);
+                match kind {
+                    Some(kind) => self.conf.leaf_mod(kind, 1),
+                    None => self.conf.dirs_mod(1),
                 }
             }
 
@@ -1338,7 +1436,7 @@ impl DirTree {
     ///
     /// WARNING: implementation is WIP and may yet contain bugs.
     #[instrument(level = "debug", skip(self))]
-    pub fn remove(&self, path: &str) -> Result<Option<(u32, u32, u32)>, Error> {
+    pub fn remove(&self, path: &str) -> Result<Option<NodeCounts>, Error> {
         let op: TreeOp = TreeOp::Remove(path.into());
         match self.get_node(path) {
             Some(node) => {
@@ -1383,8 +1481,8 @@ impl DirTree {
                 them - check for one before declaring the path missing.
                 */
                 if self.remove_name_entry(path) {
-                    self.conf.files_mod(-1);
-                    return Ok(Some((0, 0, 1)));
+                    self.conf.counts_mod(NodeCounts::NAME_ENTRY, -1);
+                    return Ok(Some(NodeCounts::NAME_ENTRY));
                 }
                 warn!("Node not found: {path:?}");
                 Ok(None)
@@ -1395,10 +1493,9 @@ impl DirTree {
     /**
     Detach an already-resolved child [[Node]] from its parent and adjust
     the tree counters. The subtree below the child is dropped in a
-    cascading manner via refcounting. Returns `(nodes, dirs, files)`
-    removed.
+    cascading manner via refcounting. Returns the counts removed.
 
-    Nothing is removed (and `(0, 0, 0)` returned) if `name_idx` no longer
+    Nothing is removed (and empty counts returned) if `name_idx` no longer
     holds `child` itself: the caller resolved the child earlier, and a
     concurrent remove (watcher vs. worker update, say) may have emptied
     the slot or a create re-filled it with a new node since. Removing
@@ -1414,9 +1511,9 @@ impl DirTree {
         parent: &Node,
         name_idx: u32,
         child: Arc<Node>,
-    ) -> (u32, u32, u32) {
-        let counts: (u32, u32, u32) = self.detach_child_node(parent, name_idx, child.clone());
-        if counts != (0, 0, 0) {
+    ) -> NodeCounts {
+        let counts: NodeCounts = self.detach_child_node(parent, name_idx, child.clone());
+        if !counts.is_empty() {
             self.release_handles(&child);
         }
         counts
@@ -1433,15 +1530,13 @@ impl DirTree {
         parent: &Node,
         name_idx: u32,
         child: Arc<Node>,
-    ) -> (u32, u32, u32) {
-        let (nodes, dirs, files) = self.count_from(child.clone());
+    ) -> NodeCounts {
+        let counts: NodeCounts = self.count_from(child.clone());
         if !parent.remove_child_exact(&name_idx, &child) {
-            return (0, 0, 0);
+            return NodeCounts::default();
         }
-        self.conf.nodes_mod(-(nodes as i32));
-        self.conf.dirs_mod(-(dirs as i32));
-        self.conf.files_mod(-(files as i32));
-        (nodes, dirs, files)
+        self.conf.counts_mod(counts, -1);
+        counts
     }
 
     /**
@@ -1493,7 +1588,7 @@ impl DirTree {
             self.remove_child_node(parent, name_idx, occupant);
         }
         let inode: u64 = old.inode().unwrap_or(0);
-        let (root, _) = self.insert_child(parent, name_idx, NodeType::Directory, inode, depth_abs);
+        let (root, _) = self.insert_child(parent, name_idx, NewChild::Dir, inode, depth_abs);
         let root: Arc<Node> = root?;
 
         // (old directory, its new node, the depth of the new node)
@@ -1511,14 +1606,15 @@ impl DirTree {
                     Some(c) if c.is_traversable() => {
                         let ino: u64 = c.inode().unwrap_or(0);
                         let (new, _) =
-                            self.insert_child(&to, idx, NodeType::Directory, ino, child_depth);
+                            self.insert_child(&to, idx, NewChild::Dir, ino, child_depth);
                         if let Some(new) = new {
                             work.push((c, new, child_depth));
                         }
                     }
                     Some(c) => {
                         let ino: u64 = c.inode().unwrap_or(0);
-                        self.insert_child(&to, idx, NodeType::File, ino, child_depth);
+                        let file: FileEntry = c.as_file().copied().unwrap_or_default();
+                        self.insert_child(&to, idx, NewChild::Leaf(file), ino, child_depth);
                     }
                     None => {
                         // a Name-mode (node-less) file entry
@@ -1553,7 +1649,7 @@ impl DirTree {
         parent: &Arc<Node>,
         name_idx: u32,
         child: Arc<Node>,
-        counts: (u32, u32, u32),
+        counts: NodeCounts,
     ) -> bool {
         let Some(dir) = parent.as_dir() else {
             return false;
@@ -1570,7 +1666,7 @@ impl DirTree {
                 self.remove_child_node(parent, name_idx, old);
             }
             Some(None) if dir.remove_name_child(&name_idx) => {
-                self.conf.files_mod(-1);
+                self.conf.counts_mod(NodeCounts::NAME_ENTRY, -1);
             }
             _ => {}
         }
@@ -1579,9 +1675,7 @@ impl DirTree {
             child.set_dir_name(name_idx);
         }
         dir.add_child(name_idx, Some(child));
-        self.conf.nodes_mod(counts.0 as i32);
-        self.conf.dirs_mod(counts.1 as i32);
-        self.conf.files_mod(counts.2 as i32);
+        self.conf.counts_mod(counts, 1);
         true
     }
 
@@ -1749,37 +1843,28 @@ impl DirTree {
 
     /// Count the number of directory and file nodes by iterating from a [[Node]].
     /// Also counts the starting node. Returns a tuple of `(nodes, dirs, files)`.
-    pub fn iter_count_from(&self, node: Arc<Node>) -> (u32, u32, u32) {
+    pub fn iter_count_from(&self, node: Arc<Node>) -> NodeCounts {
         if node.node_t.is_file() {
-            return (1, 0, 1);
+            return NodeCounts::of_node(&node);
         }
 
-        let mut nodes: u32 = 0;
-        let mut dirs: u32 = 0;
-        let mut files: u32 = 0;
+        let mut counts: NodeCounts = NodeCounts::default();
         /*
         NOTE: trying to convert this iterating closure to a parallel
         one with Rayon's `par_bridge()` makes the counting almost 5x slower.
         This is much more than the slowdown observed with `count_from()`,
         and I have no good explanation for it at this point.
         */
-        self.iter_from(node).for_each(|node: Arc<Node>| {
-            nodes += 1;
-            if node.node_t.is_dir() {
-                dirs += 1;
-            } else if node.node_t.is_file() {
-                files += 1;
-            }
-        });
-        (nodes, dirs, files)
+        self.iter_from(node).for_each(|node: Arc<Node>| counts.add_node(&node));
+        counts
     }
 
     /// Count the number of directory and file nodes by iterating the whole tree.
-    /// Does not count the root [[Node]]. Returns a tuple of `(nodes, dirs, files)`.
-    pub fn iter_count(&self) -> (u32, u32, u32) {
-        let (mut nodes, dirs, files) = self.iter_count_from(self.root());
-        nodes -= 1; // remove root node since we started from it
-        (nodes, dirs, files)
+    /// Does not count the root [[Node]].
+    pub fn iter_count(&self) -> NodeCounts {
+        let mut counts: NodeCounts = self.iter_count_from(self.root());
+        counts.nodes -= 1; // remove root node since we started from it
+        counts
     }
 
     /* --------------------------------- */
@@ -1802,34 +1887,25 @@ impl DirTree {
     }
 
     /// Count the number of directory and file nodes with `traverse()`. Also counts
-    /// the starting [[Node]] (except root). Returns a tuple of `(nodes, dirs, files)`.
-    pub fn count_from(&self, node: Arc<Node>) -> (u32, u32, u32) {
+    /// the starting [[Node]] (except root).
+    pub fn count_from(&self, node: Arc<Node>) -> NodeCounts {
         if node.node_t.is_file() {
-            return (1, 0, 1);
+            return NodeCounts::of_node(&node);
         }
 
-        let mut nodes: u32 = 0;
-        let mut files: u32 = 0;
-        let mut dirs: u32 = 0;
+        let mut counts: NodeCounts = NodeCounts::default();
         /*
         NOTE: trying to convert this iterating closure to a parallel
         one with `traverse_from_par()` makes the counting almost 50% slower.
         Likely the overhead from moving stuff between threads and having
         to use Atomic versions of counters is the main reason.
         */
-        traverse_from(&node, &mut |n: &Arc<Node>| {
-            nodes += 1;
-            match n.node_t {
-                NodeType::Directory => dirs += 1,
-                NodeType::File => files += 1,
-                _ => (),
-            }
-        });
+        traverse_from(&node, &mut |n: &Arc<Node>| counts.add_node(n));
 
         if node.node_t == NodeType::Root {
-            nodes -= 1; // remove root node if we started from it
+            counts.nodes -= 1; // remove root node if we started from it
         };
-        (nodes, dirs, files)
+        counts
     }
 
     /// Calculates and returns the memory usage of directory and file nodes.
@@ -1873,10 +1949,11 @@ impl Display for DirTree {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "DirTree: nodes {}, dirs {}, files {}, depth {}, handles {}, ctime {} UTC",
+            "DirTree: nodes {}, dirs {}, files {}, specials {}, depth {}, handles {}, ctime {} UTC",
             self.conf.nodes(),
             self.conf.dirs(),
             self.conf.files(),
+            self.conf.specials(),
             self.conf.depth(),
             self.handles.len(),
             self.created()

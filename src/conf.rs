@@ -1,6 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use super::node::Node;
+use super::node::{FileKind, Node, NodeType};
 use super::observer::{NOOP_OBSERVER, TreeObserver};
 use super::visitor::{Visitor, WalkEvent};
 use super::{FileMode, Filters};
@@ -8,7 +8,7 @@ use super::utils::mod_atom_u32;
 use crossbeam::channel::Sender;
 use parking_lot::RwLock;
 use std::{
-    fmt::{self, Debug, Formatter},
+    fmt::{self, Debug, Display, Formatter},
     path::PathBuf,
     sync::Arc,
     sync::OnceLock,
@@ -32,6 +32,60 @@ pub(super) type ListHookFn = dyn Fn(&Arc<Node>) + Send + Sync;
 impl Debug for ListHook {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("ListHook")
+    }
+}
+
+/**
+Node counts of a subtree (see [DirTree::count_from](super::DirTree::count_from)),
+or what a change added to or took off a tree. `files` are regular files,
+`specials` the other non-directory entries (see [FileKind]).
+*/
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeCounts {
+    pub nodes: u32,
+    pub dirs: u32,
+    pub files: u32,
+    pub specials: u32,
+}
+
+impl NodeCounts {
+    /// One name-only file entry (Name filemode): a file, but not a node.
+    pub(super) const NAME_ENTRY: Self = Self { nodes: 0, dirs: 0, files: 1, specials: 0 };
+
+    /// Whether nothing is counted.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Count `node`: a directory, or a file or special file by its kind.
+    #[inline]
+    pub(super) fn add_node(&mut self, node: &Node) {
+        self.nodes += 1;
+        match node.node_t {
+            NodeType::Directory => self.dirs += 1,
+            NodeType::File => match node.file_kind().is_some_and(FileKind::is_special) {
+                true => self.specials += 1,
+                false => self.files += 1,
+            },
+            _ => {}
+        }
+    }
+
+    /// The counts of `node` alone, or of its subtree with [DirTree::count_from](super::DirTree::count_from).
+    pub(super) fn of_node(node: &Node) -> Self {
+        let mut c: Self = Self::default();
+        c.add_node(node);
+        c
+    }
+}
+
+impl Display for NodeCounts {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} nodes, {} dirs, {} files, {} specials",
+            self.nodes, self.dirs, self.files, self.specials
+        )
     }
 }
 
@@ -64,6 +118,8 @@ pub struct TreeConf {
     nodes: AtomicU32,
     dirs: AtomicU32,
     files: AtomicU32,
+    /// Non-directory entries other than regular files, see [FileKind].
+    specials: AtomicU32,
     /// Maximum depth of the tree. Root is at depth 0.
     depth: AtomicU8,
     errors: AtomicU32,
@@ -103,8 +159,22 @@ impl TreeConf {
     pub fn dirs(&self) -> u32 {
         self.dirs.load(Relaxed)
     }
+    /// Regular files; see [TreeConf::specials] for the other non-directories.
     pub fn files(&self) -> u32 {
         self.files.load(Relaxed)
+    }
+    /// Special files: symlinks, FIFOs, sockets and devices (see [FileKind]).
+    pub fn specials(&self) -> u32 {
+        self.specials.load(Relaxed)
+    }
+    /// All the counters at once (each read on its own, not as a snapshot).
+    pub fn counts(&self) -> NodeCounts {
+        NodeCounts {
+            nodes: self.nodes(),
+            dirs: self.dirs(),
+            files: self.files(),
+            specials: self.specials(),
+        }
     }
     pub fn depth(&self) -> u8 {
         self.depth.load(Relaxed)
@@ -208,6 +278,26 @@ impl TreeConf {
     #[inline]
     pub(super) fn files_mod(&self, n: i32) {
         mod_atom_u32(&self.files, n);
+    }
+    /// Increment or decrement the specials counter.
+    #[inline]
+    pub(super) fn specials_mod(&self, n: i32) {
+        mod_atom_u32(&self.specials, n);
+    }
+    /// Increment or decrement the files or the specials counter, by `kind`.
+    #[inline]
+    pub(super) fn leaf_mod(&self, kind: FileKind, n: i32) {
+        match kind.is_special() {
+            true => self.specials_mod(n),
+            false => self.files_mod(n),
+        }
+    }
+    /// Add `c` to the counters (`sign` 1), or take it off them (`sign` -1).
+    pub(super) fn counts_mod(&self, c: NodeCounts, sign: i32) {
+        mod_atom_u32(&self.nodes, sign * c.nodes as i32);
+        mod_atom_u32(&self.dirs, sign * c.dirs as i32);
+        mod_atom_u32(&self.files, sign * c.files as i32);
+        mod_atom_u32(&self.specials, sign * c.specials as i32);
     }
 
     /// Increment the error counter by 1.

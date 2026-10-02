@@ -11,7 +11,10 @@ use parking_lot::Mutex;
 use std::{
     collections::HashSet,
     collections::hash_map::DefaultHasher,
+    ffi::CString,
+    fs::{remove_file, rename, write},
     hash::{Hash, Hasher},
+    os::unix::{ffi::OsStrExt, fs::symlink},
     panic,
     path::{Path, PathBuf},
     sync::{
@@ -321,7 +324,7 @@ fn test_name_mode_removal() {
 
     let p: String = format!("{dir}/sub/afile.bin");
     match tree.remove(&p) {
-        Ok(Some((0, 0, 1))) => {}
+        Ok(Some(c)) if c == NodeCounts { files: 1, ..Default::default() } => {}
         other => panic!("Name-only entry removal failed: {other:?}"),
     }
     assert_eq!(tree.conf().files(), 0, "file count not decremented");
@@ -404,13 +407,48 @@ fn test_tree_update_diff() {
     assert!(!stats.changed(), "second update changed something: {stats}");
 }
 
+/// The [FileKind] a planned special entry is recorded as: a hardlink is a regular file.
+fn planned_kind(kind: Special) -> FileKind {
+    match kind {
+        Special::SymlinkFile
+        | Special::SymlinkDir
+        | Special::SymlinkDangling
+        | Special::SymlinkSelf => FileKind::Symlink,
+        Special::Hardlink => FileKind::File,
+        Special::Fifo => FileKind::Fifo,
+        Special::Socket => FileKind::Socket,
+        other => panic!("no FileKind mapped for {other:?}"),
+    }
+}
+
 /**
-Whether a walk records a planned entry, as the tree's policy stands:
-directories and regular files, which a hardlink is too, but no symlinks
-(not followed either) and no FIFOs or sockets.
+Whether a walk in `mode` records a planned entry, as the tree's policy
+stands: directories, regular files (a hardlink is one too) and, in Node
+mode, every special file with its kind; symlinks are never followed. A
+name-only entry could not tell a special file apart, so Name mode
+leaves them out.
 */
-fn recorded(e: &PlannedEntry) -> bool {
-    matches!(e.kind, EntryKind::Dir | EntryKind::File | EntryKind::Special(Special::Hardlink))
+fn recorded(e: &PlannedEntry, mode: FileMode) -> bool {
+    match e.kind {
+        EntryKind::Special(kind) => mode.is_node() || !planned_kind(kind).is_special(),
+        _ => true,
+    }
+}
+
+/// Check that the tree holds a planned entry as recorded: its kind, and a symlink's target.
+fn check_recorded(tree: &DirTree, e: &PlannedEntry, ctx: &str) {
+    let p = e.path.to_string_lossy();
+    let node: Arc<Node> = tree.get_node(&p).unwrap_or_else(|| panic!("{ctx}: {p} missing"));
+    let EntryKind::Special(kind) = e.kind else {
+        return;
+    };
+    assert_eq!(node.file_kind(), Some(planned_kind(kind)), "{ctx}: {p} kind");
+    match planned_kind(kind) {
+        FileKind::Symlink => {
+            assert_eq!(tree.symlink_target(&node), e.target, "{ctx}: {p} target")
+        }
+        _ => assert_eq!(tree.symlink_target(&node), None, "{ctx}: {p} has a target"),
+    }
 }
 
 #[test]
@@ -431,22 +469,24 @@ fn test_tree_special_entries() {
 
         let ctx: String = format!("{mode:?}, sync={sync}");
         assert_eq!(tree.conf().errors(), 0, "{ctx}: errors");
-        let files: u64 = counts.files + counts.special(Special::Hardlink);
-        assert_eq!(tree.conf().files() as u64, files, "{ctx}: files");
+        let hardlinks: u64 = counts.special(Special::Hardlink);
+        let specials: u64 = counts.specials.iter().sum::<u64>() - hardlinks;
+        assert_eq!(tree.conf().files() as u64, counts.files + hardlinks, "{ctx}: files");
+        let want_specials: u64 = if mode.is_node() { specials } else { 0 };
+        assert_eq!(tree.conf().specials() as u64, want_specials, "{ctx}: specials");
         if mode.is_node() {
             // name-only files have no node to look up
             for e in spec.plan(temp.path()) {
                 let p = e.path.to_string_lossy();
-                assert_eq!(tree.contains(&p), recorded(&e), "{ctx}: {p}");
+                assert_eq!(tree.contains(&p), recorded(&e, mode), "{ctx}: {p}");
+                check_recorded(&tree, &e, &ctx);
             }
         }
         tree_validate_counts(&tree);
 
         // a diff-rescan sees the same entries as the walk: nothing to add or remove
         let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
-        let changed: u32 = stats.added_dirs + stats.added_files + stats.removed_dirs
-            + stats.removed_files + stats.replaced;
-        assert_eq!(changed, 0, "{ctx}: {stats}");
+        assert!(!stats.changed(), "{ctx}: {stats}");
         // the root and every directory diffed, none skipped by the pre-check
         assert_eq!(stats.scanned_dirs as u64, counts.dirs + 1, "{ctx}: {stats}");
         assert_eq!(tree.conf().errors(), 0, "{ctx}: update errors");
@@ -462,7 +502,7 @@ fn test_tree_deep_walk() {
     /*
     A chain of single directories with one file at the bottom, and in
     the first one a symlink to "..": a symlinked directory is recorded
-    as neither dir nor file, and not followed into the loop.
+    as a symlink, and not followed into the loop.
     */
     let spec: TreeSpec = (2..depth)
         .fold(TreeSpec::new().level(1, 0).with(Special::SymlinkDir, 1), |s, _| s.level(1, 0))
@@ -476,9 +516,11 @@ fn test_tree_deep_walk() {
     let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
     assert_eq!(tree.conf().errors(), 0, "deep walk reported errors");
     assert!(tree.contains(&leaf.to_string_lossy()), "deepest file missing");
-    assert!(!tree.contains(&link.to_string_lossy()), "symlink should not be recorded");
+    let node: Arc<Node> = tree.get_node(&link.to_string_lossy()).expect("symlink missing");
+    assert_eq!(node.file_kind(), Some(FileKind::Symlink));
     let root_depth: u64 = (dir.split(PATH_SEP).count() - 1) as u64;
     assert_eq!(tree.conf().dirs() as u64, root_depth + depth as u64, "dirs miscounted");
+    assert_eq!(tree.conf().specials(), 1, "specials miscounted");
     tree_validate_counts(&tree);
 }
 
@@ -1150,6 +1192,7 @@ fn test_tree_watcher_special_files() {
     let _watcher: Arc<TreeWatcher> =
         TreeWatcher::start(tree.clone()).expect("watcher should start");
     let files: u32 = tree.conf().files();
+    let specials: u32 = tree.conf().specials();
 
     // symlinks (dangling, to "..", to themselves), a FIFO and a socket: none is a regular file
     let spec: TreeSpec = [
@@ -1166,12 +1209,94 @@ fn test_tree_watcher_special_files() {
     std::fs::write(temp.path().join("plain.bin"), b"p").unwrap();
     wait_for(|| tree.contains(&format!("{dir}/plain.bin")), "regular file should appear");
 
+    // each is recorded as a special file of its kind, a symlink with its target
     for e in spec.plan(temp.path()) {
-        assert!(!tree.contains(&e.path.to_string_lossy()), "{:?} recorded", e.kind);
+        check_recorded(&tree, &e, "watcher");
     }
-    assert_eq!(tree.conf().files(), files + 1, "only plain.bin should be counted");
+    assert_eq!(tree.conf().files(), files + 1, "only plain.bin is a regular file");
+    assert_eq!(tree.conf().specials(), specials + 5, "specials miscounted");
     assert_eq!(tree.conf().errors(), 0, "a special entry caused an error");
     tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_update_specials() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    write(at("f.bin"), b"f").unwrap();
+    symlink("f.bin", at("link")).unwrap();
+    mkfifo(&at("pipe"));
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    assert_eq!((tree.conf().files(), tree.conf().specials()), (1, 2));
+
+    remove_file(at("pipe")).unwrap();
+    // `ln -sfn other link`: a symlink is retargeted by replacing it
+    symlink("other", at("link.tmp")).unwrap();
+    rename(at("link.tmp"), at("link")).unwrap();
+    symlink("f.bin", at("new_link")).unwrap();
+    // a regular file replaced by a FIFO of the same name
+    remove_file(at("f.bin")).unwrap();
+    mkfifo(&at("f.bin"));
+
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert_eq!(stats.added_specials, 3, "new_link, link and f.bin: {stats}");
+    assert_eq!(stats.removed_specials, 2, "pipe and the old link: {stats}");
+    assert_eq!(stats.removed_files, 1, "the old f.bin: {stats}");
+    assert_eq!(stats.replaced, 2, "link and f.bin: {stats}");
+    assert_eq!((tree.conf().files(), tree.conf().specials()), (0, 3));
+
+    let node = |name: &str| tree.get_node(&at(name).to_string_lossy()).unwrap();
+    assert_eq!(tree.symlink_target(&node("link")), Some(PathBuf::from("other")));
+    assert_eq!(tree.symlink_target(&node("new_link")), Some(PathBuf::from("f.bin")));
+    assert_eq!(node("f.bin").file_kind(), Some(FileKind::Fifo));
+    tree_validate_counts(&tree);
+    assert!(!tree.update(dir, Some(true)).unwrap().changed(), "second update changed something");
+}
+
+#[test]
+fn test_tree_watcher_special_moves() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    std::fs::create_dir_all(at("a")).unwrap();
+    std::fs::create_dir_all(at("b")).unwrap();
+    symlink("target-1", at("a/lnk")).unwrap();
+    symlink("target-3", at("a/lnk3")).unwrap();
+    mkfifo(&at("a/p"));
+    let tree: Arc<DirTree> = Arc::new(walked_tree(dir, FileMode::NODE, false));
+    let watcher: Arc<TreeWatcher> = TreeWatcher::start(tree.clone()).expect("watcher should start");
+    assert_eq!(tree.conf().specials(), 3);
+    let has = |name: &str| tree.contains(&at(name).to_string_lossy());
+    let node = |name: &str| tree.get_node(&at(name).to_string_lossy()).unwrap();
+
+    // to another directory: re-created from its known kind and target
+    rename(at("a/lnk"), at("b/lnk2")).unwrap();
+    wait_for(|| has("b/lnk2") && !has("a/lnk"), "symlink moved to b/");
+    assert_eq!(tree.symlink_target(&node("b/lnk2")), Some(PathBuf::from("target-1")));
+    // renamed in place: the same node, re-attached
+    rename(at("a/p"), at("a/p2")).unwrap();
+    wait_for(|| has("a/p2") && !has("a/p"), "FIFO renamed");
+    assert_eq!(node("a/p2").file_kind(), Some(FileKind::Fifo));
+    // a directory moved to another parent is rebuilt from memory, kinds included
+    rename(at("a"), at("b/a_moved")).unwrap();
+    wait_for(|| has("b/a_moved/lnk3"), "directory moved under b/");
+    assert_eq!(tree.symlink_target(&node("b/a_moved/lnk3")), Some(PathBuf::from("target-3")));
+    assert_eq!(node("b/a_moved/p2").file_kind(), Some(FileKind::Fifo));
+    assert_eq!(tree.conf().specials(), 3, "specials after the moves");
+
+    remove_file(at("b/lnk2")).unwrap();
+    wait_for(|| !has("b/lnk2"), "symlink removed");
+    assert_eq!(tree.conf().specials(), 2, "specials after the removal");
+    watcher.stop();
+    assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
+    tree_validate_counts(&tree);
+}
+
+/// Create a FIFO at `path`.
+fn mkfifo(path: &Path) {
+    let c: CString = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo {}", path.display());
 }
 
 fn wait_for<F: Fn() -> bool>(cond: F, msg: &str) {
@@ -1234,17 +1359,13 @@ fn check_nodes_dirs_files(nodes: u32, root_depth: u8, dirs: u32, files: u32, dep
 
 /// Validate and return the counts of nodes, dirs, and files below a given node.
 fn validate_counts_below_node(tree: &DirTree, node: Arc<Node>) -> (u64, u64, u64) {
-    let (nodes_c, dirs_c, files_c) = tree.count_from(node.clone());
-    let (nodes_i, dirs_i, files_i) = tree.iter_count_from(node.clone());
+    let c: NodeCounts = tree.count_from(node.clone());
+    let i: NodeCounts = tree.iter_count_from(node.clone());
 
-    assert_eq!(nodes_c, dirs_c + files_c, "count_from() node count != dirs+files");
-    assert_eq!(nodes_i, dirs_i + files_i, "iter_count_from() node count != dirs+files");
+    assert_eq!(c.nodes, c.dirs + c.files + c.specials, "count_from() node count != dirs+files+specials");
+    assert_eq!(c, i, "count_from() != iter_count_from()");
 
-    assert_eq!(nodes_c, nodes_i, "count_from() != iter_count_from() [nodes]");
-    assert_eq!(dirs_c, dirs_i, "count_from() != iter_count_from() [dirs]");
-    assert_eq!(files_c, files_i, "count_from() != iter_count_from() [files]");
-
-    (nodes_c as u64, dirs_c as u64, files_c as u64)
+    (c.nodes as u64, c.dirs as u64, c.files as u64)
 }
 
 /**

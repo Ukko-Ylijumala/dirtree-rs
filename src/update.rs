@@ -23,7 +23,9 @@ there; adds and removes still work.
 use super::dirtree::{DirTree, ENTRY_BATCH_MIN, MAX_RECURSE_DEPTH};
 use super::event::{TreeEvent, TreeOp};
 use super::hash::DirTreeXxh3Hasher;
-use super::node::{DirTreeHashMap, MaybeNode, Node, NodeType, ctime_stamp};
+use super::conf::NodeCounts;
+use super::dirtree::NewChild;
+use super::node::{DirTreeHashMap, FileEntry, FileKind, MaybeNode, Node, ctime_stamp};
 
 use dirhandle::{DirHandle, EntryExt};
 use timesince::SecondsSinceEpoch;
@@ -35,6 +37,7 @@ use std::{
     fmt::{self, Display, Formatter},
     fs::metadata,
     io::{Error, ErrorKind},
+    os::fd::{AsRawFd, BorrowedFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -61,10 +64,14 @@ pub struct UpdateStats {
     pub skipped_dirs: u32,
     pub added_dirs: u32,
     pub added_files: u32,
+    /// Special files added (see [FileKind]).
+    pub added_specials: u32,
     /// Directory nodes removed (including subtree contents).
     pub removed_dirs: u32,
     /// File nodes / name entries removed (including subtree contents).
     pub removed_files: u32,
+    /// Special file nodes removed (including subtree contents).
+    pub removed_specials: u32,
     /// Entries whose inode or type changed (counted once each; their
     /// old subtree contents are included in the removed counters).
     pub replaced: u32,
@@ -76,8 +83,10 @@ impl UpdateStats {
     pub fn changed(&self) -> bool {
         self.added_dirs != 0
             || self.added_files != 0
+            || self.added_specials != 0
             || self.removed_dirs != 0
             || self.removed_files != 0
+            || self.removed_specials != 0
             || self.replaced != 0
     }
 }
@@ -86,11 +95,13 @@ impl Display for UpdateStats {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "+{}d/+{}f, -{}d/-{}f, ~{} replaced ({} dirs diffed, {} skipped, {} errors)",
+            "+{}d/+{}f/+{}s, -{}d/-{}f/-{}s, ~{} replaced ({} dirs diffed, {} skipped, {} errors)",
             self.added_dirs,
             self.added_files,
+            self.added_specials,
             self.removed_dirs,
             self.removed_files,
+            self.removed_specials,
             self.replaced,
             self.scanned_dirs,
             self.skipped_dirs,
@@ -106,8 +117,10 @@ struct UpdateCtr {
     skipped_dirs: AtomicU32,
     added_dirs: AtomicU32,
     added_files: AtomicU32,
+    added_specials: AtomicU32,
     removed_dirs: AtomicU32,
     removed_files: AtomicU32,
+    removed_specials: AtomicU32,
     replaced: AtomicU32,
     errors: AtomicU32,
 }
@@ -119,11 +132,20 @@ impl UpdateCtr {
             skipped_dirs: self.skipped_dirs.load(Relaxed),
             added_dirs: self.added_dirs.load(Relaxed),
             added_files: self.added_files.load(Relaxed),
+            added_specials: self.added_specials.load(Relaxed),
             removed_dirs: self.removed_dirs.load(Relaxed),
             removed_files: self.removed_files.load(Relaxed),
+            removed_specials: self.removed_specials.load(Relaxed),
             replaced: self.replaced.load(Relaxed),
             errors: self.errors.load(Relaxed),
         }
+    }
+
+    /// Count what a removal took off the tree.
+    fn removed(&self, c: NodeCounts) {
+        self.removed_dirs.fetch_add(c.dirs, Relaxed);
+        self.removed_files.fetch_add(c.files, Relaxed);
+        self.removed_specials.fetch_add(c.specials, Relaxed);
     }
 }
 
@@ -251,10 +273,7 @@ impl DirTree {
                     && let Some(parent) = node.parent()
                     && let Some((name_idx, _)) = parent.get_child_byref(&node)
                 {
-                    let (_, dirs, files) =
-                        self.remove_child_node(&parent, name_idx, node.clone());
-                    ctr.removed_dirs.fetch_add(dirs, Relaxed);
-                    ctr.removed_files.fetch_add(files, Relaxed);
+                    ctr.removed(self.remove_child_node(&parent, name_idx, node.clone()));
                     return;
                 }
                 ctr.errors.fetch_add(1, Relaxed);
@@ -278,15 +297,17 @@ impl DirTree {
 
         /*
         Disk view: interned name -> dirent. Filtered entries are treated
-        as absent, and entry types the tree does not model (symlinks,
-        sockets, ...) are ignored like everywhere else. An entry whose
-        type cannot be determined at all (DT_UNKNOWN and a failed
-        fstatat) is neither: it exists, so whatever the tree has under
-        that name is kept as-is.
+        as absent, and so are special files in a Name-mode tree, which
+        does not record them (like the walk). An entry whose type cannot
+        be determined at all (DT_UNKNOWN and a failed fstatat) is neither:
+        it exists, so whatever the tree has under that name is kept as-is.
 
         The diff keeps its own stamp (above), so the handle's own state
         tracking would be wasted work: iterate untracked.
         */
+        let name_only: bool = self.filemode().is_name();
+        // for readlinkat() on new symlinks; the handle outlives the entries
+        let dirfd: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(handle.as_raw_fd()) };
         let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
         if let Some(e) = iter.error() {
@@ -324,7 +345,8 @@ impl DirTree {
                 continue;
             }
             let is_dir: bool = e.is_dir();
-            if !is_dir && !e.is_file() {
+            let kind: Option<FileKind> = e.file_type().and_then(FileKind::from_type);
+            if !is_dir && kind.is_none_or(|k: FileKind| k.is_special() && name_only) {
                 continue;
             }
             if !self.conf.filters().passes(name_os, is_dir) {
@@ -357,9 +379,7 @@ impl DirTree {
             trace!(target: "UPDATE_RM", "{:?} in {}", name_idx, path.display());
             match child {
                 Some(c) => {
-                    let (_, dirs, files) = self.remove_child_node(&node, *name_idx, c.clone());
-                    ctr.removed_dirs.fetch_add(dirs, Relaxed);
-                    ctr.removed_files.fetch_add(files, Relaxed);
+                    ctr.removed(self.remove_child_node(&node, *name_idx, c.clone()));
                 }
                 None => {
                     // a Name-mode (node-less) file entry
@@ -379,6 +399,15 @@ impl DirTree {
             let is_dir: bool = entry.is_dir();
             let disk_ino: u64 = entry.ino();
             let name_os: &OsStr = OsStr::from_bytes(entry.name_as_bytes());
+            // what a new or replaced non-directory is recorded as
+            let leaf = || -> FileEntry {
+                let kind: FileKind = entry.file_type().and_then(FileKind::from_type).unwrap_or_default();
+                let target: Option<u32> = match kind {
+                    FileKind::Symlink => self.link_target_at(dirfd, entry.file_name()),
+                    _ => None,
+                };
+                FileEntry::new(kind, target)
+            };
 
             match tree_view.get(&name_idx) {
                 // new on disk
@@ -390,7 +419,7 @@ impl DirTree {
                             ctr,
                         );
                     } else {
-                        self.update_add_file(&node, name_idx, disk_ino, child_depth, ctr);
+                        self.update_add_file(&node, name_idx, disk_ino, leaf(), child_depth, ctr);
                     }
                 }
 
@@ -416,7 +445,13 @@ impl DirTree {
                 }
 
                 Some(Some(existing)) => {
-                    let type_match: bool = existing.node_t.is_dir() == is_dir;
+                    /*
+                    A directory has no FileKind on either side. A kind change
+                    under the same inode is a freed inode number reused at
+                    once (a file deleted and a FIFO created, say): replaced.
+                    */
+                    let type_match: bool = existing.node_t.is_dir() == is_dir
+                        && existing.file_kind() == entry.file_type().and_then(FileKind::from_type);
                     let tree_ino: u64 = existing.inode().unwrap_or(0);
                     /*
                     Inode 0 marks an intermediate node created without a
@@ -426,10 +461,7 @@ impl DirTree {
                         !type_match || (tree_ino != 0 && disk_ino != 0 && tree_ino != disk_ino);
                     if replaced {
                         trace!(target: "UPDATE_REPLACE", "{:?} in {}", name_os, path.display());
-                        let (_, dirs, files) =
-                            self.remove_child_node(&node, name_idx, existing.clone());
-                        ctr.removed_dirs.fetch_add(dirs, Relaxed);
-                        ctr.removed_files.fetch_add(files, Relaxed);
+                        ctr.removed(self.remove_child_node(&node, name_idx, existing.clone()));
                         ctr.replaced.fetch_add(1, Relaxed);
                         if is_dir {
                             let child_p: PathBuf = path.join(name_os);
@@ -438,7 +470,7 @@ impl DirTree {
                             );
                         } else {
                             self.update_add_file(
-                                &node, name_idx, disk_ino, child_depth, ctr,
+                                &node, name_idx, disk_ino, leaf(), child_depth, ctr,
                             );
                         }
                     } else if is_dir && recursive {
@@ -483,7 +515,7 @@ impl DirTree {
     ) {
         trace!(target: "UPDATE_ADD", "dir {}", child_p.display());
         let (child, created) =
-            self.insert_child(parent, name_idx, NodeType::Directory, inode, depth);
+            self.insert_child(parent, name_idx, NewChild::Dir, inode, depth);
         if created {
             ctr.added_dirs.fetch_add(1, Relaxed);
             self.conf.observer().dirs_added(1);
@@ -500,6 +532,7 @@ impl DirTree {
         parent: &Arc<Node>,
         name_idx: u32,
         inode: u64,
+        file: FileEntry,
         depth: u8,
         ctr: &UpdateCtr,
     ) {
@@ -515,8 +548,12 @@ impl DirTree {
                 self.conf.observer().files_added(1, 0);
             }
         } else if mode.is_node() {
-            let (_, created) = self.insert_child(parent, name_idx, NodeType::File, inode, depth);
-            if created {
+            let (_, created) =
+                self.insert_child(parent, name_idx, NewChild::Leaf(file), inode, depth);
+            if created && file.kind().is_special() {
+                ctr.added_specials.fetch_add(1, Relaxed);
+                self.conf.observer().specials_added(1);
+            } else if created {
                 ctr.added_files.fetch_add(1, Relaxed);
                 self.conf.observer().files_added(1, 0);
             }

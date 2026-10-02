@@ -22,9 +22,12 @@ pub trait TreeObserver: Send + Sync + Debug {
     /// `n` directories were attached to the tree.
     fn dirs_added(&self, _n: u64) {}
 
-    /// `n` files were attached; `bytes` is their total size (0 unless the
-    /// filemode includes `SIZE`).
+    /// `n` regular files were attached; `bytes` is their total size (0
+    /// unless the filemode includes `SIZE`).
     fn files_added(&self, _n: u64, _bytes: u64) {}
+
+    /// `n` special files (symlinks, FIFOs, sockets, devices) were attached.
+    fn specials_added(&self, _n: u64) {}
 }
 
 /// The default observer: no progress reporting.

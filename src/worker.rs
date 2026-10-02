@@ -80,8 +80,7 @@ fn worker_round(t: &DirTree, spin_ctr: &mut u8) -> Round {
                     let p: String = path.clone();
                     t.set_state(TreeState::Active(op.clone()));
                     if let Ok(Some(x)) = t.remove(&p) {
-                        let msg: String =
-                            format!("Removed: {} nodes, {} dirs, {} files", x.0, x.1, x.2);
+                        let msg: String = format!("Removed: {x}");
                         t.add_event(TreeEvent::new(&msg).path(&p).op(&op));
                     }
                 }

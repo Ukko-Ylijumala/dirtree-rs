@@ -4,7 +4,7 @@
 Trie-based directory tree, scanned and held in memory.
 
 The module is split into several submodules for clarity:
-- `node`:     the building blocks of the trie: `Data`, `Entry<T>`, `Directory`, `FileEntry`, `NodeType`, `NodeItem`, `Node`.
+- `node`:     the building blocks of the trie: `Data`, `Entry<T>`, `Directory`, `FileEntry`, `FileKind`, `NodeType`, `NodeItem`, `Node`.
 - `hash`:     [`DirTreeXxh3Hasher`] used for [`HashMap`](std::collections::HashMap) keys in the trie.
 - `conf`:     [`TreeConf`] - atomic counters and feature flags.
 - `event`:    [`TreeOp`], [`TreeState`], [`TreeEvent`], [`EventInfo`].
@@ -43,7 +43,7 @@ mod visitors;
 mod watch;
 mod worker;
 
-pub use conf::TreeConf;
+pub use conf::{NodeCounts, TreeConf};
 pub use debug::{tree_print_debug, tree_validate_counts};
 pub use dirtree::{DirTree, DirTreeIterator};
 pub use error::{TreeError, TreeResult};
@@ -51,7 +51,7 @@ pub use event::{EventInfo, TreeEvent, TreeOp, TreeState};
 pub use filemode::FileMode;
 pub use filters::Filters;
 pub use hash::DirTreeXxh3Hasher;
-pub use node::{Directory, Entry, FileEntry, Node, NodeItem, NodeType};
+pub use node::{Directory, Entry, FileEntry, FileKind, Node, NodeItem, NodeType};
 pub use observer::{NoopObserver, TreeObserver};
 pub use traverse::{traverse_from, traverse_from_par, walk_nodes};
 pub use update::UpdateStats;
