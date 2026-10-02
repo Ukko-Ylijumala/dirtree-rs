@@ -20,7 +20,7 @@ filemode files carry no inode, so file replacement is undetectable
 there; adds and removes still work.
 */
 
-use super::dirtree::{DirTree, MAX_RECURSE_DEPTH};
+use super::dirtree::{DirTree, ENTRY_BATCH_MIN, MAX_RECURSE_DEPTH};
 use super::event::{TreeEvent, TreeOp};
 use super::hash::DirTreeXxh3Hasher;
 use super::node::{DirTreeHashMap, MaybeNode, Node, NodeType, ctime_stamp};
@@ -31,6 +31,7 @@ use timesince::SecondsSinceEpoch;
 use tracing::{debug, instrument, trace};
 
 use std::{
+    borrow::Cow,
     ffi::OsStr,
     fmt::{self, Display, Formatter},
     fs::metadata,
@@ -306,8 +307,15 @@ impl DirTree {
             return;
         }
         drop(iter);
-        let mut disk: DirTreeHashMap<u32, &EntryExt> =
-            DirTreeHashMap::with_capacity_and_hasher(entries.len(), DirTreeXxh3Hasher);
+        /*
+        The passing names are interned after the loop, ENTRY_BATCH_MIN at
+        a time: one insert_many() takes stringstore's writer mutex once per
+        batch instead of once per new name (as the walker does). Batches
+        stay moderate, as every reader and writer waiting on the mutex
+        waits out the whole batch.
+        */
+        let mut names: Vec<Cow<str>> = Vec::with_capacity(entries.len());
+        let mut passing: Vec<&EntryExt> = Vec::with_capacity(entries.len());
         let mut unknown: Vec<u32> = Vec::new();
         for e in &entries {
             let name_os: &OsStr = OsStr::from_bytes(e.name_as_bytes());
@@ -325,7 +333,17 @@ impl DirTree {
             if !self.conf.filters().passes(name_os, is_dir) {
                 continue;
             }
-            disk.insert(self.strings.insert(name_os.to_string_lossy().as_ref()), e);
+            names.push(name_os.to_string_lossy());
+            passing.push(e);
+        }
+        let mut disk: DirTreeHashMap<u32, &EntryExt> =
+            DirTreeHashMap::with_capacity_and_hasher(passing.len(), DirTreeXxh3Hasher);
+        for (batch, batch_entries) in names
+            .chunks(ENTRY_BATCH_MIN)
+            .zip(passing.chunks(ENTRY_BATCH_MIN))
+        {
+            let indices: Vec<u32> = self.strings.insert_many(batch);
+            disk.extend(indices.into_iter().zip(batch_entries.iter().copied()));
         }
 
         // tree view snapshot (Arc clones only, one read lock hold)

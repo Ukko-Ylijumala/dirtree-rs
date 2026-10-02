@@ -61,7 +61,7 @@ insert), so batching is what keeps scheduling overhead from dominating
 the walk. Subdirectories are never batched: each one is a whole subtree
 of work.
 */
-const ENTRY_BATCH_MIN: usize = 64;
+pub(super) const ENTRY_BATCH_MIN: usize = 64;
 
 /**
 Lightweight state that flows down the parallel walk: the active
