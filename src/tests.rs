@@ -910,6 +910,44 @@ fn test_tree_visitor_forces_parallel() {
     tree_validate_counts(&tree);
 }
 
+#[test]
+fn test_tree_visitor_tags() {
+    const TAG: ScopeTag = 7;
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    for d in ["a", "b", "c/d"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    write(at("a/MARK"), b"").unwrap();
+    write(at("c/d/MARK"), b"").unwrap();
+
+    let (tx, rx) = crossbeam::channel::unbounded::<WalkEvent>();
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_visitor(Arc::new(MarkerVisitor::new().marker(Marker::file_named("MARK").tag(TAG))))
+        .with_discovery_sink(tx);
+    tree.walk().unwrap();
+    let tagged = |tree: &DirTree| -> HashSet<PathBuf> {
+        tree.tagged(TAG).map(|d: Arc<Directory>| d.path(tree.strings())).collect()
+    };
+
+    // the tags stored in the tree match the events streamed during the walk
+    let events: HashSet<PathBuf> = rx.try_iter().map(|e: WalkEvent| e.path).collect();
+    assert_eq!(tagged(&tree), HashSet::from([at("a"), at("c/d")]));
+    assert_eq!(tagged(&tree), events);
+    assert_eq!(tree.get_dir(&at("b").to_string_lossy()).unwrap().tag(), None);
+    assert_eq!(tree.tagged(TAG + 1).count(), 0);
+
+    // a rescan refreshes them: the marker moved from a/ to b/
+    rename(at("a/MARK"), at("b/MARK")).unwrap();
+    for d in ["a", "b"] {
+        tree.populate_par(&at(d), Some(true));
+    }
+    assert_eq!(tagged(&tree), HashSet::from([at("b"), at("c/d")]));
+}
+
 /// Counts what a [TreeObserver] is told, for [test_tree_observer].
 #[derive(Debug, Default)]
 struct CountingObserver {

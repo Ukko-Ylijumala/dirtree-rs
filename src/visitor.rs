@@ -15,6 +15,8 @@ See `docs/implementation.md` for the design rationale. Brief summary:
   zero allocations.
 - [`WalkEvent`] is the streaming output: every `Verdict::Tag` produces
   one event on the optional `Sender<WalkEvent>` configured on the tree.
+  The tag is also stored on the directory (see
+  [`DirTree::tagged`](super::DirTree::tagged)) for querying after the walk.
 
 The trait coexists with [`Filters`](super::Filters): both run
 per child, prune wins over filter, both veto.

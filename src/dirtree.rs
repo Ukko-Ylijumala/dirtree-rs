@@ -832,6 +832,11 @@ impl DirTree {
                 walk: &walk_ctx,
                 entries: &entries,
             });
+            // a rescan refreshes the tag: a marker may have come or gone
+            node.set_tag(match verdict {
+                Verdict::Tag { tag, .. } => tag,
+                _ => SCOPE_NONE,
+            });
             match verdict {
                 Verdict::Continue => {}
                 Verdict::SkipChildren => {
@@ -1677,6 +1682,17 @@ impl DirTree {
         })
     }
 
+    /**
+    A lazy iterator over the directories a visitor tagged with `tag` (see
+    [Directory::tag]), as of their last walk. Tags come from the walker
+    only: a diff-rescan ([DirTree::update]) or a watcher event changing a
+    directory's entries does not re-run the visitor on it.
+    */
+    pub fn tagged<'a>(&'a self, tag: ScopeTag) -> impl Iterator<Item = Arc<Directory>> + 'a {
+        self.iter_dirs()
+            .filter(move |dir: &Arc<Directory>| dir.tag() == Some(tag))
+    }
+
     /// A lazy iterator over all [[FileEntry]] items in the tree (`Copy`, 16 bytes).
     pub fn iter_files<'a>(&'a self) -> impl Iterator<Item = FileEntry> + 'a {
         self.iter().filter_map(|node: NodeRef| node.as_file().copied())
@@ -1858,12 +1874,14 @@ fn open_dir_nofollow(path: &Path) -> Result<DirHandle, Error> {
 /**
 Carry the per-directory state that a [DirTree::graft_subtree] copy would
 otherwise lose from the old directory node to its new one: the scan
-stamp (so the diff pre-check still skips it) and the pooled handle's fd
+stamp (so the diff pre-check still skips it), the visitor's tag, and the
+pooled handle's fd
 (the handle stays pooled; only the old node, being dropped, stops
 pointing at it).
 */
 fn carry_dir_state(from: &Directory, to: &Directory) {
     to.set_scan_stamp(from.scan_stamp());
+    to.set_tag(from.tag().unwrap_or(SCOPE_NONE));
     if from.fd().is_open() {
         to.fd_set(from.fd().fd()).ok();
     }

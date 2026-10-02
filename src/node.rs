@@ -15,6 +15,7 @@ entry from outside a children map.
 
 use super::hash::DirTreeXxh3Hasher;
 use super::utils::PATH_SEP;
+use super::visitor::{SCOPE_NONE, ScopeTag};
 
 use dirhandle::{DirFd, nix::dir::Type};
 use stringstore::UniqueStrStore;
@@ -30,7 +31,7 @@ use std::{
     os::fd::RawFd,
     os::unix::fs::FileTypeExt,
     path::PathBuf,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
+    sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed},
     sync::{Arc, Weak},
 };
 
@@ -87,6 +88,12 @@ pub struct Directory {
     /// Interned name index. Atomic so a rename can re-label the
     /// directory in place through the shared `&Directory`.
     name: AtomicU32,
+    /**
+    The tag of the last [`Verdict::Tag`](super::Verdict::Tag) a visitor
+    gave this directory; [`SCOPE_NONE`] if none did (or no visitor is
+    set). Refreshed each time the walker visits the directory.
+    */
+    tag: AtomicU16,
     fd: DirFd,
     children: Children,
 }
@@ -108,6 +115,7 @@ impl Directory {
             inode,
             stamp: AtomicU64::new(0),
             name: AtomicU32::new(name_idx),
+            tag: AtomicU16::new(SCOPE_NONE),
             fd: DirFd::default(),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
@@ -154,6 +162,21 @@ impl Directory {
     /// Re-label the directory with a new interned name (rename support).
     pub(super) fn name_set(&self, name_idx: u32) {
         self.name.store(name_idx, Relaxed);
+    }
+
+    /// The visitor's tag for this directory, if it gave one (see [DirTree::tagged](super::DirTree::tagged)).
+    #[inline]
+    pub fn tag(&self) -> Option<ScopeTag> {
+        match self.tag.load(Relaxed) {
+            SCOPE_NONE => None,
+            tag => Some(tag),
+        }
+    }
+
+    /// Record the visitor's tag for this directory; [`SCOPE_NONE`] clears it.
+    #[inline]
+    pub(super) fn set_tag(&self, tag: ScopeTag) {
+        self.tag.store(tag, Relaxed);
     }
 
     /// Returns the [[DirFd]] for this [[Directory]].

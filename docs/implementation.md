@@ -161,6 +161,19 @@ A typed channel for richer payloads (e.g. `WpRoot { root: PathBuf, ... }`) is
 the consumer's responsibility — the visitor can capture its own `Sender` and
 emit alongside.
 
+## Stored tags
+
+The tag of every `Verdict::Tag` is also kept on the directory itself
+(`Directory::tag: AtomicU16`, `SCOPE_NONE` = untagged), so a consumer can
+query the finished tree instead of (or as well as) draining the channel:
+`DirTree::tagged(tag)` iterates the directories carrying a tag. Each visit
+of a directory refreshes its tag, so a rescan of it picks up a marker that
+came or went. A diff-rescan (`update()`) or a watcher event does not re-run
+the visitor on directories it does not scan in full, so their tags stay as
+of their last walk. Re-evaluating them there would also need each
+directory's scope and walk depth stored. A `FileEntry` has spare bytes for
+a tag of its own, should visitors ever tag files.
+
 ## Cooperative cancellation
 
 `TreeConf::cancelled: AtomicBool` is checked at the top of every
@@ -255,10 +268,6 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
 
 - Splitting the tree module out into its own crate so other projects
   can depend on it without pulling in statter's CLI surface.
-- Per-directory tag storage (`Directory::tag: AtomicU16`; a `FileEntry`
-  has spare bytes for one too) so a post-walk consumer
-  can query the tree by tag instead of (or in addition to) the
-  discovery channel.
 - Removal hooks on `TreeObserver` (`dirs_removed` / `files_removed`,
   default no-ops), so an observer can track the live tree size through
   `update()` and the watcher. `UpdateStats` already carries the removal
