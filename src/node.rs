@@ -176,16 +176,16 @@ impl AsRef<Data> for dyn DirectoryEntry {
 }
 
 /**
-A generic struct wrapping the [Data] struct, with an extra type parameter `T`.
+A generic struct wrapping the `Data` struct, with an extra type parameter `T`.
 The [Entry] struct's `new()` method is responsible for creating [Directory]
-and [File] instances with the given path and metadata.
+and [FileEntry] instances with the given path and metadata.
 
 Two structs [Directory] and [FileEntry] are also defined, which are used
 as type parameters for [Entry]. These structs implement the `Default` trait,
 which is needed for creating [Entry] instances without additional params.
 
-This approach allows us to share the implementation of [DirectoryEntry]
-trait between [Directory] and [FileEntry] without too much code duplication.
+This approach allows [Directory] and [FileEntry] to share the
+implementation of [Entry] without too much code duplication.
 
 You can use the struct like this:
 ```rust
@@ -580,7 +580,7 @@ impl NodeType {
     /**
     Returns `true` if the node type is [[File]].
 
-    [[File]]: NodeType::File
+    [File]: NodeType::File
     */
     #[must_use]
     #[inline]
@@ -591,7 +591,7 @@ impl NodeType {
     /**
     Returns `true` if the node type is [[Uninitialized]].
 
-    [[Uninitialized]]: NodeType::Uninitialized
+    [Uninitialized]: NodeType::Uninitialized
     */
     #[must_use]
     #[inline]
@@ -599,7 +599,7 @@ impl NodeType {
         matches!(self, Self::Uninitialized)
     }
 
-    /// Returns `true` if the node contains a [Data] struct.
+    /// Returns `true` if the node contains a `Data` struct.
     #[inline]
     pub fn has_data(&self) -> bool {
         matches!(self, Self::Directory | Self::File)
@@ -877,14 +877,14 @@ impl Node {
         self.as_dir().map(|dir: &Directory| dir.fd())
     }
 
-    /// The inode of the node's file or directory, if it carries [Data].
+    /// The inode of the node's file or directory, if it carries `Data`.
     /// NOTE: intermediate nodes created without a stat report inode 0.
     pub fn inode(&self) -> Option<u64> {
         self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.inode())
     }
 
-    /// Change stamp of the node's last complete scan (see [ctime_stamp];
-    /// 0 = no baseline), if the node carries [Data].
+    /// Change stamp of the node's last complete scan (see `ctime_stamp()`;
+    /// 0 = no baseline), if the node carries `Data`.
     pub fn scan_stamp(&self) -> Option<u64> {
         self.item.get().and_then(|i: &NodeItem| i.data()).map(|d: &Data| d.stamp())
     }

@@ -29,7 +29,7 @@ pub fn walk_nodes(node: &Arc<Node>, q: &SegQueue<Arc<Node>>, dirs: bool, files: 
     }
 }
 
-/// Traverses a [[DirTree]] recursively from a [[Node]] and applies function `f`
+/// Traverses a [[DirTree](super::DirTree)] recursively from a [[Node]] and applies function `f`
 /// to each child node, AND the starting node itself.
 pub fn traverse_from<F>(node: &Arc<Node>, f: &mut F)
 where
@@ -55,14 +55,15 @@ where
 }
 
 /**
-Traverses a [[DirTree]] recursively from a [[Node]] and applies function `f`
+Traverses a [[DirTree](super::DirTree)] recursively from a [[Node]] and applies function `f`
 to each child node, AND the starting node itself. Parallel version.
 
 In contrast to `traverse_from()`, this function requires that the
 fn `f` is `Send` and `Sync` since it will be sent to other threads.
 
 Basically, to make this work you must use Atomic types or other thread-safe
-primitives ([Mutex], [RwLock], [AtomicCell] etc) for any variables in `f`.
+primitives ([Mutex](parking_lot::Mutex), [RwLock](parking_lot::RwLock),
+[AtomicCell](crossbeam::atomic::AtomicCell) etc) for any variables in `f`.
 IOW, no interior mutability or shared mutable state.
 
 Testing shows that this traversal is slower than the sequential version

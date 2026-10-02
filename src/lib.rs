@@ -4,24 +4,24 @@
 Trie-based directory tree, scanned and held in memory.
 
 The module is split into several submodules for clarity:
-- [`node`]:     the building blocks of the trie: `Data`, `Entry<T>`, `Directory`, `FileEntry`, `NodeType`, `NodeItem`, `Node`.
-- [`hash`]:     [`DirTreeXxh3Hasher`] used for [`HashMap`] keys in the trie.
-- [`conf`]:     [`TreeConf`] - atomic counters and feature flags.
-- [`event`]:    [`TreeOp`], [`TreeState`], [`TreeEvent`], [`EventInfo`].
-- [`dirtree`]:  [`DirTree`] itself and [`DirTreeIterator`].
-- [`filemode`]: [`FileMode`] - how a walk handles the files it finds.
-- [`filters`]:  [`Filters`] - regex name filters for files and directories.
-- [`error`]:    [`TreeError`] and [`TreeResult`] for the fallible API.
-- [`traverse`]: free traversal helpers over `Arc<Node>`.
-- [`observer`]: [`TreeObserver`] - progress reporting out of the tree.
-- [`update`]:   diff-rescan (the [`TreeOp::Update`] primitive).
-- [`utils`]:    small shared helpers (path splitting, weak refs, atomics).
-- [`worker`]:   the background work-queue executor.
-- [`visitor`]:  per-directory visitor protocol (recognition, prune, depth).
-- [`visitors`]: built-in [`Visitor`] implementations.
-- [`watch`]:    inotify-based resident-mode tree following.
-- [`debug`]:    developer-facing diagnostic helpers.
-- [`tests`]:    unit tests for the above.
+- `node`:     the building blocks of the trie: `Data`, `Entry<T>`, `Directory`, `FileEntry`, `NodeType`, `NodeItem`, `Node`.
+- `hash`:     [`DirTreeXxh3Hasher`] used for [`HashMap`](std::collections::HashMap) keys in the trie.
+- `conf`:     [`TreeConf`] - atomic counters and feature flags.
+- `event`:    [`TreeOp`], [`TreeState`], [`TreeEvent`], [`EventInfo`].
+- `dirtree`:  [`DirTree`] itself and [`DirTreeIterator`].
+- `filemode`: [`FileMode`] - how a walk handles the files it finds.
+- `filters`:  [`Filters`] - regex name filters for files and directories.
+- `error`:    [`TreeError`] and [`TreeResult`] for the fallible API.
+- `traverse`: free traversal helpers over `Arc<Node>`.
+- `observer`: [`TreeObserver`] - progress reporting out of the tree.
+- `update`:   diff-rescan (the [`TreeOp::Update`] primitive).
+- `utils`:    small shared helpers (path splitting, weak refs, atomics).
+- `worker`:   the background work-queue executor.
+- `visitor`:  per-directory visitor protocol (recognition, prune, depth).
+- `visitors`: built-in [`Visitor`] implementations.
+- `watch`:    inotify-based resident-mode tree following.
+- `debug`:    developer-facing diagnostic helpers.
+- `tests`:    unit tests for the above.
 */
 
 mod conf;

@@ -12,7 +12,7 @@ use timesince::TimeSinceEpoch;
 #[cfg(feature = "size_of")]
 use size_of::SizeOf;
 
-/// The current operation being performed on the [[DirTree]].
+/// The current operation being performed on the [[DirTree](super::DirTree)].
 #[derive(Default, Debug, Clone, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "size_of", derive(SizeOf))]
 pub enum TreeOp {
@@ -36,7 +36,7 @@ pub enum TreeOp {
     Quit,
 }
 
-/// The current state of the [[DirTree]].
+/// The current state of the [[DirTree](super::DirTree)].
 #[derive(Default, Debug, Clone, Hash, PartialEq)]
 pub enum TreeState {
     /// Initial state, no nodes.
@@ -93,7 +93,7 @@ impl Display for EventInfo {
     }
 }
 
-/// A [DirTree] event. Could be an error, warning, or just a notice.
+/// A [DirTree](super::DirTree) event. Could be an error, warning, or just a notice.
 #[derive(Default, Clone, Hash, PartialEq)]
 #[cfg_attr(feature = "size_of", derive(SizeOf))]
 pub struct TreeEvent {

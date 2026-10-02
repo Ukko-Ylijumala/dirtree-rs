@@ -23,7 +23,7 @@ pub fn tree_print_debug(tree: &DirTree) {
 /**
 Validate the counts of nodes, dirs, and files in a [[DirTree]].
 
-We take the counts from the tree's [[Counts]] struct as master data and
+We take the counts from the tree's [[TreeConf](super::TreeConf)] as master data and
 firstly validate that the counts of directories and files add up to the
 total number of nodes. Then we compare those to the counts we get by
 traversing the tree with:
