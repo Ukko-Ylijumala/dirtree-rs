@@ -1,0 +1,132 @@
+# The tree's next consumers — needs and gaps
+
+This is an evaluation, made before the tree module's crate split, of
+what the next two users of the tree need from it and what it still
+lacks:
+
+- **The WordPress scanner.** Still in planning (`docs/design.md`); its
+  code is a stub.
+- **A web malware scanner** for shared hosting servers, currently a
+  separate project with its own walker. It scans 4–6M files per host,
+  runs as root, and treats the files it scans as hostile.
+
+## WordPress scanner
+
+The visitor protocol (`docs/implementation.md`) covers most of what it
+needs: prune by name and context, marker detection, scopes, the
+discovery channel, cancellation, depth limits and stored tags. Two parts
+its plan depends on do not work yet:
+
+1. **Tagging the parent is a no-op.** `MarkerTarget::Parent` is only
+   informational in `MarkerVisitor` (`src/tree/visitors.rs`). Both the
+   `WalkEvent` and the stored tag land on `wp-includes`, not on the WP
+   root, so `DirTree::tagged(TAG_WP_ROOT)` returns the wrong
+   directories.
+2. **Claiming an install does not work.** The example marker
+   (`version.php` under `wp-includes`) matches only once the walk is
+   inside `wp-includes`. By then the root's other subdirectories,
+   including `wp-content/uploads` (possibly hundreds of GB), are already
+   queued. So `descend(false)` stops the walk inside `wp-includes` and
+   nowhere else.
+
+   The fix is to check the marker at the root itself:
+   - It can require several entries (`wp-includes/`, `wp-admin/`,
+     `wp-load.php`).
+   - It can confirm a nested path such as `wp-includes/version.php` with
+     one `fstatat` on the directory's open fd. That runs only when the
+     first component is present in the listing.
+
+   Then the real root is tagged, and it can be claimed before its
+   subdirectories are queued.
+
+Smaller gaps:
+
+- **Pruning `uploads`.** The doc's `WpContentPathPruneVisitor` does not
+  exist. A built-in visitor that prunes by trailing path components
+  would cover it, and the malware scanner's prune patterns as well.
+- **Keep the trie.** `wp-config.php` sometimes lives one level above the
+  root. The parent's listing is already in the tree, so finding it is a
+  lookup with no syscalls. That is a reason to keep the tree rather
+  than use a discover-only walk.
+
+## Malware scanner
+
+How it works today:
+
+- **Walk:** its own walker, one rayon task per directory.
+- **Syscalls:** one `lstat` per non-directory entry.
+- **Paths:** candidates are collected as full `String` paths.
+- **Phases:** detection starts only after every walk has finished.
+- **Time:** wall time is dominated by reading files. A run with a warm
+  cache still spends minutes in system time. The cache never skips a
+  read, by design, because attackers backdate mtimes.
+- **Planned:** a resident daemon on fanotify filesystem marks. Its
+  design explicitly rejects recursive per-directory inotify watches.
+
+What the tree would not change is the speed of the nightly walk. The
+scanner's walk is already parallel, and reads dominate. A snapshot
+followed by `update()` does not help much either: a directory's ctime
+catches entries that came or went, not a file edited in place, and the
+scanner reads every candidate anyway.
+
+Where it would gain:
+
+1. **The resident daemon.** fanotify reports writes as the kernel sees
+   them, so backdated mtimes do not matter. Between events the tree
+   holds the host's whole state, with accounts and WP roots tagged and
+   prunes applied, so only the changed files are read again. Snapshots
+   let the daemon restart without a full walk.
+2. **Opening files relative to their directory.**
+   `openat(dirfd, name)` instead of a full path:
+   - saves the kernel's path resolution, for millions of files;
+   - cannot be redirected by a symlink swapped into the path;
+   - needs no workaround for paths past `PATH_MAX`.
+
+   The tree already has the directory handles.
+3. **Context from the tree instead of syscalls.**
+   - Sibling checks such as cloak rosters (`lstat` of named siblings),
+     ancestor `read_dir`s, and parent or plugin slugs become lookups in
+     memory.
+   - Core-directory checks now match substrings of the path, and anyone
+     can create `x/wp-includes/` (inferred). A tag on a WP root that was
+     recognized by its markers is a stronger signal.
+4. **Memory.** Millions of candidate `String`s become a directory
+   reference plus a name index.
+5. **Symlink escapes.** Finding links that point outside every account
+   needs no extra syscalls, because the tree already holds the interned
+   symlink targets.
+
+## Gaps, by priority
+
+Correctness, to fix before the split:
+
+| # | Gap | Needed by |
+|---|-----|-----------|
+| 1 | **Non-UTF-8 names.** Names are converted lossily. A file with such a name comes back as a different path, cannot be opened, and two names can collapse into one entry: a place for malware to hide. Fix: a reversible escape into the string store. | both; critical for the malware scanner |
+| 2 | **Markers.** Tag the parent, require several entries, check a nested path, and claim the matched subtree. | WP (and WP roots for the malware scanner) |
+| 3 | **Error reporting.** Errors are a counter plus text events. A scanner that reports coverage needs each hole as a kind plus a path (listing failed, vanished, open failed…), through the observer. | malware scanner |
+
+Features, after the split:
+
+| # | Gap | Needed by |
+|---|-----|-----------|
+| 4 | `open_at(&NodeRef)`, and iterating candidates grouped by directory | both |
+| 5 | **A per-file visitor hook.** It would get the kind and the entry, and could select a candidate and stream it, so detection overlaps the walk. Today `prune_child` gets only `is_dir`. | malware scanner; WP phase 2 |
+| 6 | **Pruning by path-component globs**, built in (`*/domains/*/logs`, `wp-content/uploads`) | both |
+| 7 | **Several roots** per tree, or one string store shared by several trees. Hosting servers spread accounts over several roots. | malware scanner |
+| 8 | **A pluggable change source.** fanotify reports a directory by file handle, so this needs a directory-by-inode index or a lookup by path. The applying side mostly exists (`update()` of one path). | malware daemon |
+| 9 | **Snapshots**, as planned in `docs/snapshot.md` | malware daemon |
+| 10 | **Staying on one filesystem**, optionally. This costs one `fstat` per directory, on the fd the walker already holds. | nice to have |
+
+Deliberately not proposed: per-file stat data (size, mode, mtime) on
+every `FileEntry`. That would cost about 100 MB on a 4.6M-file host.
+Both consumers need stat data only for candidates, and the per-file
+hook (#5) can stat them lazily.
+
+## Scale
+
+On synthetic trees where every name is unique, the tree costs about
+94 B per entry, strings included. A 6M-file host could then take
+300–550 MB of resident memory, which matters on shared hosting servers.
+Real trees reuse names far more, so this needs measuring on a real
+host before the daemon is designed around it.
