@@ -17,6 +17,8 @@ pub enum TreeError {
     NoRoot,
     /// The background worker thread could not be started.
     WorkerSpawn(io::Error),
+    /// The background worker thread panicked; holds the panic message.
+    WorkerPanicked(String),
 }
 
 impl Display for TreeError {
@@ -24,6 +26,7 @@ impl Display for TreeError {
         match self {
             Self::NoRoot => f.write_str("root path must be set before building the tree"),
             Self::WorkerSpawn(e) => write!(f, "failed to start the tree worker thread: {e}"),
+            Self::WorkerPanicked(msg) => write!(f, "the tree worker thread panicked: {msg}"),
         }
     }
 }

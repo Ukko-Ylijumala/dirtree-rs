@@ -28,6 +28,7 @@ use rayon::prelude::*;
 use tracing::{debug, error, instrument, trace, trace_span, warn};
 
 use std::{
+    any::Any,
     borrow::Cow,
     collections::VecDeque,
     ffi::OsStr,
@@ -193,7 +194,8 @@ impl DirTree {
     #[inline]
     pub(super) fn set_state(&self, state: TreeState) {
         if state == TreeState::Quitting {
-            self.quit_worker(false);
+            // non-blocking, so it cannot fail
+            let _ = self.quit_worker(false);
         } else if state == TreeState::Ready && self.has_work() {
             self.add_error(TreeEvent::new("Work queue not empty, cannot set state::Ready"));
             return;
@@ -261,13 +263,26 @@ impl DirTree {
         self.worker.lock().is_some()
     }
 
-    /// Tell the background worker thread to quit. Optionally wait till
-    /// the worker thread exits.
-    pub(super) fn quit_worker(&self, block: bool) {
+    /**
+    Tell the background worker thread to quit. Optionally wait till
+    the worker thread exits; a worker that panicked is reported as
+    [TreeError::WorkerPanicked]. Never fails without `block`.
+    */
+    pub(super) fn quit_worker(&self, block: bool) -> TreeResult<()> {
         self.queue_op_prio(TreeOp::Quit);
         if block && let Some(worker) = self.worker.lock().take() {
-            worker.join().expect("Failed to join DirTree worker thread");
+            worker.join().map_err(|payload: Box<dyn Any + Send>| {
+                let msg: String = match payload.downcast::<String>() {
+                    Ok(msg) => *msg,
+                    Err(payload) => match payload.downcast_ref::<&str>() {
+                        Some(msg) => msg.to_string(),
+                        None => "<non-string panic payload>".to_owned(),
+                    },
+                };
+                TreeError::WorkerPanicked(msg)
+            })?;
         }
+        Ok(())
     }
 
     /**
@@ -1620,12 +1635,11 @@ impl DirTree {
     pub fn handle_close(&self, path: &str) {
         if let Some(node) = self.get_node(path)
             && node.is_dir()
+            && let Some(dirfd) = node.dirfd()
+            && dirfd.is_open()
         {
-            let dirfd: &DirFd = node.dirfd().unwrap();
-            if dirfd.is_open() {
-                self.handles.close(dirfd.fd());
-                dirfd.clear();
-            }
+            self.handles.close(dirfd.fd());
+            dirfd.clear();
         }
     }
 

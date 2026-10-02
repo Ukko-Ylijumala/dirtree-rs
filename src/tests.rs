@@ -17,6 +17,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
+    thread,
     time::Duration,
 };
 use miniutils::{EntryKind, PlannedEntry, Special, TreeSpec};
@@ -125,7 +126,7 @@ fn test_tree_build_thread() {
     let (nodes, dirs, files, depth) = counts(&tree);
     let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;
     check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
-    tree.quit_worker(true);
+    tree.quit_worker(true).unwrap();
 }
 
 #[test]
@@ -660,6 +661,44 @@ fn test_tree_no_root() {
 }
 
 #[test]
+fn test_node_uninitialized_item() {
+    // an item-less node reads as NodeItem::None instead of panicking
+    let node: Node = Node::default();
+    assert!(node.item().is_none());
+    assert!(node.as_dir().is_none() && node.as_file().is_none());
+}
+
+#[test]
+fn test_node_name_detached() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(1).create(temp.path()).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+
+    let p: String = format!("{dir}/file-0.bin");
+    let node: Arc<Node> = tree.get_node(&p).expect("file node should exist");
+    tree.remove(&p).unwrap();
+    // still referenced, but gone from its parent's children map
+    assert!(node.name(tree.strings()).is_err());
+    assert_eq!(tree.node_name(&node), "<unnamed>");
+}
+
+#[test]
+fn test_tree_worker_panicked() {
+    // both panic payload types: a literal (&str) and a formatted String
+    let workers: [fn(); 2] = [|| panic!("worker boom"), || panic!("worker {}", "boom")];
+    for worker in workers {
+        let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default());
+        *tree.worker.lock() = Some(thread::spawn(worker));
+        let res = tree.quit_worker(true);
+        assert!(
+            matches!(res, Err(TreeError::WorkerPanicked(ref msg)) if msg == "worker boom"),
+            "{res:?}"
+        );
+    }
+}
+
+#[test]
 fn test_tree_visitor_forces_parallel() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
@@ -745,7 +784,7 @@ fn test_tree_rescan_via_worker() {
     wait_for(|| tree.contains(&format!("{dir}/b.bin")), "rescan should add b.bin");
     wait_for(|| !tree.contains(&p_a), "rescan should remove a.bin");
 
-    tree.quit_worker(true);
+    tree.quit_worker(true).unwrap();
     tree_validate_counts(&tree);
 }
 

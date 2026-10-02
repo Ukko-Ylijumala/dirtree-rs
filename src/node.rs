@@ -34,6 +34,8 @@ use {
 };
 
 static META_FAIL: &str = "Failed to get metadata";
+/// What an uninitialized node (one with no item) dereferences to.
+static NO_ITEM: NodeItem = NodeItem::None;
 
 // Convenience aliases
 pub(super) type MaybeNode = Option<Arc<Node>>;
@@ -751,11 +753,10 @@ impl Node {
         }
     }
 
+    /// The node's item; [NodeItem::None] for an uninitialized node.
     #[inline]
     pub fn item(&self) -> &NodeItem {
-        self.item
-            .get()
-            .expect("Node should have an item (but not initialized yet)")
+        self.item.get().unwrap_or(&NO_ITEM)
     }
 
     /// Returns `true` if the node is traversable (`children` != `None`).
@@ -849,17 +850,21 @@ impl Node {
     Root node always returns `/`.
     */
     pub fn name(&self, store: &UniqueStrStore) -> Result<String, Error> {
-        if self.node_t == NodeType::Directory {
-            return Ok(self.as_dir().unwrap().name(store).to_string());
+        if self.node_t == NodeType::Directory
+            && let Some(dir) = self.as_dir()
+        {
+            return Ok(dir.name(store).to_string());
         }
         match self.parent() {
-            Some(parent) => {
-                let name_idx: u32 = parent
-                    .get_child_byref(self)
-                    .expect("Parent's children HashMap should contain the child node's name")
-                    .0;
-                Ok(unsafe { store.borrow_str(name_idx) }.to_string())
-            }
+            Some(parent) => match parent.get_child_byref(self) {
+                Some((name_idx, _)) => Ok(unsafe { store.borrow_str(name_idx) }.to_string()),
+                // removed from its parent while still referenced
+                None => {
+                    let msg: &str = "Detached node";
+                    error!(node = ?self, msg);
+                    Err(Error::new(ErrorKind::NotFound, msg))
+                }
+            },
 
             None => {
                 if self.node_t == NodeType::Root {
@@ -988,8 +993,10 @@ impl Node {
         if self.node_t.has_data() {
             context.add(size_of::<Data>());
         }
-        if self.node_t == NodeType::Directory {
-            self.as_dir().unwrap().size_immediate(&mut context);
+        if self.node_t == NodeType::Directory
+            && let Some(dir) = self.as_dir()
+        {
+            dir.size_immediate(&mut context);
         }
         context.total_size()
     }
@@ -1019,8 +1026,10 @@ impl Deref for Node {
 // `self.hash(state)` here would recurse into this same impl infinitely.
 impl Hash for Node {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        if self.node_t.has_data() {
-            self.data().unwrap().hash(state);
+        if self.node_t.has_data()
+            && let Some(data) = self.data()
+        {
+            data.hash(state);
         } else {
             self.item.get().hash(state);
         }

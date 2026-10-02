@@ -11,9 +11,10 @@ the given [SegQueue]. The `dirs` and `files` flags control whether to include
 directory and/or file nodes.
 */
 pub fn walk_nodes(node: &Arc<Node>, q: &SegQueue<Arc<Node>>, dirs: bool, files: bool) {
-    if node.is_traversable() && node.children().is_some() {
-        node.children()
-            .unwrap()
+    if node.is_traversable()
+        && let Some(children) = node.children()
+    {
+        children
             .read()
             .values()
             .flatten()
@@ -37,9 +38,10 @@ where
 {
     // trace!(target: "traverse_from", "{}", node.path().display());
     f(node);
-    if node.is_traversable() && node.children().is_some() {
-        node.children()
-            .unwrap()
+    if node.is_traversable()
+        && let Some(children) = node.children()
+    {
+        children
             .read()
             .values()
             .flatten()
@@ -76,9 +78,10 @@ where
 {
     // trace!(target: "traverse_par", "{}", node.path().display());
     f(node);
-    if node.is_traversable() && node.children().is_some() {
-        node.children()
-            .unwrap()
+    if node.is_traversable()
+        && let Some(children) = node.children()
+    {
+        children
             .read()
             .values()
             .flatten()
