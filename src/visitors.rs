@@ -28,7 +28,7 @@ Prune a fixed set of directory names. All comparisons are `u32`-vs-`u32`
 against the pre-interned name set; no string allocations on the hot path.
 
 File pruning is not done here - files are typically scanned for content,
-not pruned by name. Use [`crate::filters::Filters`] for regex-based file
+not pruned by name. Use [`Filters`](super::Filters) for regex-based file
 filtering if needed.
 */
 #[derive(Debug, Clone)]

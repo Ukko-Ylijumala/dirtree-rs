@@ -8,7 +8,8 @@ use super::observer::TreeObserver;
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::visitor::*;
 use super::worker::tree_worker;
-use crate::{PATH_SEP, args::FileMode, filters::Filters, utils::path_parts};
+use super::{FileMode, Filters};
+use crate::{PATH_SEP, utils::path_parts};
 
 use dirhandle::{
     CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles,

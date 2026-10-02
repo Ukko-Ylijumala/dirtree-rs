@@ -10,6 +10,8 @@ The module is split into several submodules for clarity:
 - [`conf`]:     [`TreeConf`] - atomic counters and feature flags.
 - [`event`]:    [`TreeOp`], [`TreeState`], [`TreeEvent`], [`EventInfo`].
 - [`dirtree`]:  [`DirTree`] itself and [`DirTreeIterator`].
+- [`filemode`]: [`FileMode`] - how a walk handles the files it finds.
+- [`filters`]:  [`Filters`] - regex name filters for files and directories.
 - [`error`]:    [`TreeError`] and [`TreeResult`] for the fallible API.
 - [`traverse`]: free traversal helpers over `Arc<Node>`.
 - [`observer`]: [`TreeObserver`] - progress reporting out of the tree.
@@ -27,6 +29,8 @@ mod debug;
 mod dirtree;
 mod error;
 mod event;
+mod filemode;
+mod filters;
 mod hash;
 mod node;
 mod observer;
@@ -43,6 +47,8 @@ pub use debug::{tree_print_debug, tree_validate_counts};
 pub use dirtree::{DirTree, DirTreeIterator};
 pub use error::{TreeError, TreeResult};
 pub use event::{EventInfo, TreeEvent, TreeOp, TreeState};
+pub use filemode::FileMode;
+pub use filters::Filters;
 pub use hash::DirTreeXxh3Hasher;
 pub use node::{Directory, Entry, FileEntry, Node, NodeItem, NodeType};
 pub use observer::{NoopObserver, TreeObserver};

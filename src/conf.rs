@@ -2,7 +2,8 @@
 
 use super::observer::{NOOP_OBSERVER, TreeObserver};
 use super::visitor::{Visitor, WalkEvent};
-use crate::{args::FileMode, filters::Filters, utils::mod_atom_u32};
+use super::{FileMode, Filters};
+use crate::utils::mod_atom_u32;
 use crossbeam::channel::Sender;
 use parking_lot::RwLock;
 use std::{

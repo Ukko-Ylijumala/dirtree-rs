@@ -11,7 +11,7 @@ queue-overflow recovery in [`TreeWatcher`](super::TreeWatcher). Unlike
 a blind re-scan (which can only ever add nodes), the diff detects and
 removes stale tree entries as well.
 
-Policy matches the watcher: [`Filters`](crate::filters::Filters) are
+Policy matches the watcher: [`Filters`](super::Filters) are
 honored (a filtered-out entry is treated as absent from disk, so tree
 entries admitted by earlier, laxer filters get removed), the
 [`Visitor`](super::Visitor) protocol is not consulted for the diff

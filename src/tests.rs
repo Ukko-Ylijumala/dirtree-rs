@@ -4,7 +4,7 @@
 #![allow(static_mut_refs)]
 
 use super::*;
-use crate::{FileMode, Filters, PATH_SEP, ScanState, testdirs::create_test_dirs};
+use crate::{PATH_SEP, ScanState, testdirs::create_test_dirs};
 use ctor::dtor;
 use libc;
 use parking_lot::Mutex;

@@ -15,7 +15,7 @@ v1 caveats (deliberate, recorded for the future crate split):
 - The watcher thread is the only continuous mutator of a resident tree
   (the worker thread idles). Node-level insertion is atomic, but no
   cross-operation ordering with worker ops is guaranteed.
-- [`Filters`](crate::filters::Filters) are honored for new entries. A
+- [`Filters`](super::Filters) are honored for new entries. A
   configured [`Visitor`](super::Visitor) runs for new-directory subtree
   scans (they go through the normal parallel walker) but is not
   consulted for single-file events.

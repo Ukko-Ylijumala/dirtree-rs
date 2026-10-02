@@ -16,7 +16,7 @@ See `docs/implementation.md` for the design rationale. Brief summary:
 - [`WalkEvent`] is the streaming output: every `Verdict::Tag` produces
   one event on the optional `Sender<WalkEvent>` configured on the tree.
 
-The trait coexists with [`Filters`](crate::filters::Filters): both run
+The trait coexists with [`Filters`](super::Filters): both run
 per child, prune wins over filter, both veto.
 
 [`DirTree`]: super::DirTree
