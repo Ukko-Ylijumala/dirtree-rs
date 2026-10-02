@@ -40,13 +40,7 @@ pub(super) fn tree_worker(t: Arc<DirTree>) {
                     TreeOp::Build(ref path) => {
                         let p: PathBuf = path.clone();
                         t.set_state(TreeState::Active(op));
-                        // A configured visitor forces the parallel walker
-                        // because the visitor protocol is parallel-only.
-                        if t.has_visitor() {
-                            t.populate_par(&p, Some(true));
-                        } else {
-                            t.populate(&p, Some(true));
-                        }
+                        t.populate_auto(&p, Some(true));
                     }
 
                     TreeOp::Scan(ref path, recursive) => {
@@ -54,11 +48,7 @@ pub(super) fn tree_worker(t: Arc<DirTree>) {
                         if t.is_ready() {
                             t.set_state(TreeState::Active(op));
                         }
-                        if t.has_visitor() {
-                            t.populate_par(&p, recursive);
-                        } else {
-                            t.populate(&p, recursive);
-                        }
+                        t.populate_auto(&p, recursive);
                     }
 
                     TreeOp::Remove(ref path) => {

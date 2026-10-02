@@ -244,7 +244,8 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
   setting, as the sync walker would never invoke it.
 - The `Filters` API and its CLI flags. They still apply.
 - `TreeOp::Build/Scan/Remove/...` and `tree_worker`. The worker thread
-  routes through `populate_par` automatically when a visitor is set.
+  walks through `populate_auto`, like `walk()`: the parallel walker
+  unless sync mode is on, and always when a visitor is set.
 - Resident mode (`-R`) and `OpenHandles`. Orthogonal to the protocol.
 - `FileMode` (`Node`/`Name`/`Stat`/`Ignore`/`Size`). The visitor sees
   the same entry list regardless.
