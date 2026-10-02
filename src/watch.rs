@@ -21,9 +21,12 @@ v1 caveats (deliberate, recorded for the future crate split):
   consulted for single-file events.
 - Renames are correlated via move cookies: a rename within one directory
   re-attaches the detached subtree in place (node identity, contents and
-  kernel watches survive - no rescan), a cross-directory file move is
-  rebuilt from its known inode without a stat, and only cross-directory
-  *directory* moves pay a re-scan (the trie has no re-parenting). A
+  kernel watches survive - no rescan); a move to another directory
+  rebuilds the entry there from memory (the trie cannot re-parent a
+  node): a file from its known inode, a directory subtree with its
+  inodes, stamps and handles ([`DirTree::graft_subtree`]), without disk
+  reads. With a visitor, a moved directory is re-scanned instead, as
+  the visitor's verdicts depend on its ancestors. A
   `MOVED_FROM` with no matching `MOVED_TO` within [`PENDING_MOVE_TTL`]
   is a move out of the tree and drops the subtree. Events arriving for
   a subtree between its `MOVED_FROM` and `MOVED_TO` mark the move dirty,
@@ -757,7 +760,17 @@ impl TreeWatcher {
                 }
 
                 debug!(target: "WATCH_MV", "moved to {} (cookie {cookie})", full.display());
-                if child.node_t.is_dir() {
+                let depth: u8 = full
+                    .components()
+                    .count()
+                    .saturating_sub(1)
+                    .min(u8::MAX as usize) as u8;
+                if child.node_t.is_dir() && self.tree.has_visitor() {
+                    /*
+                    A visitor's verdicts depend on a directory's ancestors
+                    (scopes, depth caps, path-aware prunes), so a subtree in
+                    a new place is walked again for the visitor to see it.
+                    */
                     self.tree.release_handles(&child);
                     drop(child); // release the old subtree before re-scanning
                     self.tree.insert(&full, NodeType::Directory, None);
@@ -765,13 +778,28 @@ impl TreeWatcher {
                     // watched directory by directory as the scan reaches them, see WATCH_MKDIR
                     self.tree.populate_par(&full, Some(true));
                     self.sweep_dead_watches();
+                } else if child.node_t.is_dir() {
+                    /*
+                    Rebuilt from memory under the new parent, with no disk
+                    reads. The kernel watches follow the inodes, so
+                    re-adding them hands back the same descriptors, now
+                    mapped to the new nodes; the handles moved over too, so
+                    the old subtree is just dropped.
+                    */
+                    match self.tree.graft_subtree(parent, idx, &child, depth) {
+                        Some(new_root) => self.watch_subtree(&new_root),
+                        None => self.tree.add_error(
+                            TreeEvent::new("Moved directory has no parent directory to go to")
+                                .path(full.to_string_lossy().as_ref()),
+                        ),
+                    }
+                    drop(child);
+                    self.sweep_dead_watches();
+                    if dirty {
+                        self.resync_subtree(&full);
+                    }
                 } else {
                     // a moved file is rebuilt from its known inode: no stat
-                    let depth: u8 = full
-                        .components()
-                        .count()
-                        .saturating_sub(1)
-                        .min(u8::MAX as usize) as u8;
                     let ino: u64 = child.inode().unwrap_or(0);
                     drop(child);
                     let (_, created) =

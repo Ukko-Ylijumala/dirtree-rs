@@ -1406,10 +1406,80 @@ impl DirTree {
     }
 
     /**
+    Re-create the detached directory subtree `old` under `parent` as
+    `name_idx`, `depth_abs` deep: a directory moved to another parent.
+    The trie cannot re-parent a node in place, so the nodes are new, but
+    they are built from memory - inodes, interned names, scan stamps,
+    Name-mode entries and pooled directory handles (resident mode) carry
+    over - so nothing is read from disk, where a rescan would list every
+    directory of the subtree again. Whoever holds a node of `old` holds a
+    detached node afterwards.
+
+    Any previous occupant of `name_idx` is removed first (a rename over
+    an empty directory). `old` must be detached already
+    ([DirTree::detach_child_node] took its nodes off the counters); the
+    new nodes are counted as they are inserted. Not reported to the
+    observer: nothing new appeared on disk. Returns the new subtree root,
+    or [None] if `parent` is not a directory.
+    */
+    pub(super) fn graft_subtree(
+        &self,
+        parent: &Arc<Node>,
+        name_idx: u32,
+        old: &Arc<Node>,
+        depth_abs: u8,
+    ) -> MaybeNode {
+        let occupant: Option<MaybeNode> = parent.as_dir()?.read().get(&name_idx).cloned();
+        if let Some(Some(occupant)) = occupant {
+            self.remove_child_node(parent, name_idx, occupant);
+        }
+        let inode: u64 = old.inode().unwrap_or(0);
+        let (root, _) = self.insert_child(parent, name_idx, NodeType::Directory, inode, depth_abs);
+        let root: Arc<Node> = root?;
+
+        // (old directory, its new node, the depth of the new node)
+        let mut work: Vec<(Arc<Node>, Arc<Node>, u8)> = vec![(old.clone(), root.clone(), depth_abs)];
+        while let Some((from, to, depth)) = work.pop() {
+            carry_dir_state(&from, &to);
+            let Some(children) = from.children() else {
+                continue;
+            };
+            let children: Vec<(u32, MaybeNode)> =
+                children.read().iter().map(|(idx, c)| (*idx, c.clone())).collect();
+            let child_depth: u8 = depth.saturating_add(1);
+            for (idx, child) in children {
+                match child {
+                    Some(c) if c.is_traversable() => {
+                        let ino: u64 = c.inode().unwrap_or(0);
+                        let (new, _) =
+                            self.insert_child(&to, idx, NodeType::Directory, ino, child_depth);
+                        if let Some(new) = new {
+                            work.push((c, new, child_depth));
+                        }
+                    }
+                    Some(c) => {
+                        let ino: u64 = c.inode().unwrap_or(0);
+                        self.insert_child(&to, idx, NodeType::File, ino, child_depth);
+                    }
+                    None => {
+                        // a Name-mode (node-less) file entry
+                        if to.as_dir().is_some_and(|d: &Directory| d.add_name_child(idx)) {
+                            self.conf.files_mod(1);
+                            self.conf.depth_compare(child_depth);
+                        }
+                    }
+                }
+            }
+        }
+        Some(root)
+    }
+
+    /**
     Re-attach a previously detached child under `parent` with the given
     name (rename support). The child's stored parent reference must
     still point at `parent` - the trie has no re-parenting, so
-    cross-directory moves must re-create nodes instead of using this.
+    cross-directory moves must re-create nodes instead of using this
+    ([DirTree::graft_subtree] for a directory).
 
     Any existing occupant of the destination name is removed first
     (rename-over semantics), and a directory child is re-labeled with
@@ -1768,6 +1838,24 @@ fn open_dir_nofollow(path: &Path) -> Result<DirHandle, Error> {
         | OFlag::O_CLOEXEC
         | OFlag::O_NONBLOCK;
     DirHandle::from_fd(open(path, flags, Mode::empty())?)
+}
+
+/**
+Carry the per-directory state that a [DirTree::graft_subtree] copy would
+otherwise lose from the old directory node to its new one: the scan
+stamp (so the diff pre-check still skips it) and the pooled handle's fd
+(the handle stays pooled; only the old node, being dropped, stops
+pointing at it).
+*/
+fn carry_dir_state(from: &Node, to: &Node) {
+    if let Some(stamp) = from.scan_stamp() {
+        to.set_scan_stamp(stamp);
+    }
+    if let (Some(old), Some(new)) = (from.as_dir(), to.as_dir())
+        && old.fd().is_open()
+    {
+        new.fd_set(old.fd().fd()).ok();
+    }
 }
 
 /* ######################################################################### */

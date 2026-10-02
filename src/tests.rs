@@ -819,6 +819,69 @@ fn test_tree_watcher_events_during_rename() {
 }
 
 #[test]
+fn test_tree_watcher_move_across_dirs() {
+    // level_1_0/level_2_0 (a subtree two levels deep) moves under level_1_1
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let spec: TreeSpec = TreeSpec::new().level(2, 0).level(1, 1).level(2, 2).level(2, 1);
+    spec.create(temp.path()).unwrap();
+    let tree: Arc<DirTree> = Arc::new(walked_tree(dir, FileMode::NODE, true));
+    let (files, dirs, handles) = (tree.conf().files(), tree.conf().dirs(), tree.handles_len());
+    let watcher: Arc<TreeWatcher> = TreeWatcher::start(tree.clone()).expect("watcher should start");
+
+    let from: PathBuf = temp.path().join("level_1_0/level_2_0");
+    let to: PathBuf = temp.path().join("level_1_1/moved");
+    std::fs::rename(&from, &to).unwrap();
+    let deep: String = to.join("level_3_1/level_4_1/file-0_0_1_1_0.bin").to_string_lossy().into();
+    wait_for(|| tree.contains(&deep), "moved subtree should appear in its new place");
+    assert!(!tree.contains(&from.to_string_lossy()), "old place still in the tree");
+    assert_eq!(tree.conf().files(), files, "files after the move");
+    assert_eq!(tree.conf().dirs(), dirs, "dirs after the move");
+    assert_eq!(tree.handles_len(), handles, "pooled handles after the move");
+    tree_validate_counts(&tree);
+
+    // the moved directories are still watched, now as their new nodes
+    let late: PathBuf = to.join("level_3_1/late.bin");
+    std::fs::write(&late, b"x").unwrap();
+    let late: String = late.to_string_lossy().into();
+    wait_for(|| tree.contains(&late), "file in the moved subtree should appear");
+    watcher.stop();
+    assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
+}
+
+#[test]
+fn test_tree_watcher_move_rebuilds_from_memory() {
+    /*
+    A move to another directory is rebuilt from the tree, not rescanned:
+    a file added without its event being processed stays unseen. The
+    events are injected into a watcher whose event loop never runs.
+    */
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir_all(temp.path().join("src/a/sub")).unwrap();
+    std::fs::create_dir(temp.path().join("dst")).unwrap();
+    std::fs::write(temp.path().join("src/a/sub/known.bin"), b"x").unwrap();
+    let tree: Arc<DirTree> = Arc::new(walked_tree(dir, FileMode::NODE, false));
+    let watcher: Arc<TreeWatcher> = TreeWatcher::prepare(tree.clone()).unwrap();
+    let wd_src: i32 = watcher.wd_of(&temp.path().join("src")).unwrap();
+    let wd_dst: i32 = watcher.wd_of(&temp.path().join("dst")).unwrap();
+    let files: u32 = tree.conf().files();
+
+    std::fs::write(temp.path().join("src/a/sub/unseen.bin"), b"y").unwrap();
+    std::fs::rename(temp.path().join("src/a"), temp.path().join("dst/b")).unwrap();
+    watcher.inject(wd_src, libc::IN_MOVED_FROM | libc::IN_ISDIR, 9, "a");
+    watcher.inject(wd_dst, libc::IN_MOVED_TO | libc::IN_ISDIR, 9, "b");
+
+    assert!(tree.contains(&format!("{dir}/dst/b/sub/known.bin")), "moved file missing");
+    assert!(!tree.contains(&format!("{dir}/dst/b/sub/unseen.bin")), "the move rescanned");
+    assert!(!tree.contains(&format!("{dir}/src/a")), "old place still in the tree");
+    assert_eq!(tree.conf().files(), files, "files after the move");
+    watcher.stop();
+    assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_watcher_new_subtrees() {
     /*
     New directories with subdirectories, and files written into those
