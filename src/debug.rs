@@ -28,7 +28,7 @@ We take the counts from the tree's [[TreeConf](super::TreeConf)] as master data 
 firstly validate that the counts of directories, files and special files
 add up to the total number of nodes. Then we compare those to the counts we get by
 traversing the tree with:
-- `count_from()` (`traverse_from()` -> count)
+- `count_from()` (`traverse_from()` -> count, name-only files included)
 - `iter_count()` (`iter()` -> count)
 - `dirs().len()` and `files().len()` (`walk()` -> count)
 
@@ -50,17 +50,18 @@ pub fn tree_validate_counts(tree: &DirTree) {
             "master node count != dirs+files+specials"
         );
     }
-    // the traversals count nodes, and a name-only file is not one
-    let want: NodeCounts = match name_only {
-        true => NodeCounts { files: 0, ..want },
-        false => want,
-    };
 
     /* ------------------------- */
 
     let start: Instant = Instant::now();
     assert_eq!(tree.count_from(tree.root()), want, "count_from() != master counts");
     eprintln!(" --> count_from() = {:?}", start.elapsed());
+
+    // the iterators see nodes only, and a name-only file is not one
+    let want: NodeCounts = match name_only {
+        true => NodeCounts { files: 0, ..want },
+        false => want,
+    };
 
     let start: Instant = Instant::now();
     assert_eq!(tree.iter_count(), want, "iter_count() != master counts");

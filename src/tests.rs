@@ -1293,6 +1293,46 @@ fn test_tree_watcher_special_moves() {
     tree_validate_counts(&tree);
 }
 
+#[test]
+fn test_name_mode_subtree_counts() {
+    // name-only files leave the counters with their directory, however it goes
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    for d in ["gone", "vanish", "a/moving", "b"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+        for f in ["x", "y", "z"] {
+            write(at(d).join(f), b"n").unwrap();
+        }
+    }
+    let tree: Arc<DirTree> = Arc::new(walked_tree(dir, FileMode::NAME, false));
+    let files: u32 = tree.conf().files();
+    assert_eq!(files, 12);
+
+    // removed from the tree
+    let removed: NodeCounts = tree.remove(&at("gone").to_string_lossy()).unwrap().unwrap();
+    assert_eq!((removed.dirs, removed.files), (1, 3), "{removed}");
+    assert_eq!(tree.conf().files(), files - 3, "after remove()");
+    tree_validate_counts(&tree);
+    // (or the diff below would bring it back)
+    std::fs::remove_dir_all(at("gone")).unwrap();
+
+    // gone from disk, found by a diff
+    std::fs::remove_dir_all(at("vanish")).unwrap();
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert_eq!(stats.removed_files, 3, "{stats}");
+    assert_eq!(tree.conf().files(), files - 6, "after update()");
+    tree_validate_counts(&tree);
+
+    // moved to another parent: detached, then rebuilt from memory
+    let watcher: Arc<TreeWatcher> = TreeWatcher::start(tree.clone()).expect("watcher should start");
+    rename(at("a/moving"), at("b/moved")).unwrap();
+    wait_for(|| tree.contains(&at("b/moved").to_string_lossy()), "moved directory");
+    wait_for(|| tree.conf().files() == files - 6, "files back after the move");
+    watcher.stop();
+    tree_validate_counts(&tree);
+}
+
 /// Create a FIFO at `path`.
 fn mkfifo(path: &Path) {
     let c: CString = CString::new(path.as_os_str().as_bytes()).unwrap();

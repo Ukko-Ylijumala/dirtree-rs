@@ -1886,8 +1886,12 @@ impl DirTree {
         traverse_from_par(&self.root(), &f);
     }
 
-    /// Count the number of directory and file nodes with `traverse()`. Also counts
-    /// the starting [[Node]] (except root).
+    /**
+    Count the number of directory and file nodes with `traverse()`. Also
+    counts the starting [[Node]] (except root). Name-only file entries
+    (Name filemode) count as files but not as nodes: the tree's counters
+    hold them, so a subtree taken off the tree must take them off too.
+    */
     pub fn count_from(&self, node: Arc<Node>) -> NodeCounts {
         if node.node_t.is_file() {
             return NodeCounts::of_node(&node);
@@ -1900,7 +1904,14 @@ impl DirTree {
         Likely the overhead from moving stuff between threads and having
         to use Atomic versions of counters is the main reason.
         */
-        traverse_from(&node, &mut |n: &Arc<Node>| counts.add_node(n));
+        let name_only: bool = self.filemode().is_name();
+        traverse_from(&node, &mut |n: &Arc<Node>| {
+            counts.add_node(n);
+            // traverse_from() visits nodes only, and a name entry is none
+            if name_only && let Some(children) = n.children() {
+                counts.files += children.read().values().filter(|c| c.is_none()).count() as u32;
+            }
+        });
 
         if node.node_t == NodeType::Root {
             counts.nodes -= 1; // remove root node if we started from it
