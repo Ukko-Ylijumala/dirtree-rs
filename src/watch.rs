@@ -32,8 +32,9 @@ v1 caveats (deliberate, recorded for the future crate split):
   [diff-rescan](DirTree::update) (which fixes both lost creations and
   lost deletions), re-establishes watches and restores
   [`TreeState::Ready`]; only a failed resync leaves the tree flagged.
-- Entries created between the initial tree build and watcher start are
-  not seen (the usual scan-to-watch gap).
+- A watcher [prepared](TreeWatcher::prepare) before the tree's walk sees
+  every change; one started on a walked tree misses the changes made
+  between the walk and its start.
 */
 
 use super::dirtree::DirTree;
@@ -136,14 +137,33 @@ pub struct TreeWatcher {
 
 impl TreeWatcher {
     /**
-    Create an inotify instance, watch every directory currently in the
-    tree (from the tree's root path downward), and start the event loop
-    thread. Watch registration failures (e.g. `fs.inotify.max_user_watches`
-    exhaustion) do not fail the start; they are counted in
+    [`TreeWatcher::prepare`] and [`TreeWatcher::run`] in one, for a tree
+    that is already walked. Changes made between its walk and this call
+    are not seen; prepare the watcher before the walk to see them.
+    */
+    pub fn start(tree: Arc<DirTree>) -> io::Result<Arc<Self>> {
+        let watcher: Arc<Self> = Self::prepare(tree)?;
+        watcher.run()?;
+        Ok(watcher)
+    }
+
+    /**
+    Create an inotify instance and watch every directory currently in the
+    tree (from the tree's root path downward), without processing events
+    yet: the kernel queues them until [`TreeWatcher::run`].
+
+    From here on every directory the tree scans is watched right before
+    it is read. Prepared before the tree's walk, the watcher so misses
+    nothing: an entry the walk does not see produces an event, and an
+    event for one it did see changes nothing. Should the queue overflow
+    during a long walk, `run()` resyncs the tree.
+
+    Watch registration failures (e.g. `fs.inotify.max_user_watches`
+    exhaustion) do not fail it; they are counted in
     [`TreeWatcher::failed_watches`] and recorded in the tree's event log.
     Progress goes to the tree's [`TreeObserver`](super::TreeObserver).
     */
-    pub fn start(tree: Arc<DirTree>) -> io::Result<Arc<Self>> {
+    pub fn prepare(tree: Arc<DirTree>) -> io::Result<Arc<Self>> {
         let fd: RawFd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -173,30 +193,47 @@ impl TreeWatcher {
         debug!(target: "WATCH", "watching {} directories under {}",
             watcher.watches.len(), from.display());
 
-        // scans of new directories watch each directory before reading it
+        // every scan from here on watches each directory before reading it
         let weak: Weak<Self> = Arc::downgrade(&watcher);
         watcher.tree.conf.set_list_hook(Some(ListHook(Arc::new(move |node: &Arc<Node>| {
             if let Some(w) = weak.upgrade() {
                 w.add_watch(node);
             }
         }))));
+        Ok(watcher)
+    }
 
-        let w: Arc<Self> = watcher.clone();
+    /**
+    Start the event loop thread of a [prepared](TreeWatcher::prepare)
+    watcher; it first applies the events queued since then. Fails if it
+    is running already.
+    */
+    pub fn run(self: &Arc<Self>) -> io::Result<()> {
+        let mut slot = self.thread.lock();
+        if slot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the watcher is running already",
+            ));
+        }
+        let w: Arc<Self> = self.clone();
         let spawned = thread::Builder::new()
             .stack_size(1024 * 1024) // the event loop can run subtree scans
             .name("tree_watch".into())
             .spawn(move || w.event_loop());
         match spawned {
-            Ok(thread) => *watcher.thread.lock() = Some(thread),
+            Ok(thread) => {
+                *slot = Some(thread);
+                Ok(())
+            }
             Err(e) => {
-                watcher.tree.conf.set_list_hook(None);
-                return Err(e);
+                self.tree.conf.set_list_hook(None);
+                Err(e)
             }
         }
-        Ok(watcher)
     }
 
-    /// Signal the event loop to exit and wait for the thread to finish.
+    /// Signal the event loop to exit, wait for the thread to finish, and stop watching new directories.
     pub fn stop(&self) {
         self.quit.store(true, Relaxed);
         if let Some(t) = self.thread.lock().take() {

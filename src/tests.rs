@@ -750,6 +750,43 @@ fn test_tree_rescan_via_worker() {
 }
 
 #[test]
+fn test_tree_watcher_prepared_before_walk() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let spec: TreeSpec = TreeSpec::new().root_files(1).level(2, 2).level(2, 1);
+    spec.create(temp.path()).unwrap();
+
+    let tree: Arc<DirTree> = Arc::new(
+        DirTree::new(FileMode::NODE, Filters::default())
+            .from_path(dir)
+            .with_recursive(true),
+    );
+    let watcher: Arc<TreeWatcher> = TreeWatcher::prepare(tree.clone()).expect("prepare failed");
+    tree.walk().unwrap();
+    // every directory was watched as the walk reached it
+    assert_eq!(watcher.watches_len() as u64, spec.counts().dirs + 1, "watches after the walk");
+
+    // changed after the walk, before the event loop: queued by the kernel until run()
+    let sub: PathBuf = temp.path().join("level_1_0/level_2_1");
+    std::fs::write(sub.join("late.bin"), b"x").unwrap();
+    std::fs::create_dir(sub.join("late_dir")).unwrap();
+    std::fs::write(sub.join("late_dir/inner.bin"), b"y").unwrap();
+    std::fs::remove_file(temp.path().join("file-0.bin")).unwrap();
+    watcher.run().expect("run failed");
+    assert!(watcher.run().is_err(), "a second run() must fail");
+
+    for p in ["late.bin", "late_dir", "late_dir/inner.bin"] {
+        let p: String = sub.join(p).to_string_lossy().into_owned();
+        wait_for(|| tree.contains(&p), &format!("{p} should appear"));
+    }
+    let gone: String = format!("{dir}/file-0.bin");
+    wait_for(|| !tree.contains(&gone), "removed file should vanish");
+    watcher.stop();
+    assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_watcher_new_subtrees() {
     /*
     New directories with subdirectories, and files written into those
