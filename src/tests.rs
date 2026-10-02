@@ -4,7 +4,8 @@
 #![allow(static_mut_refs)]
 
 use super::*;
-use crate::{PATH_SEP, ScanState, testdirs::create_test_dirs};
+use super::utils::PATH_SEP;
+use crate::{ScanState, testdirs::create_test_dirs};
 use ctor::dtor;
 use libc;
 use parking_lot::Mutex;
@@ -83,7 +84,7 @@ fn test_create_empty_tree() {
     assert_eq!(files, 0, "files mismatch");
     assert_eq!(depth, 0, "depth mismatch");
     tree.conf.from.set(PathBuf::from("/foo")).ok();
-    assert_eq!(tree.from(), &PathBuf::from("/foo"));
+    assert_eq!(tree.from().unwrap(), &PathBuf::from("/foo"));
 }
 
 #[test]
@@ -608,6 +609,8 @@ fn test_tree_watcher_renames() {
 fn test_tree_no_root() {
     // no from_path(): nothing to walk or build from
     let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default());
+    let res = tree.from();
+    assert!(matches!(res, Err(TreeError::NoRoot)), "{res:?}");
     let res = tree.walk();
     assert!(matches!(res, Err(TreeError::NoRoot)), "{res:?}");
     let res = DirTree::new(FileMode::NODE, Filters::default()).build();
@@ -791,7 +794,7 @@ fn create_test_tree(recursive: bool) -> (&'static str, DirTree, u8) {
         unsafe { (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap()) };
     let tree: DirTree = state.tree_from_path(path, recursive, false).unwrap();
     assert_eq!(tree.root.node_t, NodeType::Root);
-    assert_eq!(*tree.from(), PathBuf::from(path));
+    assert_eq!(*tree.from().unwrap(), PathBuf::from(path));
     assert_eq!(tree.state(), TreeState::Ready);
     assert!(tree.is_ready(), "Tree is not ready");
     let root_depth: u8 = (path.split(PATH_SEP).count() - 1) as u8;

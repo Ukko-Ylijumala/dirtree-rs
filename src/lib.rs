@@ -16,6 +16,7 @@ The module is split into several submodules for clarity:
 - [`traverse`]: free traversal helpers over `Arc<Node>`.
 - [`observer`]: [`TreeObserver`] - progress reporting out of the tree.
 - [`update`]:   diff-rescan (the [`TreeOp::Update`] primitive).
+- [`utils`]:    small shared helpers (path splitting, weak refs, atomics).
 - [`worker`]:   the background work-queue executor.
 - [`visitor`]:  per-directory visitor protocol (recognition, prune, depth).
 - [`visitors`]: built-in [`Visitor`] implementations.
@@ -37,6 +38,7 @@ mod observer;
 mod tests;
 mod traverse;
 mod update;
+mod utils;
 mod visitor;
 mod visitors;
 mod watch;

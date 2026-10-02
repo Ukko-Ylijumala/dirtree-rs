@@ -37,6 +37,7 @@ v1 caveats (deliberate, recorded for the future crate split):
 */
 
 use super::dirtree::DirTree;
+use super::error::TreeError;
 use super::event::{TreeEvent, TreeOp, TreeState};
 use super::node::{MaybeNode, Node, NodeType};
 use super::traverse::traverse_from;
@@ -117,6 +118,8 @@ dropping the caller's handle does not stop it).
 */
 pub struct TreeWatcher {
     tree: Arc<DirTree>,
+    /// the tree's root path, checked to be set by `start()`
+    root: PathBuf,
     ino_fd: OwnedFd,
     /// watch descriptor -> the watched directory's node
     watches: DashMap<i32, Weak<Node>>,
@@ -144,9 +147,10 @@ impl TreeWatcher {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let from: PathBuf = tree.conf.from.get().cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Tree has no root path")
-        })?;
+        let from: PathBuf = tree
+            .from()
+            .map_err(|e: TreeError| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .clone();
         let from_node: Arc<Node> = tree
             .get_node(from.to_string_lossy().as_ref())
             .ok_or_else(|| {
@@ -155,6 +159,7 @@ impl TreeWatcher {
 
         let watcher: Arc<Self> = Arc::new(Self {
             tree,
+            root: from.clone(),
             ino_fd: unsafe { OwnedFd::from_raw_fd(fd) },
             watches: DashMap::new(),
             pending: DashMap::new(),
@@ -383,8 +388,7 @@ impl TreeWatcher {
             self.tree.add_error(ev.clone());
             self.tree.set_state(TreeState::Inconsistent(ev));
 
-            let from: PathBuf = self.tree.from().clone();
-            let from_str = from.to_string_lossy();
+            let from_str = self.root.to_string_lossy();
             match self.tree.update(from_str.as_ref(), Some(true)) {
                 Ok(stats) => {
                     self.sweep_dead_watches();
@@ -400,7 +404,7 @@ impl TreeWatcher {
                     // stays Inconsistent - the consumer must intervene
                     self.tree.add_error(TreeEvent::error(
                         &format!("Overflow resync failed: {e}"),
-                        &TreeOp::Update(from.clone()),
+                        &TreeOp::Update(self.root.clone()),
                     ));
                 }
             }
@@ -449,7 +453,7 @@ impl TreeWatcher {
         self.events_seen.fetch_add(1, Relaxed);
 
         if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
-            if dir_path == *self.tree.from() {
+            if dir_path == self.root {
                 let ev: TreeEvent = TreeEvent::new("Tree root was removed or moved")
                     .path(dir_path.to_string_lossy().as_ref());
                 error!("{ev:?}");

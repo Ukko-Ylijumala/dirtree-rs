@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use super::hash::DirTreeXxh3Hasher;
-use crate::{PATH_SEP, utils::make_weak_ref};
+use super::utils::{PATH_SEP, make_weak_ref};
 
 use dirhandle::DirFd;
 use stringstore::UniqueStrStore;

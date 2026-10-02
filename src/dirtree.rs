@@ -9,7 +9,7 @@ use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::visitor::*;
 use super::worker::tree_worker;
 use super::{FileMode, Filters};
-use crate::{PATH_SEP, utils::path_parts};
+use super::utils::{PATH_SEP, path_parts};
 
 use dirhandle::{
     CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles,
@@ -37,19 +37,17 @@ use std::{
     os::fd::{AsRawFd, RawFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::DirEntryExt,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering::Relaxed},
-    },
+    path::{Path, PathBuf},
+    sync::Arc,
     thread,
 };
 
 #[cfg(feature = "size_of")]
 use {
-    crate::utils::mod_atom_u32,
+    super::utils::mod_atom_u32,
     size_of::{Context, SizeOf},
     std::mem::size_of,
+    std::sync::atomic::{AtomicU32, Ordering::Relaxed},
     timesince::TimeSinceEpoch,
 };
 
@@ -120,10 +118,22 @@ impl DirTree {
         self.root.clone()
     }
 
-    /// Tree root path (in the filesystem) from which the tree is built.
-    /// NOTE: internally stored paths are relative to this.
-    pub fn from(&self) -> &PathBuf {
-        self.conf.from()
+    /**
+    Tree root path (in the filesystem) from which the tree is built.
+    Fails with [TreeError::NoRoot] until set with `from_path()`.
+
+    NOTE: internally stored paths are relative to this.
+    */
+    pub fn from(&self) -> TreeResult<&PathBuf> {
+        self.conf.from().ok_or(TreeError::NoRoot)
+    }
+
+    /// `path` relative to the tree root, for log and trace output; as is without a root.
+    fn rel_path<'p>(&self, path: &'p PathBuf) -> &'p Path {
+        self.conf
+            .from()
+            .and_then(|from: &PathBuf| path.strip_prefix(from).ok())
+            .unwrap_or(path)
     }
 
     /// Returns a reference to the tree's [[TreeConf]] struct.
@@ -349,7 +359,10 @@ impl DirTree {
     /// Set the root (filesystem) path of the tree.
     pub fn from_path(self, path: &str) -> Self {
         self.conf.set_from(path);
-        self.insert(self.from(), NodeType::Directory, None);
+        // the root actually stored: a second from_path() keeps the first
+        if let Some(from) = self.conf.from() {
+            self.insert(from, NodeType::Directory, None);
+        }
         self.set_state(TreeState::Empty);
         self
     }
@@ -426,7 +439,7 @@ impl DirTree {
     */
     #[instrument(name = "DirTree", skip_all)]
     pub fn walk(&self) -> TreeResult<()> {
-        let from: PathBuf = self.conf.from.get().ok_or(TreeError::NoRoot)?.clone();
+        let from: PathBuf = self.from()?.clone();
         debug!(target: "path", "{}", from.display());
         // the root dir itself, which the walk lists but does not attach
         self.conf.observer().dirs_added(1);
@@ -445,9 +458,7 @@ impl DirTree {
     [TreeError::WorkerSpawn] if the worker thread cannot be started.
     */
     pub fn build(self) -> TreeResult<Arc<Self>> {
-        if self.conf.from.get().is_none() {
-            return Err(TreeError::NoRoot);
-        }
+        self.from()?;
         let tree: Arc<Self> = self.into();
         let tree_c: Arc<Self> = tree.clone();
         let worker: thread::JoinHandle<()> = thread::Builder::new()
@@ -480,7 +491,7 @@ impl DirTree {
     /// NOTE: If `recursive` is [None], the tree's default is used.
     ///
     /// NOTE: single threaded, potentially slow with large directory trees.
-    #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).unwrap_or(path).to_str()))]
+    #[instrument(level = "debug", skip_all, fields(p = self.rel_path(path).to_str()))]
     pub fn populate(&self, path: &PathBuf, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
         match path.read_dir() {
@@ -660,7 +671,7 @@ impl DirTree {
     */
     #[
         instrument(level = "debug", name = "p_par_inner", skip_all,
-        fields(p = path.strip_prefix(self.from()).unwrap_or(path).to_str(), d = depth))
+        fields(p = self.rel_path(path).to_str(), d = depth))
     ]
     #[allow(clippy::too_many_arguments)]
     fn populate_par_inner<'env>(

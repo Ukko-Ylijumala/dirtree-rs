@@ -3,7 +3,7 @@
 use super::observer::{NOOP_OBSERVER, TreeObserver};
 use super::visitor::{Visitor, WalkEvent};
 use super::{FileMode, Filters};
-use crate::utils::mod_atom_u32;
+use super::utils::mod_atom_u32;
 use crossbeam::channel::Sender;
 use parking_lot::RwLock;
 use std::{
@@ -62,8 +62,9 @@ impl TreeConf {
         &self.filters
     }
 
-    pub(super) fn from(&self) -> &PathBuf {
-        self.from.get().expect("Tree must be initialized")
+    /// The tree's root path, if one has been set.
+    pub(super) fn from(&self) -> Option<&PathBuf> {
+        self.from.get()
     }
     pub(super) fn set_from(&self, path: &str) {
         self.from.set(PathBuf::from(path)).ok();

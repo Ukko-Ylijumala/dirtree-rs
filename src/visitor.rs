@@ -125,7 +125,7 @@ impl Verdict {
     }
 
     /**
-    "Most restrictive" combine. Used by [`crate::tree::CompositeVisitor`].
+    "Most restrictive" combine. Used by [`super::CompositeVisitor`].
 
     Precedence: `SkipChildren` > `Tag{descend: false}` > `Tag{descend: true}` > `Continue`.
 
