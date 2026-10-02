@@ -10,7 +10,6 @@ use libc;
 use parking_lot::Mutex;
 use std::{
     collections::HashSet,
-    ffi::CString,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -20,7 +19,7 @@ use std::{
     },
     time::Duration,
 };
-use miniutils::{PlannedEntry, TreeSpec};
+use miniutils::{EntryKind, PlannedEntry, Special, TreeSpec};
 use tempfile::TempDir;
 
 const TEST_NUM: [u64; 3] = [9, 11, 7];
@@ -292,15 +291,15 @@ fn test_node_hash_no_recursion() {
 fn test_hardlink_names() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
-    std::fs::write(temp.path().join("orig.bin"), b"x").unwrap();
-    std::fs::hard_link(temp.path().join("orig.bin"), temp.path().join("link.bin")).unwrap();
+    let spec: TreeSpec = TreeSpec::new().root_files(1).with(Special::Hardlink, 2);
+    spec.create(temp.path()).unwrap();
 
     let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
     /*
     Hardlinked files share an inode, so an equality-based child lookup
     cannot tell the siblings apart - name resolution must be by identity.
     */
-    for name in ["orig.bin", "link.bin"] {
+    for name in ["file-0.bin", "hardlink-0", "hardlink-1"] {
         let p: String = format!("{dir}/{name}");
         let node: Arc<Node> = tree.get_node(&p).expect("hardlinked node should exist");
         assert_eq!(tree.node_name(&node), name, "hardlink resolved to wrong sibling");
@@ -402,25 +401,81 @@ fn test_tree_update_diff() {
     assert!(!stats.changed(), "second update changed something: {stats}");
 }
 
+/**
+Whether a walk records a planned entry, as the tree's policy stands:
+directories and regular files, which a hardlink is too, but no symlinks
+(not followed either) and no FIFOs or sockets.
+*/
+fn recorded(e: &PlannedEntry) -> bool {
+    matches!(e.kind, EntryKind::Dir | EntryKind::File | EntryKind::Special(Special::Hardlink))
+}
+
+#[test]
+fn test_tree_special_entries() {
+    // every special kind, in the root and two levels down
+    let with_all = |spec: TreeSpec| Special::ALL.into_iter().fold(spec, |s, k| s.with(k, 1));
+    let spec: TreeSpec = with_all(with_all(TreeSpec::new().root_files(1)).level(2, 1).level(2, 2));
+    let counts = spec.counts();
+    for (mode, sync) in [(FileMode::NODE, false), (FileMode::NODE, true), (FileMode::NAME, false)] {
+        let temp: TempDir = TempDir::new().unwrap();
+        let dir: &str = temp.path().to_str().unwrap();
+        spec.create(temp.path()).unwrap();
+        let tree: DirTree = DirTree::new(mode, Filters::default())
+            .from_path(dir)
+            .with_recursive(true)
+            .with_sync(sync);
+        tree.walk().unwrap();
+
+        let ctx: String = format!("{mode:?}, sync={sync}");
+        assert_eq!(tree.conf().errors(), 0, "{ctx}: errors");
+        let files: u64 = counts.files + counts.special(Special::Hardlink);
+        assert_eq!(tree.conf().files() as u64, files, "{ctx}: files");
+        if mode.is_node() {
+            // name-only files have no node to look up
+            for e in spec.plan(temp.path()) {
+                let p = e.path.to_string_lossy();
+                assert_eq!(tree.contains(&p), recorded(&e), "{ctx}: {p}");
+            }
+        }
+        tree_validate_counts(&tree);
+
+        // a diff-rescan sees the same entries as the walk: nothing to add or remove
+        let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+        let changed: u32 = stats.added_dirs + stats.added_files + stats.removed_dirs
+            + stats.removed_files + stats.replaced;
+        assert_eq!(changed, 0, "{ctx}: {stats}");
+        // the root and every directory diffed, none skipped by the pre-check
+        assert_eq!(stats.scanned_dirs as u64, counts.dirs + 1, "{ctx}: {stats}");
+        assert_eq!(tree.conf().errors(), 0, "{ctx}: update errors");
+    }
+}
+
 #[test]
 fn test_tree_deep_walk() {
     // deeper than MAX_RECURSE_DEPTH, so descents run as spawned tasks too
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
     let depth: usize = 3 * dirtree::MAX_RECURSE_DEPTH + 1;
-    let mut p: PathBuf = temp.path().to_path_buf();
-    for i in 0..depth {
-        p.push(format!("d{i}"));
-    }
-    std::fs::create_dir_all(&p).unwrap();
-    std::fs::write(p.join("leaf.bin"), b"x").unwrap();
-    // a symlinked directory is recorded as neither dir nor file, and not followed
-    std::os::unix::fs::symlink(temp.path(), temp.path().join("d0/loop")).unwrap();
+    /*
+    A chain of single directories with one file at the bottom, and in
+    the first one a symlink to "..": a symlinked directory is recorded
+    as neither dir nor file, and not followed into the loop.
+    */
+    let spec: TreeSpec = (2..depth)
+        .fold(TreeSpec::new().level(1, 0).with(Special::SymlinkDir, 1), |s, _| s.level(1, 0))
+        .level(1, 1);
+    spec.create(temp.path()).unwrap();
+    let plan: Vec<PlannedEntry> = spec.plan(temp.path()).collect();
+    let path_of = |kind: EntryKind| plan.iter().find(|e| e.kind == kind).unwrap().path.clone();
+    let leaf: PathBuf = path_of(EntryKind::File);
+    let link: PathBuf = path_of(EntryKind::Special(Special::SymlinkDir));
 
     let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
     assert_eq!(tree.conf().errors(), 0, "deep walk reported errors");
-    assert!(tree.contains(&p.join("leaf.bin").to_string_lossy()), "deepest file missing");
-    assert!(!tree.contains(&format!("{dir}/d0/loop")), "symlink should not be recorded");
+    assert!(tree.contains(&leaf.to_string_lossy()), "deepest file missing");
+    assert!(!tree.contains(&link.to_string_lossy()), "symlink should not be recorded");
+    let root_depth: u64 = (dir.split(PATH_SEP).count() - 1) as u64;
+    assert_eq!(tree.conf().dirs() as u64, root_depth + depth as u64, "dirs miscounted");
     tree_validate_counts(&tree);
 }
 
@@ -748,18 +803,26 @@ fn test_tree_watcher_special_files() {
         TreeWatcher::start(tree.clone()).expect("watcher should start");
     let files: u32 = tree.conf().files();
 
-    // neither a (dangling) symlink nor a FIFO is a regular file
-    std::os::unix::fs::symlink("/nonexistent", temp.path().join("link")).unwrap();
-    let fifo: CString = CString::new(format!("{dir}/fifo")).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo failed");
+    // symlinks (dangling, to "..", to themselves), a FIFO and a socket: none is a regular file
+    let spec: TreeSpec = [
+        Special::SymlinkDir,
+        Special::SymlinkDangling,
+        Special::SymlinkSelf,
+        Special::Fifo,
+        Special::Socket,
+    ]
+    .into_iter()
+    .fold(TreeSpec::new(), |s, kind| s.with(kind, 1));
+    spec.create(temp.path()).unwrap();
     // ...a regular file created last proves the events before it were handled
     std::fs::write(temp.path().join("plain.bin"), b"p").unwrap();
     wait_for(|| tree.contains(&format!("{dir}/plain.bin")), "regular file should appear");
 
-    assert!(!tree.contains(&format!("{dir}/link")), "symlink recorded as a file");
-    assert!(!tree.contains(&format!("{dir}/fifo")), "FIFO recorded as a file");
+    for e in spec.plan(temp.path()) {
+        assert!(!tree.contains(&e.path.to_string_lossy()), "{:?} recorded", e.kind);
+    }
     assert_eq!(tree.conf().files(), files + 1, "only plain.bin should be counted");
-    assert_eq!(tree.conf().errors(), 0, "dangling symlink caused an error");
+    assert_eq!(tree.conf().errors(), 0, "a special entry caused an error");
     tree_validate_counts(&tree);
 }
 
