@@ -5,7 +5,6 @@
 
 use super::*;
 use super::utils::PATH_SEP;
-use crate::{ScanState, testdirs::create_test_dirs};
 use ctor::dtor;
 use libc;
 use parking_lot::Mutex;
@@ -14,13 +13,14 @@ use std::{
     ffi::CString,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
 };
+use miniutils::{PlannedEntry, TreeSpec};
 use tempfile::TempDir;
 
 const TEST_NUM: [u64; 3] = [9, 11, 7];
@@ -29,7 +29,6 @@ const EXP_FILES: u32 = (TEST_NUM[0] * TEST_NUM[1] * TEST_NUM[2] + TEST_NUM[0] + 
 const EXP_NODES: u32 = EXP_DIRS + EXP_FILES;
 
 // statics for all tests
-static mut STATE: Option<ScanState> = None;
 static mut TESTDIR: Option<TempDir> = None;
 static INITIALIZED: Mutex<bool> = Mutex::new(false);
 
@@ -42,10 +41,6 @@ fn setup_tests() {
         return;
     }
     unsafe {
-        STATE = Some(ScanState {
-            filemode: FileMode::NODE,
-            ..Default::default()
-        });
         TESTDIR = Some(create_test_dirs_for_tree_test());
     }
     *init = true;
@@ -114,10 +109,12 @@ fn test_tree_new_from_path_recursive() {
 #[test]
 fn test_tree_build_thread() {
     setup_tests();
-    let (path, state) =
-        unsafe { (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap()) };
+    let path = unsafe { TESTDIR.as_ref().unwrap().path().to_str().unwrap() };
 
-    let tree: Arc<DirTree> = state.new_tree(path).build().unwrap();
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(path)
+        .build()
+        .unwrap();
     assert!(tree.worker.lock().is_some(), "Worker not initialized");
 
     // scan is non-blocking, so we must wait for it to finish
@@ -224,7 +221,7 @@ fn test_tree_removals() {
     check_nodes_dirs_files(nodes, root_depth, dirs, files, depth);
 
     let l1_idx: u64 = TEST_NUM[0] - 1;
-    let file: String = format!("{path}/level_1_{0}/file-{0}.bin", l1_idx);
+    let file: String = format!("{path}/level_1_{0}/file-{0}_0.bin", l1_idx);
     let l2_p: String = format!("{path}/level_1_{}/level_2_{}", l1_idx - 1, TEST_NUM[1] - 1);
     let l1_p: String = format!("{path}/level_1_{}", l1_idx - 2);
     for &p in [&file, &l2_p, &l1_p].iter() {
@@ -298,8 +295,7 @@ fn test_hardlink_names() {
     std::fs::write(temp.path().join("orig.bin"), b"x").unwrap();
     std::fs::hard_link(temp.path().join("orig.bin"), temp.path().join("link.bin")).unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
     /*
     Hardlinked files share an inode, so an equality-based child lookup
     cannot tell the siblings apart - name resolution must be by identity.
@@ -318,8 +314,7 @@ fn test_name_mode_removal() {
     std::fs::create_dir(temp.path().join("sub")).unwrap();
     std::fs::write(temp.path().join("sub/afile.bin"), b"x").unwrap();
 
-    let state = ScanState { filemode: FileMode::NAME, ..Default::default() };
-    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NAME, false);
     assert_eq!(tree.conf().files(), 1, "name-only file not counted");
 
     let p: String = format!("{dir}/sub/afile.bin");
@@ -371,8 +366,7 @@ fn test_tree_update_diff() {
     std::fs::create_dir(temp.path().join("gone")).unwrap();
     std::fs::write(temp.path().join("gone/g.bin"), b"g").unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
     tree_validate_counts(&tree);
 
     // a no-op pass must diff everything and change nothing
@@ -423,8 +417,7 @@ fn test_tree_deep_walk() {
     // a symlinked directory is recorded as neither dir nor file, and not followed
     std::os::unix::fs::symlink(temp.path(), temp.path().join("d0/loop")).unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
     assert_eq!(tree.conf().errors(), 0, "deep walk reported errors");
     assert!(tree.contains(&p.join("leaf.bin").to_string_lossy()), "deepest file missing");
     assert!(!tree.contains(&format!("{dir}/d0/loop")), "symlink should not be recorded");
@@ -439,8 +432,7 @@ fn test_tree_resident_handles_released() {
         std::fs::create_dir(temp.path().join(d)).unwrap();
     }
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = state.tree_from_path(dir, true, true).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, true);
     assert_eq!(tree.handles_len(), 4, "walk root, a, a/x and b should be pinned");
 
     // re-populating a known subtree must not pool a second set of handles
@@ -460,8 +452,7 @@ fn test_tree_update_rejects_unscanned() {
     let dir: &str = temp.path().to_str().unwrap();
     std::fs::create_dir(temp.path().join("sub")).unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
     let nodes: u32 = tree.conf().nodes();
 
     // the trie root and the intermediate nodes above the walk root
@@ -484,8 +475,7 @@ fn test_tree_update_diff_name_mode() {
     std::fs::create_dir(temp.path().join("sub")).unwrap();
     std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
 
-    let state = ScanState { filemode: FileMode::NAME, ..Default::default() };
-    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NAME, false);
     assert_eq!(tree.conf().files(), 1, "name-only file not counted");
 
     std::fs::write(temp.path().join("sub/b.bin"), b"y").unwrap();
@@ -507,8 +497,7 @@ fn test_tree_update_mtime_precheck() {
     std::fs::create_dir(temp.path().join("sub2")).unwrap();
     std::fs::write(temp.path().join("sub2/b.bin"), b"y").unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
 
     /*
     Freshly built: fs timestamps and node scan times are within the
@@ -548,9 +537,8 @@ fn test_tree_watcher_renames() {
     std::fs::write(temp.path().join("dir1/inner/d.bin"), b"d").unwrap();
     let outside: TempDir = TempDir::new().unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
     let tree: Arc<DirTree> =
-        Arc::new(state.tree_from_path(dir, true, false).unwrap());
+        Arc::new(walked_tree(dir, FileMode::NODE, false));
     let watcher: Arc<TreeWatcher> =
         TreeWatcher::start(tree.clone()).expect("watcher should start");
 
@@ -688,8 +676,10 @@ fn test_tree_rescan_via_worker() {
     let dir: &str = temp.path().to_str().unwrap();
     std::fs::write(temp.path().join("a.bin"), b"x").unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: Arc<DirTree> = state.new_tree(dir).build().unwrap();
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .build()
+        .unwrap();
     tree.scan(dir, Some(true));
     let p_a: String = format!("{dir}/a.bin");
     wait_for(|| tree.contains(&p_a), "initial scan should find a.bin");
@@ -712,9 +702,8 @@ fn test_tree_watcher() {
     std::fs::create_dir(temp.path().join("sub")).unwrap();
     std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
     let tree: Arc<DirTree> =
-        Arc::new(state.tree_from_path(dir, true, false).unwrap());
+        Arc::new(walked_tree(dir, FileMode::NODE, false));
     let watcher: Arc<TreeWatcher> =
         TreeWatcher::start(tree.clone()).expect("watcher should start");
     assert!(watcher.watches_len() >= 2, "root + sub should be watched");
@@ -754,8 +743,7 @@ fn test_tree_watcher_special_files() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: Arc<DirTree> = Arc::new(state.tree_from_path(dir, true, false).unwrap());
+    let tree: Arc<DirTree> = Arc::new(walked_tree(dir, FileMode::NODE, false));
     let _watcher: Arc<TreeWatcher> =
         TreeWatcher::start(tree.clone()).expect("watcher should start");
     let files: u32 = tree.conf().files();
@@ -787,12 +775,24 @@ fn wait_for<F: Fn() -> bool>(cond: F, msg: &str) {
 
 /* --------------------------------- */
 
+/// A tree of `dir` in `filemode`, walked recursively (parallel walker).
+fn walked_tree(dir: &str, filemode: FileMode, resident: bool) -> DirTree {
+    let tree: DirTree = DirTree::new(filemode, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_resident(resident);
+    tree.walk().unwrap();
+    tree
+}
+
 /// Create a test DirTree from path and perform some basic validations.
 fn create_test_tree(recursive: bool) -> (&'static str, DirTree, u8) {
     setup_tests();
-    let (path, state) =
-        unsafe { (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap()) };
-    let tree: DirTree = state.tree_from_path(path, recursive, false).unwrap();
+    let path = unsafe { TESTDIR.as_ref().unwrap().path().to_str().unwrap() };
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(path)
+        .with_recursive(recursive);
+    tree.walk().unwrap();
     assert_eq!(tree.root.node_t, NodeType::Root);
     assert_eq!(*tree.from().unwrap(), PathBuf::from(path));
     assert_eq!(tree.state(), TreeState::Ready);
@@ -836,25 +836,24 @@ fn validate_counts_below_node(tree: &DirTree, node: Arc<Node>) -> (u64, u64, u64
     (nodes_c as u64, dirs_c as u64, files_c as u64)
 }
 
-/// Generate all expected paths for the test directory structure.
-fn path_generator(path: &str) -> HashSet<String> {
-    let mut paths: HashSet<String> = HashSet::new();
-    paths.insert(format!("{}/test.bin", path));
+/**
+The shared test tree: one file in the root, `TEST_NUM[0]` top-level
+directories with one file each, `TEST_NUM[1]` subdirectories in each,
+holding `TEST_NUM[2]` files each. miniutils' default names.
+*/
+fn test_spec() -> TreeSpec {
+    TreeSpec::new()
+        .root_files(1)
+        .level(TEST_NUM[0], 1)
+        .level(TEST_NUM[1], TEST_NUM[2])
+}
 
-    for l1_idx in 0..TEST_NUM[0] {
-        paths.insert(format!("{}/level_1_{l1_idx}", path));
-        for l2_idx in 0..TEST_NUM[1] {
-            paths.insert(format!("{}/level_1_{l1_idx}/level_2_{l2_idx}", path));
-            for l3_idx in 1..=TEST_NUM[2] {
-                paths.insert(format!(
-                    "{0}/level_1_{1}/level_2_{2}/file-{1}_{2}_{3}.bin",
-                    path, l1_idx, l2_idx, l3_idx
-                ));
-            }
-            paths.insert(format!("{path}/level_1_{0}/file-{0}.bin", l1_idx));
-        }
-    }
-    paths
+/// All expected paths of the test tree under `path`.
+fn path_generator(path: &str) -> HashSet<String> {
+    test_spec()
+        .plan(Path::new(path))
+        .map(|e: PlannedEntry| e.path.to_string_lossy().into_owned())
+        .collect()
 }
 
 /**
@@ -864,7 +863,7 @@ this fn is called only once.
 */
 fn create_test_dirs_for_tree_test() -> TempDir {
     let temp_dir: TempDir = TempDir::new().unwrap();
-    let path: &str = temp_dir.path().to_str().unwrap();
-    create_test_dirs(path, Some(TEST_NUM.to_vec()), true, false, None).unwrap();
+    let counts = test_spec().create(temp_dir.path()).unwrap();
+    assert_eq!((counts.dirs, counts.files), (EXP_DIRS as u64, EXP_FILES as u64));
     temp_dir
 }
