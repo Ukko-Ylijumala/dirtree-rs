@@ -115,7 +115,8 @@ fn test_tree_build_thread() {
 
     let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
         .from_path(path)
-        .build(state);
+        .build(state)
+        .unwrap();
     assert!(tree.worker.lock().is_some(), "Worker not initialized");
 
     // scan is non-blocking, so we must wait for it to finish
@@ -605,6 +606,25 @@ fn test_tree_watcher_renames() {
 }
 
 #[test]
+fn test_tree_build_errors() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+
+    // no from_path(): no root to build from
+    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
+    let res = DirTree::new(FileMode::NODE, Filters::default()).build(&state);
+    assert!(matches!(res, Err(TreeError::NoRoot)), "{res:?}");
+
+    // a visitor would never run in sync mode
+    let state = ScanState { filemode: FileMode::NODE, sync: true, ..Default::default() };
+    let res = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_visitor(Arc::new(MaxDepthVisitor::new(1)))
+        .build(&state);
+    assert!(matches!(res, Err(TreeError::VisitorInSyncMode)), "{res:?}");
+}
+
+#[test]
 fn test_tree_rescan_via_worker() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
@@ -613,7 +633,8 @@ fn test_tree_rescan_via_worker() {
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
     let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
         .from_path(dir)
-        .build(&state);
+        .build(&state)
+        .unwrap();
     tree.scan(dir, Some(true));
     let p_a: String = format!("{dir}/a.bin");
     wait_for(|| tree.contains(&p_a), "initial scan should find a.bin");

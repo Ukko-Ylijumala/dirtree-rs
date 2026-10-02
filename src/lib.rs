@@ -10,6 +10,7 @@ The module is split into several submodules for clarity:
 - [`conf`]:     [`TreeConf`] - atomic counters and feature flags.
 - [`event`]:    [`TreeOp`], [`TreeState`], [`TreeEvent`], [`EventInfo`].
 - [`dirtree`]:  [`DirTree`] itself and [`DirTreeIterator`].
+- [`error`]:    [`TreeError`] and [`TreeResult`] for the fallible API.
 - [`traverse`]: free traversal helpers over `Arc<Node>`.
 - [`update`]:   diff-rescan (the [`TreeOp::Update`] primitive).
 - [`worker`]:   the background work-queue executor.
@@ -23,6 +24,7 @@ The module is split into several submodules for clarity:
 mod conf;
 mod debug;
 mod dirtree;
+mod error;
 mod event;
 mod hash;
 mod node;
@@ -37,6 +39,7 @@ mod worker;
 pub use conf::TreeConf;
 pub use debug::{tree_print_debug, tree_validate_counts};
 pub use dirtree::{DirTree, DirTreeIterator};
+pub use error::{TreeError, TreeResult};
 pub use event::{EventInfo, TreeEvent, TreeOp, TreeState};
 pub use hash::DirTreeXxh3Hasher;
 pub use node::{Directory, Entry, FileEntry, Node, NodeItem, NodeType};

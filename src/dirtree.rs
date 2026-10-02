@@ -1,6 +1,7 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
 use super::conf::TreeConf;
+use super::error::{TreeError, TreeResult};
 use super::event::{TreeEvent, TreeOp, TreeState};
 use super::node::{Directory, Entry, FileEntry, MaybeNode, Node, NodeItem, NodeIter, NodeType};
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
@@ -428,19 +429,18 @@ impl DirTree {
     Build a new [[DirTree]] with the given options and start the worker thread.
 
     NOTE: must be chained with `from_path()` to set the root path.
+
+    Fails with [TreeError::NoRoot] without a root path, with
+    [TreeError::VisitorInSyncMode] if a visitor is set but `state.sync` is
+    (silently skipping the visitor would hide a caller bug), and with
+    [TreeError::WorkerSpawn] if the worker thread cannot be started.
     */
-    pub fn build(self, state: &ScanState) -> Arc<Self> {
+    pub fn build(self, state: &ScanState) -> TreeResult<Arc<Self>> {
         if self.conf.from.get().is_none() {
-            panic!("Root path must be set before building the tree");
+            return Err(TreeError::NoRoot);
         }
         if state.sync && self.has_visitor() {
-            /*
-            Silent fallthrough would mean the visitor is configured but
-            never invoked - almost certainly a caller bug. Force the
-            configuration error early.
-            */
-            panic!("DirTree::build: a visitor was configured, but state.sync is true. \
-                    The visitor protocol is parallel-walker only - set sync=false.");
+            return Err(TreeError::VisitorInSyncMode);
         }
         self.conf.set_sync(state.sync);
         let tree: Arc<Self> = self.into();
@@ -450,9 +450,9 @@ impl DirTree {
             .stack_size(256 * 1024) // 256 KiB
             .name("tree_worker".into())
             .spawn(|| tree_worker(tree_c, state))
-            .expect("Failed to start DirTree worker thread");
+            .map_err(TreeError::WorkerSpawn)?;
         *tree.worker.lock() = Some(worker);
-        tree
+        Ok(tree)
     }
 
     /// Creates a new [[DirTree]] with the given path as root.
