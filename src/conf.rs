@@ -1,5 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
+use super::node::Node;
 use super::observer::{NOOP_OBSERVER, TreeObserver};
 use super::visitor::{Visitor, WalkEvent};
 use super::{FileMode, Filters};
@@ -7,12 +8,29 @@ use super::utils::mod_atom_u32;
 use crossbeam::channel::Sender;
 use parking_lot::RwLock;
 use std::{
+    fmt::{self, Debug, Formatter},
     path::PathBuf,
     sync::Arc,
     sync::OnceLock,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed},
 };
 use timesince::SecondsSinceEpoch;
+
+/**
+Called by the parallel walker for each directory right before it lists
+it. A [`TreeWatcher`](super::TreeWatcher) sets one to watch every
+directory a scan reaches before reading it: an entry created before the
+watch is then in the listing, one created after it produces an event,
+and none falls in between.
+*/
+#[derive(Clone)]
+pub(super) struct ListHook(pub(super) Arc<dyn Fn(&Arc<Node>) + Send + Sync>);
+
+impl Debug for ListHook {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("ListHook")
+    }
+}
 
 /**
 Atomic counters for tracking the number of nodes, directories, and files.
@@ -34,6 +52,8 @@ pub struct TreeConf {
     pub(super) discovery_tx: RwLock<Option<Sender<WalkEvent>>>,
     /// Progress reporting; [`NoopObserver`](super::NoopObserver) until set.
     observer: OnceLock<Arc<dyn TreeObserver>>,
+    /// Set while a watcher follows the tree, see [ListHook].
+    list_hook: RwLock<Option<ListHook>>,
     /// Cooperative cancellation flag. Checked at the top of every `populate_par_inner`.
     pub(super) cancelled: AtomicBool,
     ctime: SecondsSinceEpoch,
@@ -144,6 +164,21 @@ impl TreeConf {
     /// Set the progress observer. Only the first one set takes effect.
     pub(super) fn set_observer(&self, o: Arc<dyn TreeObserver>) {
         self.observer.set(o).ok();
+    }
+
+    /// Set or clear the [ListHook] (one watcher per tree).
+    pub(super) fn set_list_hook(&self, hook: Option<ListHook>) {
+        *self.list_hook.write() = hook;
+    }
+
+    /// Run the [ListHook], if one is set, for the directory `node` about to be listed.
+    #[inline]
+    pub(super) fn before_listing(&self, node: &Arc<Node>) {
+        // cloned out, so that the hook runs without the lock held
+        let hook: Option<ListHook> = self.list_hook.read().clone();
+        if let Some(hook) = hook {
+            (hook.0)(node);
+        }
     }
 
     /// Whether cancellation has been requested.

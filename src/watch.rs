@@ -37,6 +37,7 @@ v1 caveats (deliberate, recorded for the future crate split):
 */
 
 use super::dirtree::DirTree;
+use super::conf::ListHook;
 use super::error::TreeError;
 use super::event::{TreeEvent, TreeOp, TreeState};
 use super::node::{MaybeNode, Node, NodeType};
@@ -172,12 +173,26 @@ impl TreeWatcher {
         debug!(target: "WATCH", "watching {} directories under {}",
             watcher.watches.len(), from.display());
 
+        // scans of new directories watch each directory before reading it
+        let weak: Weak<Self> = Arc::downgrade(&watcher);
+        watcher.tree.conf.set_list_hook(Some(ListHook(Arc::new(move |node: &Arc<Node>| {
+            if let Some(w) = weak.upgrade() {
+                w.add_watch(node);
+            }
+        }))));
+
         let w: Arc<Self> = watcher.clone();
-        let thread: JoinHandle<()> = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .stack_size(1024 * 1024) // the event loop can run subtree scans
             .name("tree_watch".into())
-            .spawn(move || w.event_loop())?;
-        *watcher.thread.lock() = Some(thread);
+            .spawn(move || w.event_loop());
+        match spawned {
+            Ok(thread) => *watcher.thread.lock() = Some(thread),
+            Err(e) => {
+                watcher.tree.conf.set_list_hook(None);
+                return Err(e);
+            }
+        }
         Ok(watcher)
     }
 
@@ -187,6 +202,7 @@ impl TreeWatcher {
         if let Some(t) = self.thread.lock().take() {
             t.join().ok();
         }
+        self.tree.conf.set_list_hook(None);
     }
 
     /// Number of currently established directory watches.
@@ -490,20 +506,15 @@ impl TreeWatcher {
                 self.tree.insert(&full, NodeType::Directory, None);
                 self.tree.conf.observer().dirs_added(1);
                 /*
-                Watch-then-scan: watching the new directory before reading
-                it closes the race where entries created right after the
-                mkdir would be missed by both the scan and the watch.
-                Grandchild directories created before their own watch
-                existed are still found by the recursive scan below, and
-                produce their own create events afterwards.
+                Watch-then-list, per directory: the scan runs the watcher's
+                ListHook on each directory it reaches, the new one included,
+                before reading it. An entry created before a directory's
+                watch is in its listing, one created after it produces an
+                event. (Watching the subtree only after the whole scan lost
+                entries created in a subdirectory between its listing and
+                its watch.)
                 */
-                if let Some(new_node) =
-                    self.tree.get_node(full.to_string_lossy().as_ref())
-                {
-                    self.add_watch(&new_node);
-                    self.tree.populate_par(&full, Some(true));
-                    self.watch_subtree(&new_node);
-                }
+                self.tree.populate_par(&full, Some(true));
             } else {
                 /*
                 IN_CREATE fires for every entry type. Like the walker and the
@@ -687,13 +698,8 @@ impl TreeWatcher {
                     drop(child); // release the old subtree before re-scanning
                     self.tree.insert(&full, NodeType::Directory, None);
                     self.tree.conf.observer().dirs_added(1);
-                    if let Some(new_node) =
-                        self.tree.get_node(full.to_string_lossy().as_ref())
-                    {
-                        self.add_watch(&new_node);
-                        self.tree.populate_par(&full, Some(true));
-                        self.watch_subtree(&new_node);
-                    }
+                    // watched directory by directory as the scan reaches them, see WATCH_MKDIR
+                    self.tree.populate_par(&full, Some(true));
                     self.sweep_dead_watches();
                 } else {
                     // a moved file is rebuilt from its known inode: no stat

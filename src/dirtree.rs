@@ -734,6 +734,8 @@ impl DirTree {
         skip the state pass (a directory fstat and a digest per entry)
         and the dir-first lookahead.
         */
+        // a watcher watches this directory before it is read (see ListHook)
+        self.conf.before_listing(&node);
         let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
         if let Some(e) = iter.error() {

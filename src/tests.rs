@@ -751,6 +751,38 @@ fn test_tree_rescan_via_worker() {
 }
 
 #[test]
+fn test_tree_watcher_new_subtrees() {
+    /*
+    New directories with subdirectories, and files written into those
+    right away: each subdirectory must be watched before it is listed,
+    or a file written between its listing and its watch is lost for good.
+    */
+    const ROUNDS: usize = 100;
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let tree: Arc<DirTree> = Arc::new(walked_tree(dir, FileMode::NODE, false));
+    let _watcher: Arc<TreeWatcher> =
+        TreeWatcher::start(tree.clone()).expect("watcher should start");
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    for i in 0..ROUNDS {
+        let deepest: PathBuf = temp.path().join(format!("r{i}/a/b/c"));
+        std::fs::create_dir_all(&deepest).unwrap();
+        for sub in ["", "a", "a/b", "a/b/c"] {
+            let file: PathBuf = temp.path().join(format!("r{i}")).join(sub).join("f.bin");
+            std::fs::write(&file, b"x").unwrap();
+            files.push(file);
+        }
+    }
+    for file in &files {
+        let p: String = file.to_string_lossy().into_owned();
+        wait_for(|| tree.contains(&p), &format!("{p} should appear"));
+    }
+    assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_watcher() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
