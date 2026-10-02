@@ -579,10 +579,6 @@ impl DirTree {
                                     }
                                 }
                             } else if let Some(kind) = FileKind::from_std(entry_t) {
-                                // a name-only entry could not tell a special file apart
-                                if kind.is_special() && self.filemode().is_name() {
-                                    return;
-                                }
                                 if !self.conf.filters().passes(&name, false) {
                                     return;
                                 }
@@ -602,9 +598,7 @@ impl DirTree {
                                         }
                                     }
                                 }
-                                if self.filemode().is_name() {
-                                    self.insert(&path, NodeType::Name, None);
-                                } else if self.filemode().is_node() {
+                                if self.filemode().is_node() {
                                     let target: Option<u32> = match kind {
                                         FileKind::Symlink => self.link_target(&path),
                                         _ => None,
@@ -1043,9 +1037,8 @@ impl DirTree {
     entry - with per-entry updates, the global `Counter` mutexes and the
     parent's map lock were contended by every worker at once.
 
-    Special files are recorded with their [FileKind] (Node filemode only:
-    a name-only entry could not tell them apart) and counted apart from
-    regular files; a symlink's target is read through `dirfd`, the
+    Special files are recorded with their [FileKind] and counted apart
+    from regular files; a symlink's target is read through `dirfd`, the
     directory being listed. Entries of undeterminable type are reported
     as events. No paths are constructed: the interned name and the inode
     from the dirent are all an insertion requires.
@@ -1066,8 +1059,7 @@ impl DirTree {
         let Some(dir) = parent_node.as_dir() else {
             return;
         };
-        let name_only: bool = self.filemode().is_name();
-        let store: bool = name_only || self.filemode().is_node();
+        let store: bool = self.filemode().is_node();
         let with_size: bool = self.filemode().is_with_size();
         let mut children: Vec<(u32, MaybeNode)> = Vec::with_capacity(batch.len());
         /*
@@ -1084,18 +1076,14 @@ impl DirTree {
         let mut seen: u64 = 0;
         let mut seen_specials: u64 = 0;
         let mut size: u64 = 0;
-        // name-only files get no node, just a (name -> None) entry
         let file_node = |inode: u64, file: FileEntry| -> MaybeNode {
-            match name_only {
-                true => None,
-                false => Some(
-                    Node::new(
-                        NodeItem::File(Entry::<FileEntry>::leaf(inode, file)),
-                        Some(parent_node.clone()),
-                    )
-                    .into(),
-                ),
-            }
+            Some(
+                Node::new(
+                    NodeItem::File(Entry::<FileEntry>::leaf(inode, file)),
+                    Some(parent_node.clone()),
+                )
+                .into(),
+            )
         };
 
         for entry in batch {
@@ -1112,9 +1100,6 @@ impl DirTree {
             let Some(kind) = FileKind::from_type(entry_t) else {
                 continue;
             };
-            if kind.is_special() && name_only {
-                continue;
-            }
             let name_os: &OsStr = OsStr::from_bytes(entry.name_as_bytes());
             trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
 
@@ -1183,10 +1168,7 @@ impl DirTree {
             false => dir.add_children_new(specials),
         };
         if added + added_specials > 0 {
-            // name-only entries are files, but not nodes
-            if !name_only {
-                self.conf.nodes_mod((added + added_specials) as i32);
-            }
+            self.conf.nodes_mod((added + added_specials) as i32);
             self.conf.files_mod(added as i32);
             self.conf.specials_mod(added_specials as i32);
             // files live one path component below their directory
@@ -1337,19 +1319,6 @@ impl DirTree {
                 }
             };
 
-            if is_leaf && node_t == NodeType::Name {
-                /*
-                optimization: don't create file Nodes at all, just
-                record the fact that a file exists in the directory
-                NOTE: total node count is not incremented in this case
-                */
-                if dir.add_name_child(part) {
-                    self.conf.files_mod(1);
-                    debug!(target: "FILENAME_ADD", "{part:?} (store name only)");
-                }
-                return;
-            }
-
             /*
             Build the item for a would-be new node up front. Leaf items can
             require a stat (when no inode is given) and thus fail on a
@@ -1475,15 +1444,6 @@ impl DirTree {
             }
 
             None => {
-                /*
-                In Name filemode files exist only as name entries in their
-                parent's children map (no Node), so get_node cannot find
-                them - check for one before declaring the path missing.
-                */
-                if self.remove_name_entry(path) {
-                    self.conf.counts_mod(NodeCounts::NAME_ENTRY, -1);
-                    return Ok(Some(NodeCounts::NAME_ENTRY));
-                }
                 warn!("Node not found: {path:?}");
                 Ok(None)
             }
@@ -1564,7 +1524,7 @@ impl DirTree {
     `name_idx`, `depth_abs` deep: a directory moved to another parent.
     The trie cannot re-parent a node in place, so the nodes are new, but
     they are built from memory - inodes, interned names, scan stamps,
-    Name-mode entries and pooled directory handles (resident mode) carry
+    file kinds and pooled directory handles (resident mode) carry
     over - so nothing is read from disk, where a rescan would list every
     directory of the subtree again. Whoever holds a node of `old` holds a
     detached node afterwards.
@@ -1616,13 +1576,7 @@ impl DirTree {
                         let file: FileEntry = c.as_file().copied().unwrap_or_default();
                         self.insert_child(&to, idx, NewChild::Leaf(file), ino, child_depth);
                     }
-                    None => {
-                        // a Name-mode (node-less) file entry
-                        if to.as_dir().is_some_and(|d: &Directory| d.add_name_child(idx)) {
-                            self.conf.files_mod(1);
-                            self.conf.depth_compare(child_depth);
-                        }
-                    }
+                    None => {}
                 }
             }
         }
@@ -1661,14 +1615,8 @@ impl DirTree {
 
         // rename-over: drop any previous occupant of the destination name
         let occupant: Option<MaybeNode> = dir.read().get(&name_idx).cloned();
-        match occupant {
-            Some(Some(old)) => {
-                self.remove_child_node(parent, name_idx, old);
-            }
-            Some(None) if dir.remove_name_child(&name_idx) => {
-                self.conf.counts_mod(NodeCounts::NAME_ENTRY, -1);
-            }
-            _ => {}
+        if let Some(Some(old)) = occupant {
+            self.remove_child_node(parent, name_idx, old);
         }
 
         if child.node_t.is_dir() {
@@ -1677,27 +1625,6 @@ impl DirTree {
         dir.add_child(name_idx, Some(child));
         self.conf.counts_mod(counts, 1);
         true
-    }
-
-    /// Remove a name-only (Node-less) file entry from its parent directory.
-    /// Returns `true` if such an entry existed and was removed.
-    fn remove_name_entry(&self, path: &str) -> bool {
-        let trimmed: &str = path.trim_end_matches(PATH_SEP);
-        let Some((parent_p, name)) = trimmed.rsplit_once(PATH_SEP) else {
-            return false;
-        };
-        // a first-level path like "/foo" splits into ("", "foo")
-        let parent_p: &str = if parent_p.is_empty() { PATH_SEP } else { parent_p };
-        let Some(name_idx) = self.strings.idx(name) else {
-            return false;
-        };
-        self.get_node(parent_p)
-            .and_then(|parent: Arc<Node>| {
-                parent
-                    .as_dir()
-                    .map(|dir: &Directory| dir.remove_name_child(&name_idx))
-            })
-            .unwrap_or(false)
     }
 
     /* --------------------------------- */
@@ -1886,12 +1813,8 @@ impl DirTree {
         traverse_from_par(&self.root(), &f);
     }
 
-    /**
-    Count the number of directory and file nodes with `traverse()`. Also
-    counts the starting [[Node]] (except root). Name-only file entries
-    (Name filemode) count as files but not as nodes: the tree's counters
-    hold them, so a subtree taken off the tree must take them off too.
-    */
+    /// Count the number of directory and file nodes with `traverse()`. Also counts
+    /// the starting [[Node]] (except root).
     pub fn count_from(&self, node: Arc<Node>) -> NodeCounts {
         if node.node_t.is_file() {
             return NodeCounts::of_node(&node);
@@ -1904,14 +1827,7 @@ impl DirTree {
         Likely the overhead from moving stuff between threads and having
         to use Atomic versions of counters is the main reason.
         */
-        let name_only: bool = self.filemode().is_name();
-        traverse_from(&node, &mut |n: &Arc<Node>| {
-            counts.add_node(n);
-            // traverse_from() visits nodes only, and a name entry is none
-            if name_only && let Some(children) = n.children() {
-                counts.files += children.read().values().filter(|c| c.is_none()).count() as u32;
-            }
-        });
+        traverse_from(&node, &mut |n: &Arc<Node>| counts.add_node(n));
 
         if node.node_t == NodeType::Root {
             counts.nodes -= 1; // remove root node if we started from it

@@ -297,15 +297,13 @@ impl DirTree {
 
         /*
         Disk view: interned name -> dirent. Filtered entries are treated
-        as absent, and so are special files in a Name-mode tree, which
-        does not record them (like the walk). An entry whose type cannot
-        be determined at all (DT_UNKNOWN and a failed fstatat) is neither:
-        it exists, so whatever the tree has under that name is kept as-is.
+        as absent. An entry whose type cannot be determined at all
+        (DT_UNKNOWN and a failed fstatat) is neither: it exists, so
+        whatever the tree has under that name is kept as-is.
 
         The diff keeps its own stamp (above), so the handle's own state
         tracking would be wasted work: iterate untracked.
         */
-        let name_only: bool = self.filemode().is_name();
         // for readlinkat() on new symlinks; the handle outlives the entries
         let dirfd: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(handle.as_raw_fd()) };
         let mut iter = handle.iter_untracked();
@@ -345,8 +343,7 @@ impl DirTree {
                 continue;
             }
             let is_dir: bool = e.is_dir();
-            let kind: Option<FileKind> = e.file_type().and_then(FileKind::from_type);
-            if !is_dir && kind.is_none_or(|k: FileKind| k.is_special() && name_only) {
+            if !is_dir && e.file_type().and_then(FileKind::from_type).is_none() {
                 continue;
             }
             if !self.conf.filters().passes(name_os, is_dir) {
@@ -377,20 +374,8 @@ impl DirTree {
                 continue;
             }
             trace!(target: "UPDATE_RM", "{:?} in {}", name_idx, path.display());
-            match child {
-                Some(c) => {
-                    ctr.removed(self.remove_child_node(&node, *name_idx, c.clone()));
-                }
-                None => {
-                    // a Name-mode (node-less) file entry
-                    if node
-                        .as_dir()
-                        .is_some_and(|d| d.remove_name_child(name_idx))
-                    {
-                        self.conf.files_mod(-1);
-                        ctr.removed_files.fetch_add(1, Relaxed);
-                    }
-                }
+            if let Some(c) = child {
+                ctr.removed(self.remove_child_node(&node, *name_idx, c.clone()));
             }
         }
 
@@ -423,26 +408,7 @@ impl DirTree {
                     }
                 }
 
-                // a name-only entry occupies the slot
-                Some(None) => {
-                    if is_dir {
-                        // type change: a directory replaced a former file
-                        if node
-                            .as_dir()
-                            .is_some_and(|d| d.remove_name_child(&name_idx))
-                        {
-                            self.conf.files_mod(-1);
-                            ctr.removed_files.fetch_add(1, Relaxed);
-                            ctr.replaced.fetch_add(1, Relaxed);
-                        }
-                        let child_p: PathBuf = path.join(name_os);
-                        self.update_add_dir(
-                            &node, name_idx, disk_ino, child_depth, &child_p, recursive,
-                            ctr,
-                        );
-                    }
-                    // a plain file behind a name entry has no inode to compare
-                }
+                Some(None) => {}
 
                 Some(Some(existing)) => {
                     /*
@@ -536,18 +502,7 @@ impl DirTree {
         depth: u8,
         ctr: &UpdateCtr,
     ) {
-        let mode = self.filemode();
-        if mode.is_name() {
-            if parent
-                .as_dir()
-                .is_some_and(|d| d.add_name_child(name_idx))
-            {
-                self.conf.files_mod(1);
-                self.conf.depth_compare(depth);
-                ctr.added_files.fetch_add(1, Relaxed);
-                self.conf.observer().files_added(1, 0);
-            }
-        } else if mode.is_node() {
+        if self.filemode().is_node() {
             let (_, created) =
                 self.insert_child(parent, name_idx, NewChild::Leaf(file), inode, depth);
             if created && file.kind().is_special() {

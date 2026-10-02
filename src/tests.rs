@@ -319,13 +319,15 @@ fn test_name_mode_removal() {
     std::fs::create_dir(temp.path().join("sub")).unwrap();
     std::fs::write(temp.path().join("sub/afile.bin"), b"x").unwrap();
 
+    // Name is an alias of Node: the file gets a node of its own
     let tree: DirTree = walked_tree(dir, FileMode::NAME, false);
-    assert_eq!(tree.conf().files(), 1, "name-only file not counted");
+    assert_eq!(tree.conf().files(), 1, "file not counted");
 
     let p: String = format!("{dir}/sub/afile.bin");
+    assert!(tree.contains(&p), "file has no node");
     match tree.remove(&p) {
-        Ok(Some(c)) if c == NodeCounts { files: 1, ..Default::default() } => {}
-        other => panic!("Name-only entry removal failed: {other:?}"),
+        Ok(Some(c)) if c == NodeCounts { nodes: 1, files: 1, ..Default::default() } => {}
+        other => panic!("File removal failed: {other:?}"),
     }
     assert_eq!(tree.conf().files(), 0, "file count not decremented");
     assert!(matches!(tree.remove(&p), Ok(None)), "second removal should be a no-op");
@@ -424,9 +426,8 @@ fn planned_kind(kind: Special) -> FileKind {
 /**
 Whether a walk in `mode` records a planned entry, as the tree's policy
 stands: directories, regular files (a hardlink is one too) and, in Node
-mode, every special file with its kind; symlinks are never followed. A
-name-only entry could not tell a special file apart, so Name mode
-leaves them out.
+mode (or Name, its alias), every special file with its kind; symlinks
+are never followed.
 */
 fn recorded(e: &PlannedEntry, mode: FileMode) -> bool {
     match e.kind {
@@ -475,7 +476,6 @@ fn test_tree_special_entries() {
         let want_specials: u64 = if mode.is_node() { specials } else { 0 };
         assert_eq!(tree.conf().specials() as u64, want_specials, "{ctx}: specials");
         if mode.is_node() {
-            // name-only files have no node to look up
             for e in spec.plan(temp.path()) {
                 let p = e.path.to_string_lossy();
                 assert_eq!(tree.contains(&p), recorded(&e, mode), "{ctx}: {p}");
@@ -576,7 +576,7 @@ fn test_tree_update_diff_name_mode() {
     std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
 
     let tree: DirTree = walked_tree(dir, FileMode::NAME, false);
-    assert_eq!(tree.conf().files(), 1, "name-only file not counted");
+    assert_eq!(tree.conf().files(), 1, "file not counted");
 
     std::fs::write(temp.path().join("sub/b.bin"), b"y").unwrap();
     std::fs::remove_file(temp.path().join("sub/a.bin")).unwrap();
@@ -1295,7 +1295,7 @@ fn test_tree_watcher_special_moves() {
 
 #[test]
 fn test_name_mode_subtree_counts() {
-    // name-only files leave the counters with their directory, however it goes
+    // files leave the counters with their directory, however it goes (Name mode, Node's alias)
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
     let at = |name: &str| -> PathBuf { temp.path().join(name) };

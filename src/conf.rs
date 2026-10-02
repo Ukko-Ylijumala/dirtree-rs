@@ -49,9 +49,6 @@ pub struct NodeCounts {
 }
 
 impl NodeCounts {
-    /// One name-only file entry (Name filemode): a file, but not a node.
-    pub(super) const NAME_ENTRY: Self = Self { nodes: 0, dirs: 0, files: 1, specials: 0 };
-
     /// Whether nothing is counted.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()

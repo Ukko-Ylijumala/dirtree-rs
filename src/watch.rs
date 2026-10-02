@@ -582,16 +582,14 @@ impl TreeWatcher {
             } else {
                 /*
                 IN_CREATE fires for every entry type. Like the walker and the
-                diff, record each with its FileKind, special files included
-                (but not in Name mode, which cannot tell them apart). lstat,
-                so a symlink is not followed - that also yields the inode,
-                and the insert needs no stat of its own.
+                diff, record each with its FileKind, special files included.
+                lstat, so a symlink is not followed - that also yields the
+                inode, and the insert needs no stat of its own.
                 */
-                let mode = self.tree.filemode();
                 let (ino, kind): (u64, FileKind) = match symlink_metadata(&full) {
                     Ok(meta) => match FileKind::from_std(meta.file_type()) {
-                        Some(kind) if !(kind.is_special() && mode.is_name()) => (meta.ino(), kind),
-                        _ => return,
+                        Some(kind) => (meta.ino(), kind),
+                        None => return,
                     },
                     Err(_) => return, // already gone again
                 };
@@ -602,16 +600,7 @@ impl TreeWatcher {
                     .count()
                     .saturating_sub(1)
                     .min(u8::MAX as usize) as u8;
-                let counted: bool = if mode.is_name() {
-                    let added: bool = node
-                        .as_dir()
-                        .is_some_and(|d| d.add_name_child(idx));
-                    if added {
-                        self.tree.conf.files_mod(1);
-                        self.tree.conf.depth_compare(depth);
-                    }
-                    added
-                } else if mode.is_node() {
+                let counted: bool = if self.tree.filemode().is_node() {
                     let target: Option<u32> = match kind {
                         FileKind::Symlink => self.tree.link_target(&full),
                         _ => None,
@@ -674,18 +663,7 @@ impl TreeWatcher {
         let counts: NodeCounts = match &child_opt {
             // detach only: an in-place rename re-attaches it, handles and all
             Some(child) => self.tree.detach_child_node(parent, idx, child.clone()),
-            None => {
-                // a Name-mode (node-less) file entry
-                if parent
-                    .as_dir()
-                    .is_some_and(|d| d.remove_name_child(&idx))
-                {
-                    self.tree.conf.counts_mod(NodeCounts::NAME_ENTRY, -1);
-                    NodeCounts::NAME_ENTRY
-                } else {
-                    NodeCounts::default()
-                }
-            }
+            None => NodeCounts::default(),
         };
         if counts.is_empty() {
             /*
@@ -824,18 +802,7 @@ impl TreeWatcher {
                 }
                 true
             }
-            None => {
-                // Name-mode entry: nothing to re-link, record the new name
-                let idx: u32 = self.tree.strings.insert(name.to_string_lossy().as_ref());
-                if parent
-                    .as_dir()
-                    .is_some_and(|d| d.add_name_child(idx))
-                {
-                    self.tree.conf.files_mod(1);
-                    self.tree.conf.observer().files_added(1, 0);
-                }
-                true
-            }
+            None => false,
         }
     }
 }

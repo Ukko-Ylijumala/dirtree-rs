@@ -424,32 +424,6 @@ impl Directory {
         ch.reserve(additional);
     }
 
-    /// Atomically record a name-only child (no [[Node]] is created).
-    /// Returns `true` if the name was newly added, `false` if any entry
-    /// (name-only or full node) already occupied the slot.
-    pub(super) fn add_name_child(&self, name_idx: u32) -> bool {
-        match self.write().entry(name_idx) {
-            HmEntry::Occupied(_) => false,
-            HmEntry::Vacant(v) => {
-                v.insert(None);
-                true
-            }
-        }
-    }
-
-    /// Remove a name-only (`None`) child entry. Returns `true` if one was
-    /// removed; full [[Node]] entries are left untouched.
-    pub(super) fn remove_name_child(&self, name_idx: &u32) -> bool {
-        let mut ch = self.write();
-        match ch.get(name_idx) {
-            Some(None) => {
-                ch.remove(name_idx);
-                true
-            }
-            _ => false,
-        }
-    }
-
     /// Add the immediate (non-recursive) memory size of the directory to [Context].
     #[cfg(feature = "size_of")]
     fn size_immediate(&self, context: &mut Context) {

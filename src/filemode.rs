@@ -16,7 +16,11 @@ impl FileMode {
     pub const UNSET: FileMode = FileMode(0b0);
     /// Create a full Trie node for each file.
     pub const NODE: FileMode = FileMode(0b1);
-    /// Only store the names of files in Trie parent nodes.
+    /**
+    An alias of [FileMode::NODE], kept for compatibility. It used to store
+    only the names of files; a file's slot in its parent's map now holds
+    its inode and kind at hardly any extra cost.
+    */
     pub const NAME: FileMode = FileMode(0b10);
     /// Just stat each file found.
     pub const STAT: FileMode = FileMode(0b100);
@@ -25,12 +29,12 @@ impl FileMode {
     // encode the "--size" flag
     pub const SIZE: FileMode = FileMode(0b10000000);
 
-    /// Whether the "node" option is set.
+    /// Whether the "node" option (or its alias "name") is set.
     pub fn is_node(&self) -> bool {
-        self.0 & Self::NODE.0 != 0
+        self.0 & (Self::NODE.0 | Self::NAME.0) != 0
     }
 
-    /// Whether the "name" option is set.
+    /// Whether the "name" option is set (an alias of "node", see [FileMode::NAME]).
     pub fn is_name(&self) -> bool {
         self.0 & Self::NAME.0 != 0
     }
