@@ -14,6 +14,7 @@ entry from outside a children map.
 #![allow(dead_code)]
 
 use super::hash::DirTreeXxh3Hasher;
+use super::osname::decode_os;
 use super::utils::PATH_SEP;
 use super::visitor::{SCOPE_NONE, ScopeTag};
 
@@ -155,6 +156,7 @@ impl Directory {
         self.name.load(Relaxed)
     }
 
+    /// The directory's name, encoded (see [encode_name](super::encode_name)).
     pub fn name<'a>(&self, store: &'a UniqueStrStore) -> &'a str {
         unsafe { store.borrow_str(self.name_idx()) }
     }
@@ -329,7 +331,7 @@ impl Directory {
     pub fn path(&self, store: &UniqueStrStore) -> PathBuf {
         let mut path: PathBuf = PathBuf::from(PATH_SEP);
         match self.construct_path(store) {
-            Some(parts) => path.extend(parts),
+            Some(parts) => path.extend(parts.iter().map(|p: &String| decode_os(p))),
             None => error!("Cannot construct path for a detached directory: {self:?}"),
         }
         path
@@ -688,7 +690,7 @@ impl NodeView<'_> {
         match self {
             Self::Dir(dir) => dir.path(store),
             Self::File { parent, name, .. } => {
-                parent.path(store).join(unsafe { store.borrow_str(*name) })
+                parent.path(store).join(decode_os(unsafe { store.borrow_str(*name) }))
             }
         }
     }

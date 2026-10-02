@@ -2,6 +2,7 @@
 
 use super::dirtree::DirTree;
 use super::event::{TreeEvent, TreeOp, TreeState};
+use super::osname::encode_os;
 use std::{hint, path::PathBuf, sync::Weak, thread, time::Duration};
 
 /// What one round of the worker loop found.
@@ -88,12 +89,12 @@ fn worker_round(t: &DirTree, spin_ctr: &mut u8) -> Round {
                 TreeOp::Update(ref path) => {
                     let p: PathBuf = path.clone();
                     t.set_state(TreeState::Active(op.clone()));
-                    match t.update(p.to_string_lossy().as_ref(), None) {
+                    match t.update(encode_os(&p).as_ref(), None) {
                         Ok(stats) => {
                             let msg: String = format!("Updated: {stats}");
                             t.add_event(
                                 TreeEvent::new(&msg)
-                                    .path(p.to_string_lossy().as_ref())
+                                    .path(encode_os(&p).as_ref())
                                     .op(&op),
                             );
                         }

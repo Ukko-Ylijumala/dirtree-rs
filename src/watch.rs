@@ -48,6 +48,7 @@ use super::event::{TreeEvent, TreeOp, TreeState};
 use super::conf::NodeCounts;
 use super::dirtree::NewChild;
 use super::node::{Child, Directory, FileEntry, FileKind, NodeView};
+use super::osname::encode_os;
 use super::traverse::traverse_from;
 
 use dashmap::DashMap;
@@ -181,7 +182,7 @@ impl TreeWatcher {
             .map_err(|e: TreeError| io::Error::new(io::ErrorKind::InvalidInput, e))?
             .clone();
         let from_node: Arc<Directory> = tree
-            .get_dir(from.to_string_lossy().as_ref())
+            .get_dir(encode_os(&from).as_ref())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "Tree root node not found")
             })?;
@@ -284,7 +285,7 @@ impl TreeWatcher {
                     path.display());
                 self.tree.add_error(
                     TreeEvent::new(&format!("inotify watch failed: {e}"))
-                        .path(path.to_string_lossy().as_ref()),
+                        .path(encode_os(&path).as_ref()),
                 );
             }
             return;
@@ -411,7 +412,7 @@ impl TreeWatcher {
     diff scans them; watches of removed ones are dropped.
     */
     fn resync_subtree(&self, path: &Path) {
-        let path_str = path.to_string_lossy();
+        let path_str = encode_os(&path);
         match self.tree.update(path_str.as_ref(), Some(true)) {
             Ok(stats) => {
                 debug!(target: "WATCH_MV", "{} resynced: {stats}", path.display());
@@ -466,7 +467,7 @@ impl TreeWatcher {
             self.tree.add_error(ev.clone());
             self.tree.set_state(TreeState::Inconsistent(ev));
 
-            let from_str = self.root.to_string_lossy();
+            let from_str = encode_os(&self.root);
             match self.tree.update(from_str.as_ref(), Some(true)) {
                 Ok(stats) => {
                     self.sweep_dead_watches();
@@ -511,7 +512,7 @@ impl TreeWatcher {
         */
         let attached: bool = self
             .tree
-            .get_dir(dir_path.to_string_lossy().as_ref())
+            .get_dir(encode_os(&dir_path).as_ref())
             .is_some_and(|n: Arc<Directory>| Arc::ptr_eq(&n, &node));
         if !attached {
             if let Some(cookie) = self.pending_cookie(&node) {
@@ -536,7 +537,7 @@ impl TreeWatcher {
         if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
             if dir_path == self.root {
                 let ev: TreeEvent = TreeEvent::new("Tree root was removed or moved")
-                    .path(dir_path.to_string_lossy().as_ref());
+                    .path(encode_os(&dir_path).as_ref());
                 error!("{ev:?}");
                 self.tree.add_error(ev.clone());
                 self.tree.set_state(TreeState::Error(ev));
@@ -595,7 +596,7 @@ impl TreeWatcher {
                     Err(_) => return, // already gone again
                 };
                 debug!(target: "WATCH_CREATE", "{}", full.display());
-                let idx: u32 = self.tree.strings.insert(name.to_string_lossy().as_ref());
+                let idx: u32 = self.tree.strings.insert(encode_os(&name).as_ref());
                 let depth: u8 = full
                     .components()
                     .count()
@@ -619,13 +620,13 @@ impl TreeWatcher {
             }
         } else if mask & libc::IN_DELETE != 0 {
             debug!(target: "WATCH_RM", "{}", full.display());
-            let op: TreeOp = TreeOp::Remove(full.to_string_lossy().to_string());
-            match self.tree.remove(full.to_string_lossy().as_ref()) {
+            let op: TreeOp = TreeOp::Remove(encode_os(&full).to_string());
+            match self.tree.remove(encode_os(&full).as_ref()) {
                 Ok(Some(counts)) => {
                     let msg: String = format!("Removed: {counts}");
                     self.tree.add_event(
                         TreeEvent::new(&msg)
-                            .path(full.to_string_lossy().as_ref())
+                            .path(encode_os(&full).as_ref())
                             .op(&op),
                     );
                 }
@@ -651,7 +652,7 @@ impl TreeWatcher {
     */
     fn on_moved_from(&self, parent: &Arc<Directory>, name: &OsStr, cookie: u32, is_dir: bool) {
         // lookup only: a name we never interned cannot be in the tree
-        let Some(idx) = self.tree.strings.idx(name.to_string_lossy().as_ref()) else {
+        let Some(idx) = self.tree.strings.idx(encode_os(&name).as_ref()) else {
             return;
         };
         let Some(child) = parent.get_child(&idx) else {
@@ -721,7 +722,7 @@ impl TreeWatcher {
         let full: PathBuf = dir_path.join(name);
         let dirty: bool = pending.dirty;
         let child: Child = pending.node;
-        let idx: u32 = self.tree.strings.insert(name.to_string_lossy().as_ref());
+        let idx: u32 = self.tree.strings.insert(encode_os(&name).as_ref());
         let same_parent: bool = pending
             .parent
             .upgrade()
@@ -735,7 +736,7 @@ impl TreeWatcher {
             // in-place rename: subtree and watches survive intact
             debug!(target: "WATCH_MV", "renamed to {} (cookie {cookie})", full.display());
             self.tree.add_event(
-                TreeEvent::new("Renamed").path(full.to_string_lossy().as_ref()),
+                TreeEvent::new("Renamed").path(encode_os(&full).as_ref()),
             );
             if dirty {
                 self.resync_subtree(&full);
@@ -778,7 +779,7 @@ impl TreeWatcher {
                 Some(new_root) => self.watch_subtree(&new_root),
                 None => self.tree.add_error(
                     TreeEvent::new("Moved directory has no place to go to")
-                        .path(full.to_string_lossy().as_ref()),
+                        .path(encode_os(&full).as_ref()),
                 ),
             }
             drop(child);

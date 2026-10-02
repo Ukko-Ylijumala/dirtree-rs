@@ -5,6 +5,7 @@ use super::error::{TreeError, TreeResult};
 use super::event::{TreeEvent, TreeOp, TreeState};
 use super::node::{Child, Directory, FileEntry, FileKind, NodeIter, NodeRef, NodeView};
 use super::observer::TreeObserver;
+use super::osname::{decode_path, encode_os};
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::visitor::*;
 use super::worker::tree_worker;
@@ -36,7 +37,7 @@ use std::{
     os::fd::{AsRawFd, BorrowedFd, RawFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::{DirEntryExt, MetadataExt},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Weak},
     thread,
 };
@@ -176,11 +177,12 @@ impl DirTree {
         &self.strings
     }
 
+    /// An interned string, in the encoded form (see [encode_name](super::encode_name)).
     pub fn get_string(&self, idx: u32) -> &str {
         self.strings.get(idx).ok().unwrap_or("")
     }
 
-    /// The name of an entry; `/` for the root.
+    /// The name of an entry, encoded (see [encode_name](super::encode_name)); `/` for the root.
     pub fn node_name(&self, node: &NodeRef) -> String {
         match node {
             NodeRef::Dir(dir) if dir.is_root() => PATH_SEP.to_owned(),
@@ -352,7 +354,7 @@ impl DirTree {
     is the blocking form.
     */
     pub fn scan(&self, path: &str, recursive: Option<bool>) -> TreeResult<()> {
-        self.queue_bg_op(TreeOp::Scan(PathBuf::from(path), recursive))
+        self.queue_bg_op(TreeOp::Scan(decode_path(path), recursive))
     }
 
     /**
@@ -364,7 +366,7 @@ impl DirTree {
     with [TreeError::WorkerNotRunning] when no worker would run it.
     */
     pub fn rescan(&self, path: &str) -> TreeResult<()> {
-        self.queue_bg_op(TreeOp::Update(PathBuf::from(path)))
+        self.queue_bg_op(TreeOp::Update(decode_path(path)))
     }
 
     /// Queue `op` for the worker, or fail if there is no worker to run it.
@@ -670,7 +672,7 @@ impl DirTree {
         one lock per entry), instead of a full root-to-leaf trie walk
         per entry through [DirTree::insert].
         */
-        let path_str = path.to_string_lossy();
+        let path_str = encode_os(&path);
         let node: Arc<Directory> = match self.get_dir(path_str.as_ref()) {
             Some(n) => n,
             None => {
@@ -703,7 +705,7 @@ impl DirTree {
     fn initial_walk_state(&self, path: &Path, recursive: Option<bool>) -> WalkState {
         let name_idx = path
             .file_name()
-            .map(|n| self.strings.insert(n.to_string_lossy().as_ref()))
+            .map(|n| self.strings.insert(encode_os(&n).as_ref()))
             .unwrap_or_else(|| self.strings.insert(""));
         // number of path components below the filesystem root
         let base_depth: u8 = path
@@ -967,7 +969,7 @@ impl DirTree {
         */
         let mut child_idx: Option<u32> = None;
         if let Some(v) = visitor {
-            let idx: u32 = self.strings.insert(name_os.to_string_lossy().as_ref());
+            let idx: u32 = self.strings.insert(encode_os(name_os).as_ref());
             child_idx = Some(idx);
             let parent_ctx = WalkContext {
                 path: parent_path,
@@ -985,7 +987,7 @@ impl DirTree {
             return;
         }
         let child_idx: u32 =
-            child_idx.unwrap_or_else(|| self.strings.insert(name_os.to_string_lossy().as_ref()));
+            child_idx.unwrap_or_else(|| self.strings.insert(encode_os(name_os).as_ref()));
         let (child, _) =
             self.insert_child(parent_node, child_idx, NewChild::Dir(entry.ino()), depth_abs);
         self.conf.observer().dirs_added(1);
@@ -1094,7 +1096,7 @@ impl DirTree {
                 let entry_p: PathBuf = parent_path.join(OsStr::from_bytes(entry.name_as_bytes()));
                 self.add_event(
                     TreeEvent::new("Unknown entry type")
-                        .path(&entry_p.to_string_lossy())
+                        .path(&encode_os(&entry_p))
                         .op(op),
                 );
                 debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
@@ -1109,7 +1111,7 @@ impl DirTree {
             // same prune + filter shape as for directories
             let mut child_idx: Option<u32> = None;
             if let Some(v) = visitor {
-                let idx: u32 = self.strings.insert(name_os.to_string_lossy().as_ref());
+                let idx: u32 = self.strings.insert(encode_os(name_os).as_ref());
                 child_idx = Some(idx);
                 let parent_ctx = WalkContext {
                     path: parent_path,
@@ -1147,7 +1149,7 @@ impl DirTree {
                 Some(idx) if kind.is_special() => specials.push((idx, Child::File(file))),
                 Some(idx) => children.push((idx, Child::File(file))),
                 None => {
-                    names.push(name_os.to_string_lossy());
+                    names.push(encode_os(name_os));
                     files.push(file);
                 }
             }
@@ -1231,7 +1233,7 @@ impl DirTree {
     */
     pub(super) fn link_target_at(&self, dirfd: BorrowedFd<'_>, name: &CStr) -> Option<u32> {
         match readlinkat(dirfd, name) {
-            Ok(target) => Some(self.strings.insert(target.to_string_lossy())),
+            Ok(target) => Some(self.strings.insert(encode_os(&target))),
             Err(e) => {
                 debug!(target: "WARN", "Cannot read symlink {name:?}: {e}");
                 None
@@ -1242,7 +1244,7 @@ impl DirTree {
     /// [DirTree::link_target_at] for a symlink given by its path.
     pub(super) fn link_target(&self, path: &Path) -> Option<u32> {
         match read_link(path) {
-            Ok(target) => Some(self.strings.insert(target.to_string_lossy())),
+            Ok(target) => Some(self.strings.insert(encode_os(&target))),
             Err(e) => {
                 debug!(target: "WARN", "Cannot read symlink {}: {e}", path.display());
                 None
@@ -1253,13 +1255,13 @@ impl DirTree {
     /// The target of a symlink, as read when it was recorded.
     pub fn symlink_target(&self, node: &NodeRef) -> Option<PathBuf> {
         let idx: u32 = node.as_file()?.target()?;
-        Some(PathBuf::from(unsafe { self.strings.borrow_str(idx) }))
+        Some(decode_path(unsafe { self.strings.borrow_str(idx) }))
     }
 
     /// Add a [[RawFd]] to a [[Directory]].
     #[allow(unused)]
     fn add_fd(&self, path: &Path, fd: RawFd) {
-        if let Some(dir) = self.get_dir(path.to_string_lossy().as_ref()) {
+        if let Some(dir) = self.get_dir(encode_os(&path).as_ref()) {
             dir.fd_set(fd).ok();
         }
     }
@@ -1299,10 +1301,29 @@ impl DirTree {
         self.insert_path(path, NewChild::File(file));
     }
 
+    /**
+    The interned components of `path`, encoded (see [encode_os]) and
+    otherwise exact: only `.` components are dropped and `..` taken
+    lexically, never a byte of a name (`...` is a name like any other).
+    */
+    fn intern_path(&self, path: &Path) -> Vec<u32> {
+        let mut parts: Vec<Cow<str>> = Vec::new();
+        for c in path.components() {
+            match c {
+                Component::Normal(name) => parts.push(encode_os(name)),
+                Component::ParentDir => {
+                    parts.pop();
+                }
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            }
+        }
+        self.strings.insert_many(&parts)
+    }
+
     /// Insert `leaf` at `path`, with any missing intermediate directories.
-    fn insert_path(&self, path: &PathBuf, leaf: NewChild) {
+    fn insert_path(&self, path: &Path, leaf: NewChild) {
         let mut current: Arc<Directory> = self.root();
-        let parts = &self.strings.store_path(path)[1..];
+        let parts: &[u32] = &self.intern_path(path);
         let len: usize = parts.len();
         // max depth can just as well be updated at this point
         self.conf.depth_compare(len.min(u8::MAX as usize) as u8);
@@ -1716,11 +1737,11 @@ impl DirTree {
         self.iter().filter_map(|node: NodeRef| node.as_file().copied())
     }
 
-    /// An iterator over all Paths in the tree.
+    /// An iterator over all paths in the tree, encoded (see [encode_name](super::encode_name)).
     pub fn iter_paths(&self) -> impl Iterator<Item = String> + '_ {
         self.iter()
             .filter_map(|node: NodeRef| self.fs_path(&node))
-            .map(|p: PathBuf| p.to_string_lossy().to_string())
+            .map(|p: PathBuf| encode_os(&p).into_owned())
     }
 
     /// Count the number of directories and files by iterating from a [[Directory]].

@@ -26,6 +26,7 @@ use super::hash::DirTreeXxh3Hasher;
 use super::conf::NodeCounts;
 use super::dirtree::NewChild;
 use super::node::{Child, DirTreeHashMap, Directory, FileEntry, FileKind, NodeRef, ctime_stamp};
+use super::osname::{decode_os, encode_os};
 
 use dirhandle::{DirHandle, EntryExt};
 use timesince::SecondsSinceEpoch;
@@ -242,7 +243,7 @@ impl DirTree {
                     .filter_map(|(k, v)| v.as_dir().map(|d: &Arc<Directory>| (*k, d.clone())))
                     .collect();
                 for (name_idx, child) in subdirs {
-                    let child_p: PathBuf = path.join(self.get_string(name_idx));
+                    let child_p: PathBuf = path.join(decode_os(self.get_string(name_idx)));
                     if frames < MAX_RECURSE_DEPTH {
                         self.update_inner(
                             &child_p, child, recursive, ctr, rs, frames + 1,
@@ -336,7 +337,7 @@ impl DirTree {
             let name_os: &OsStr = OsStr::from_bytes(e.name_as_bytes());
             if e.file_type().is_none() {
                 // lookup only: a name the store lacks is not in the tree either
-                if let Some(idx) = self.strings.idx(name_os.to_string_lossy().as_ref()) {
+                if let Some(idx) = self.strings.idx(encode_os(name_os).as_ref()) {
                     unknown.push(idx);
                 }
                 continue;
@@ -348,7 +349,7 @@ impl DirTree {
             if !self.conf.filters().passes(name_os, is_dir) {
                 continue;
             }
-            names.push(name_os.to_string_lossy());
+            names.push(encode_os(name_os));
             passing.push(e);
         }
         let mut disk: DirTreeHashMap<u32, &EntryExt> =

@@ -9,9 +9,10 @@ use ctor::dtor;
 use libc;
 use parking_lot::Mutex;
 use std::{
+    borrow::Cow,
     collections::HashSet,
     collections::hash_map::DefaultHasher,
-    ffi::CString,
+    ffi::{CString, OsStr},
     mem::size_of,
     fs::{remove_file, rename, write},
     hash::{Hash, Hasher},
@@ -1304,6 +1305,98 @@ fn test_tree_update_specials() {
     assert_eq!(node("f.bin").file_kind(), Some(FileKind::Fifo));
     tree_validate_counts(&tree);
     assert!(!tree.update(dir, Some(true)).unwrap().changed(), "second update changed something");
+}
+
+#[test]
+fn test_osname_roundtrip() {
+    let cases: [&[u8]; 7] = [
+        b"plain.php",
+        b"x\xe4.php",
+        b"\xff\xfe",
+        // a sequence cut short at the end
+        b"a\xe2\x82",
+        // U+F7E4 itself, valid UTF-8 but in the escape range
+        "x\u{F7E4}.php".as_bytes(),
+        // the byte U+F7E4 stands for, then U+F7E4 again
+        b"\xe4\xef\x9f\xa4",
+        "x\u{FFFD}.php".as_bytes(),
+    ];
+    let mut seen: HashSet<String> = HashSet::new();
+    for bytes in cases {
+        let enc: Cow<str> = encode_name(bytes);
+        assert_eq!(decode_name(&enc).as_ref(), bytes, "{enc:?}");
+        assert!(seen.insert(enc.into_owned()), "two names encode alike: {bytes:?}");
+    }
+    assert!(matches!(encode_name(b"plain.php"), Cow::Borrowed("plain.php")));
+    assert!(matches!(decode_name("plain.php"), Cow::Borrowed(b"plain.php")));
+    assert_ne!(encode_name("x\u{F7E4}".as_bytes()), "x\u{F7E4}");
+}
+
+/// Names that a lossy (or normalizing) conversion would change or collapse.
+fn hostile_names(root: &Path) -> NodeCounts {
+    let at = |name: &[u8]| -> PathBuf { root.join(OsStr::from_bytes(name)) };
+    // the first two collapse into the third when made lossy
+    for name in [&b"x\xe4.php"[..], b"x\xf6.php", "x\u{FFFD}.php".as_bytes()] {
+        write(at(name), b"x").unwrap();
+    }
+    for name in ["y\u{F7E4}.php", "nl\n.php", "back\\slash.php"] {
+        write(at(name.as_bytes()), b"x").unwrap();
+    }
+    std::fs::create_dir(at(b"...")).unwrap();
+    write(at(b".../inner.php"), b"x").unwrap();
+    std::fs::create_dir(at(b"d\xe9")).unwrap();
+    write(at(b"d\xe9/f\xe9"), b"x").unwrap();
+    symlink(OsStr::from_bytes(b"t\xe4rget"), at(b"lnk\xe4")).unwrap();
+    // with `root` itself, as DirTree::count_from counts it
+    NodeCounts { nodes: 12, dirs: 3, files: 8, specials: 1 }
+}
+
+/// Every path below `dir` on disk, found with std.
+fn disk_paths(dir: &Path, out: &mut HashSet<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        out.insert(entry.path());
+        if entry.file_type().unwrap().is_dir() {
+            disk_paths(&entry.path(), out);
+        }
+    }
+}
+
+#[test]
+fn test_tree_hostile_names() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let expected: NodeCounts = hostile_names(temp.path());
+    let mut on_disk: HashSet<PathBuf> = HashSet::new();
+    disk_paths(temp.path(), &mut on_disk);
+
+    for sync in [false, true] {
+        let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+            .from_path(dir)
+            .with_recursive(true)
+            .with_sync(sync);
+        tree.walk().unwrap();
+        let root: Arc<Directory> = tree.get_dir(dir).unwrap();
+        assert_eq!(tree.count_from(&root), expected, "sync {sync}");
+        tree_validate_counts(&tree);
+
+        // every entry comes back as the path it has on disk, and is found by it
+        let mut in_tree: HashSet<PathBuf> = HashSet::new();
+        tree.traverse(|n: NodeView| {
+            in_tree.insert(n.path(tree.strings()));
+        });
+        in_tree.retain(|p: &PathBuf| p.starts_with(temp.path()) && p != temp.path());
+        assert_eq!(in_tree, on_disk, "sync {sync}");
+        for p in &on_disk {
+            let node: NodeRef = tree.get_node(&encode_os(p)).unwrap();
+            assert_eq!(tree.fs_path(&node).as_ref(), Some(p));
+        }
+
+        let link: PathBuf = temp.path().join(OsStr::from_bytes(b"lnk\xe4"));
+        let node: NodeRef = tree.get_node(&encode_os(&link)).unwrap();
+        assert_eq!(tree.symlink_target(&node), Some(std::fs::read_link(&link).unwrap()));
+        assert!(!tree.update(dir, Some(true)).unwrap().changed(), "sync {sync}");
+    }
 }
 
 #[test]

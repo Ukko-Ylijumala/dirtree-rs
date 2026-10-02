@@ -2,6 +2,7 @@
 
 use super::node::{Directory, FileEntry, FileKind};
 use super::observer::{NOOP_OBSERVER, TreeObserver};
+use super::osname::decode_path;
 use super::visitor::{Visitor, WalkEvent};
 use super::{FileMode, Filters};
 use super::utils::mod_atom_u32;
@@ -146,7 +147,7 @@ impl TreeConf {
         self.from.get()
     }
     pub(super) fn set_from(&self, path: &str) {
-        self.from.set(PathBuf::from(path)).ok();
+        self.from.set(decode_path(path)).ok();
     }
 
     pub fn ctime(&self) -> &SecondsSinceEpoch {

@@ -1,5 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
+use super::osname::encode_os;
 use regex::Regex;
 use std::ffi::OsStr;
 
@@ -36,7 +37,7 @@ impl Filters {
 
     /// Returns `true` if the entry should be processed.
     pub fn passes(&self, name: &OsStr, is_dir: bool) -> bool {
-        let name = name.to_string_lossy();
+        let name = encode_os(&name);
         if is_dir {
             if let Some(ref re) = self.exclude_dirs
                 && re.is_match(&name)
