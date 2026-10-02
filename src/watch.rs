@@ -40,7 +40,6 @@ use super::dirtree::DirTree;
 use super::event::{TreeEvent, TreeOp, TreeState};
 use super::node::{MaybeNode, Node, NodeType};
 use super::traverse::traverse_from;
-use crate::ScanState;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -118,7 +117,6 @@ dropping the caller's handle does not stop it).
 */
 pub struct TreeWatcher {
     tree: Arc<DirTree>,
-    state: ScanState,
     ino_fd: OwnedFd,
     /// watch descriptor -> the watched directory's node
     watches: DashMap<i32, Weak<Node>>,
@@ -139,13 +137,16 @@ impl TreeWatcher {
     thread. Watch registration failures (e.g. `fs.inotify.max_user_watches`
     exhaustion) do not fail the start; they are counted in
     [`TreeWatcher::failed_watches`] and recorded in the tree's event log.
+    Progress goes to the tree's [`TreeObserver`](super::TreeObserver).
     */
-    pub fn start(tree: Arc<DirTree>, state: ScanState) -> io::Result<Arc<Self>> {
+    pub fn start(tree: Arc<DirTree>) -> io::Result<Arc<Self>> {
         let fd: RawFd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let from: PathBuf = tree.from().clone();
+        let from: PathBuf = tree.conf.from.get().cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Tree has no root path")
+        })?;
         let from_node: Arc<Node> = tree
             .get_node(from.to_string_lossy().as_ref())
             .ok_or_else(|| {
@@ -154,7 +155,6 @@ impl TreeWatcher {
 
         let watcher: Arc<Self> = Arc::new(Self {
             tree,
-            state,
             ino_fd: unsafe { OwnedFd::from_raw_fd(fd) },
             watches: DashMap::new(),
             pending: DashMap::new(),
@@ -385,7 +385,7 @@ impl TreeWatcher {
 
             let from: PathBuf = self.tree.from().clone();
             let from_str = from.to_string_lossy();
-            match self.tree.update(from_str.as_ref(), &self.state, Some(true)) {
+            match self.tree.update(from_str.as_ref(), Some(true)) {
                 Ok(stats) => {
                     self.sweep_dead_watches();
                     if let Some(root) = self.tree.get_node(from_str.as_ref()) {
@@ -484,7 +484,7 @@ impl TreeWatcher {
             if is_dir {
                 debug!(target: "WATCH_MKDIR", "{}", full.display());
                 self.tree.insert(&full, NodeType::Directory, None);
-                self.state.num_d.inc1();
+                self.tree.conf.observer().dirs_added(1);
                 /*
                 Watch-then-scan: watching the new directory before reading
                 it closes the race where entries created right after the
@@ -497,7 +497,7 @@ impl TreeWatcher {
                     self.tree.get_node(full.to_string_lossy().as_ref())
                 {
                     self.add_watch(&new_node);
-                    self.tree.populate_par(&full, &self.state, Some(true));
+                    self.tree.populate_par(&full, Some(true));
                     self.watch_subtree(&new_node);
                 }
             } else {
@@ -535,7 +535,7 @@ impl TreeWatcher {
                     true // counted, but not stored
                 };
                 if counted {
-                    self.state.num_f.inc1();
+                    self.tree.conf.observer().files_added(1, 0);
                 }
             }
         } else if mask & libc::IN_DELETE != 0 {
@@ -682,12 +682,12 @@ impl TreeWatcher {
                     self.tree.release_handles(&child);
                     drop(child); // release the old subtree before re-scanning
                     self.tree.insert(&full, NodeType::Directory, None);
-                    self.state.num_d.inc1();
+                    self.tree.conf.observer().dirs_added(1);
                     if let Some(new_node) =
                         self.tree.get_node(full.to_string_lossy().as_ref())
                     {
                         self.add_watch(&new_node);
-                        self.tree.populate_par(&full, &self.state, Some(true));
+                        self.tree.populate_par(&full, Some(true));
                         self.watch_subtree(&new_node);
                     }
                     self.sweep_dead_watches();
@@ -703,7 +703,7 @@ impl TreeWatcher {
                     let (_, created) =
                         self.tree.insert_child(parent, idx, NodeType::File, ino, depth);
                     if created {
-                        self.state.num_f.inc1();
+                        self.tree.conf.observer().files_added(1, 0);
                     }
                 }
                 true
@@ -716,7 +716,7 @@ impl TreeWatcher {
                     .is_some_and(|d| d.add_name_child(idx))
                 {
                     self.tree.conf.files_mod(1);
-                    self.state.num_f.inc1();
+                    self.tree.conf.observer().files_added(1, 0);
                 }
                 true
             }

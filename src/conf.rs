@@ -1,5 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
+use super::observer::{NOOP_OBSERVER, TreeObserver};
 use super::visitor::{Visitor, WalkEvent};
 use crate::{args::FileMode, filters::Filters, utils::mod_atom_u32};
 use crossbeam::channel::Sender;
@@ -30,6 +31,8 @@ pub struct TreeConf {
     pub(super) visitor: RwLock<Option<Arc<dyn Visitor>>>,
     /// Optional channel for streaming [`WalkEvent`]s as the walk runs.
     pub(super) discovery_tx: RwLock<Option<Sender<WalkEvent>>>,
+    /// Progress reporting; [`NoopObserver`](super::NoopObserver) until set.
+    observer: OnceLock<Arc<dyn TreeObserver>>,
     /// Cooperative cancellation flag. Checked at the top of every `populate_par_inner`.
     pub(super) cancelled: AtomicBool,
     ctime: SecondsSinceEpoch,
@@ -92,7 +95,6 @@ impl TreeConf {
         self.resident.load(Relaxed)
     }
 
-    #[allow(unused)]
     pub(super) fn sync(&self) -> bool {
         self.sync.load(Relaxed)
     }
@@ -126,6 +128,20 @@ impl TreeConf {
 
     pub(super) fn set_discovery_tx(&self, tx: Option<Sender<WalkEvent>>) {
         *self.discovery_tx.write() = tx;
+    }
+
+    /// The progress observer, or a no-op one if none was set.
+    #[inline]
+    pub(super) fn observer(&self) -> &dyn TreeObserver {
+        match self.observer.get() {
+            Some(o) => o.as_ref(),
+            None => &NOOP_OBSERVER,
+        }
+    }
+
+    /// Set the progress observer. Only the first one set takes effect.
+    pub(super) fn set_observer(&self, o: Arc<dyn TreeObserver>) {
+        self.observer.set(o).ok();
     }
 
     /// Whether cancellation has been requested.

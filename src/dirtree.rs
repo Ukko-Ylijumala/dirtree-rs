@@ -4,10 +4,11 @@ use super::conf::TreeConf;
 use super::error::{TreeError, TreeResult};
 use super::event::{TreeEvent, TreeOp, TreeState};
 use super::node::{Directory, Entry, FileEntry, MaybeNode, Node, NodeItem, NodeIter, NodeType};
+use super::observer::TreeObserver;
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::visitor::*;
 use super::worker::tree_worker;
-use crate::{PATH_SEP, ScanState, args::FileMode, filters::Filters, utils::path_parts};
+use crate::{PATH_SEP, args::FileMode, filters::Filters, utils::path_parts};
 
 use dirhandle::{
     CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles,
@@ -89,14 +90,15 @@ Trie structure for storing a directory tree.
 
 You can use it f.ex. like this:
 ```
-use statter::ScanState;
+use statter::{FileMode, Filters};
 use statter::tree::DirTree;
 
-let state: ScanState = ScanState::default();
-state.start_updates(); // start the progress bars
-
-let tree: DirTree = DirTree::new_from_path("/tmp", &state, false, false);
+let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+    .from_path("/tmp")
+    .with_recursive(false);
+tree.walk().unwrap();
 eprintln!("{tree}"); // print basic tree info (nodes, dirs, files etc)
+```
 */
 #[derive(Default, Debug)]
 pub struct DirTree {
@@ -355,8 +357,8 @@ impl DirTree {
     Attach a [`Visitor`] to this tree. The visitor's hooks
     ([`Visitor::visit_dir`], [`Visitor::prune_child`],
     [`Visitor::max_depth`]) are invoked from the parallel walker
-    (`populate_par`). Sync-mode walks ignore the visitor and
-    [`DirTree::build`] rejects sync mode when a visitor is set.
+    (`populate_par`), so a visitor forces the parallel walker whatever
+    the sync setting.
     */
     pub fn with_visitor(self, v: Arc<dyn Visitor>) -> Self {
         self.conf.set_visitor(Some(v));
@@ -390,39 +392,47 @@ impl DirTree {
         self
     }
 
-    /**
-    Walk this tree's configured root path, populating it.
+    /// Builder: walk with the synchronous walker (ignored when a visitor is set).
+    pub fn with_sync(self, val: bool) -> Self {
+        self.conf.set_sync(val);
+        self
+    }
 
-    Uses [`DirTree::populate_par`] when sync-mode is disabled OR a visitor is
-    configured; otherwise falls back to the synchronous [`DirTree::populate`].
-    
+    /// Builder: report progress to `observer`. Only the first one set takes effect.
+    pub fn with_observer(self, observer: Arc<dyn TreeObserver>) -> Self {
+        self.conf.set_observer(observer);
+        self
+    }
+
+    /**
+    Walk this tree's configured root path, populating it (one level only
+    unless recursive, see `with_recursive()`). Blocking; progress goes to
+    the observer set with `with_observer()`. Fails with
+    [TreeError::NoRoot] if no root path was set with `from_path()`.
+
+    The walker is picked as in [DirTree::populate_auto].
+
     This is the recommended entry point for builder-style construction:
 
     ```ignore
     let tree = DirTree::new(filemode, filters)
         .from_path("/some/root")
         .with_recursive(true)
+        .with_observer(Arc::new(progress))
         .with_visitor(Arc::new(visitor));
-    tree.walk(&state);
+    tree.walk()?;
     ```
     */
-    pub fn walk(&self, state: &ScanState) {
-        let from: PathBuf = self.from().clone();
-        /*
-        Counter bookkeeping for the root dir: kept here to mirror
-        `new_from_path`, since the counter is for display only and is
-        not load-bearing for tree consistency.
-        */
-        state.num_d.inc1();
+    #[instrument(name = "DirTree", skip_all)]
+    pub fn walk(&self) -> TreeResult<()> {
+        let from: PathBuf = self.conf.from.get().ok_or(TreeError::NoRoot)?.clone();
+        debug!(target: "path", "{}", from.display());
+        // the root dir itself, which the walk lists but does not attach
+        self.conf.observer().dirs_added(1);
         self.set_state(TreeState::Active(TreeOp::Build(from.clone())));
-        let use_par: bool = !state.sync || self.has_visitor();
-        let recursive: bool = self.conf.recursive();
-        if use_par {
-            self.populate_par(&from, state, Some(recursive));
-        } else {
-            self.populate(&from, state, Some(recursive));
-        }
+        self.populate_auto(&from, Some(self.conf.recursive()));
         self.set_state(TreeState::Ready);
+        Ok(())
     }
 
     /**
@@ -430,60 +440,37 @@ impl DirTree {
 
     NOTE: must be chained with `from_path()` to set the root path.
 
-    Fails with [TreeError::NoRoot] without a root path, with
-    [TreeError::VisitorInSyncMode] if a visitor is set but `state.sync` is
-    (silently skipping the visitor would hide a caller bug), and with
+    Fails with [TreeError::NoRoot] without a root path, and with
     [TreeError::WorkerSpawn] if the worker thread cannot be started.
     */
-    pub fn build(self, state: &ScanState) -> TreeResult<Arc<Self>> {
+    pub fn build(self) -> TreeResult<Arc<Self>> {
         if self.conf.from.get().is_none() {
             return Err(TreeError::NoRoot);
         }
-        if state.sync && self.has_visitor() {
-            return Err(TreeError::VisitorInSyncMode);
-        }
-        self.conf.set_sync(state.sync);
         let tree: Arc<Self> = self.into();
         let tree_c: Arc<Self> = tree.clone();
-        let state: ScanState = state.clone();
         let worker: thread::JoinHandle<()> = thread::Builder::new()
             .stack_size(256 * 1024) // 256 KiB
             .name("tree_worker".into())
-            .spawn(|| tree_worker(tree_c, state))
+            .spawn(|| tree_worker(tree_c))
             .map_err(TreeError::WorkerSpawn)?;
         *tree.worker.lock() = Some(worker);
         Ok(tree)
     }
 
-    /// Creates a new [[DirTree]] with the given path as root.
-    ///
-    /// If `recursive` is true, also populates the tree by recursively walking
-    /// the full directory structure (starting from from the given directory)
-    /// and inserting each found path into the tree.
-    #[instrument(name = "DirTree", skip_all)]
-    pub fn new_from_path(path: &str, state: &ScanState, recursive: bool, resident: bool) -> Self {
-        debug!(target: "path", "{path}");
-        let tree: DirTree = Self::new(state.filemode, state.filters.clone()).from_path(path);
-        tree.conf.set_recursive(recursive);
-        tree.conf.set_resident(resident);
-        tree.conf.set_sync(state.sync);
-        /*
-        Technically we've not yet scanned the root directory, but this place
-        is the most logical one to do the increment to keep the counter in
-        sync as adding more logic to `populate*()` methods would be counter-
-        productive. Besides, this counter is only for display.
-        */
-        state.num_d.inc1();
-        debug!(target: "TREE", "{tree:?}");
-        if recursive {
-            tree.set_state(TreeState::Active(TreeOp::Build(PathBuf::from(path))));
-            match state.sync {
-                true => tree.populate(tree.from(), state, Some(recursive)),
-                false => tree.populate_par(tree.from(), state, Some(recursive)),
-            }
-        };
-        tree.set_state(TreeState::Ready);
-        tree
+    /**
+    Populate `path` with the walker the tree is configured for: the
+    parallel [DirTree::populate_par] unless sync mode is on, and always
+    when a visitor is set (the visitor protocol is parallel-walker only).
+    Otherwise the synchronous [DirTree::populate].
+
+    NOTE: If `recursive` is [None], the tree's default is used.
+    */
+    pub fn populate_auto(&self, path: &PathBuf, recursive: Option<bool>) {
+        match !self.conf.sync() || self.has_visitor() {
+            true => self.populate_par(path, recursive),
+            false => self.populate(path, recursive),
+        }
     }
 
     /// Populate a leaf [[Node]] in the trie with the contents of a directory.
@@ -493,7 +480,7 @@ impl DirTree {
     ///
     /// NOTE: single threaded, potentially slow with large directory trees.
     #[instrument(level = "debug", skip_all, fields(p = path.strip_prefix(self.from()).unwrap_or(path).to_str()))]
-    pub fn populate(&self, path: &PathBuf, state: &ScanState, recursive: Option<bool>) {
+    pub fn populate(&self, path: &PathBuf, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
         match path.read_dir() {
             Ok(entries) => {
@@ -508,23 +495,24 @@ impl DirTree {
                                     return;
                                 }
                                 self.insert(&path, NodeType::Directory, Some(entry.ino()));
-                                state.num_d.inc1();
+                                self.conf.observer().dirs_added(1);
                                 // an explicit per-op flag overrides the tree default
                                 if recursive.unwrap_or(self.conf.recursive()) {
                                     if self.is_worker_running() {
                                         self.queue_op(TreeOp::Scan(path, recursive));
                                     } else {
-                                        self.populate(&path, state, recursive);
+                                        self.populate(&path, recursive);
                                     }
                                 }
                             } else if entry_t.is_file() {
                                 if !self.conf.filters().passes(&name, false) {
                                     return;
                                 }
+                                let mut size: u64 = 0;
                                 if self.filemode().is_with_size() {
                                     match entry.metadata() {
                                         Ok(meta) => {
-                                            state.fsize.fetch_add(meta.len());
+                                            size = meta.len();
                                         }
                                         // likely deleted between readdir and stat
                                         Err(e) => {
@@ -541,7 +529,7 @@ impl DirTree {
                                 } else if self.filemode().is_node() {
                                     self.insert(&path, NodeType::File, Some(entry.ino()));
                                 }
-                                state.num_f.inc1();
+                                self.conf.observer().files_added(1, size);
                             }
                         }
                         Err(e) => {
@@ -573,7 +561,7 @@ impl DirTree {
     buffer to look ahead in the directory stream.
     */
     /// NOTE: If `recursive` is [None], the tree's default is used.
-    pub fn populate_par(&self, path: &PathBuf, state: &ScanState, recursive: Option<bool>) {
+    pub fn populate_par(&self, path: &PathBuf, recursive: Option<bool>) {
         /*
         Resolve the walk root's node up front - children are attached
         directly to their parent's node during the walk (one intern and
@@ -608,7 +596,7 @@ impl DirTree {
         let walk = self.initial_walk_state(path, recursive);
         // the walk root is opened by path; a symlinked root is followed
         let handle: Result<DirHandle, Error> = DirHandle::new(path);
-        rayon::scope(|s| self.populate_par_inner(path, handle, state, walk, node, s, 0, 0));
+        rayon::scope(|s| self.populate_par_inner(path, handle, walk, node, s, 0, 0));
     }
 
     /**
@@ -678,7 +666,6 @@ impl DirTree {
         &'env self,
         path: &PathBuf,
         handle: Result<DirHandle, Error>,
-        state: &'env ScanState,
         walk: WalkState,
         node: Arc<Node>,
         rs: &rayon::Scope<'env>,
@@ -795,7 +782,6 @@ impl DirTree {
             let each_dir = |entry: &EntryExt| {
                 self.process_par_dir(
                     path,
-                    state,
                     &walk,
                     &node,
                     scope_for_children,
@@ -808,7 +794,7 @@ impl DirTree {
                 );
             };
             let each_files = |chunk: &[EntryExt]| {
-                self.process_par_files(path, state, &walk, &node, depth, visitor_ref, &op, chunk);
+                self.process_par_files(path, &walk, &node, depth, visitor_ref, &op, chunk);
             };
             rayon::join(
                 || dirs.par_iter().for_each(each_dir),
@@ -848,7 +834,6 @@ impl DirTree {
     fn process_par_dir<'env>(
         &'env self,
         parent_path: &PathBuf,
-        state: &'env ScanState,
         parent_walk: &WalkState,
         parent_node: &Arc<Node>,
         scope_for_children: ScopeTag,
@@ -899,7 +884,7 @@ impl DirTree {
             child_idx.unwrap_or_else(|| self.strings.insert(name_os.to_string_lossy().as_ref()));
         let (child, _) =
             self.insert_child(parent_node, child_idx, NodeType::Directory, entry.ino(), depth_abs);
-        state.num_d.inc1();
+        self.conf.observer().dirs_added(1);
         let Some(child_node) = child else {
             // a name-only entry (or similar) blocks this slot
             self.add_error(TreeEvent::error(
@@ -928,7 +913,6 @@ impl DirTree {
             self.populate_par_inner(
                 &entry_p,
                 entry.open_dir(),
-                state,
                 next,
                 child_node,
                 rs,
@@ -945,7 +929,6 @@ impl DirTree {
                 self.populate_par_inner(
                     &entry_p,
                     open_dir_nofollow(&entry_p),
-                    state,
                     next,
                     child_node,
                     s,
@@ -974,7 +957,6 @@ impl DirTree {
     fn process_par_files(
         &self,
         parent_path: &PathBuf,
-        state: &ScanState,
         parent_walk: &WalkState,
         parent_node: &Arc<Node>,
         depth: usize,
@@ -1091,10 +1073,7 @@ impl DirTree {
             self.conf.depth_compare(depth_abs);
         }
         if seen > 0 {
-            state.num_f.inc(seen);
-        }
-        if size > 0 {
-            state.fsize.fetch_add(size);
+            self.conf.observer().files_added(seen, size);
         }
     }
 

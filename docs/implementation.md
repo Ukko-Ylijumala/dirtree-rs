@@ -222,7 +222,7 @@ let tree = DirTree::new(filemode, filters)
     .from_path("/var/www")
     .with_visitor(Arc::new(visitor))
     .with_discovery_sink(tx)
-    .build(&state);
+    .build()?;
 
 // Consumer pipeline (separate file):
 for event in rx {
@@ -239,9 +239,9 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
 
 ## What's not changed
 
-- The synchronous `populate` path — sync mode walks unchanged. If a
-  visitor is configured, `build()` rejects sync mode with an explicit
-  error rather than silently ignoring the visitor.
+- The synchronous `populate` path — sync mode walks unchanged. A
+  configured visitor forces the parallel walker whatever the sync
+  setting, as the sync walker would never invoke it.
 - The `Filters` API and its CLI flags. They still apply.
 - `TreeOp::Build/Scan/Remove/...` and `tree_worker`. The worker thread
   routes through `populate_par` automatically when a visitor is set.
@@ -257,6 +257,10 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
 - Per-node tag storage (`Node::tag: AtomicU16`) so a post-walk consumer
   can query the tree by tag instead of (or in addition to) the
   discovery channel.
+- Removal hooks on `TreeObserver` (`dirs_removed` / `files_removed`,
+  default no-ops), so an observer can track the live tree size through
+  `update()` and the watcher. `UpdateStats` already carries the removal
+  counts of an update.
 - A lighter "discover-only" walk mode that does not retain the trie at
   all — the visitor-recognized paths are streamed and the tree itself
   is not built. Useful when the discovery is the only output.

@@ -12,6 +12,7 @@ The module is split into several submodules for clarity:
 - [`dirtree`]:  [`DirTree`] itself and [`DirTreeIterator`].
 - [`error`]:    [`TreeError`] and [`TreeResult`] for the fallible API.
 - [`traverse`]: free traversal helpers over `Arc<Node>`.
+- [`observer`]: [`TreeObserver`] - progress reporting out of the tree.
 - [`update`]:   diff-rescan (the [`TreeOp::Update`] primitive).
 - [`worker`]:   the background work-queue executor.
 - [`visitor`]:  per-directory visitor protocol (recognition, prune, depth).
@@ -28,6 +29,7 @@ mod error;
 mod event;
 mod hash;
 mod node;
+mod observer;
 mod tests;
 mod traverse;
 mod update;
@@ -43,6 +45,7 @@ pub use error::{TreeError, TreeResult};
 pub use event::{EventInfo, TreeEvent, TreeOp, TreeState};
 pub use hash::DirTreeXxh3Hasher;
 pub use node::{Directory, Entry, FileEntry, Node, NodeItem, NodeType};
+pub use observer::{NoopObserver, TreeObserver};
 pub use traverse::{traverse_from, traverse_from_par, walk_nodes};
 pub use update::UpdateStats;
 pub use visitor::*;

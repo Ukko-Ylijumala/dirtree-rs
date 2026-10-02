@@ -14,7 +14,10 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     time::Duration,
 };
 use tempfile::TempDir;
@@ -113,10 +116,7 @@ fn test_tree_build_thread() {
     let (path, state) =
         unsafe { (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap()) };
 
-    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
-        .from_path(path)
-        .build(state)
-        .unwrap();
+    let tree: Arc<DirTree> = state.new_tree(path).build().unwrap();
     assert!(tree.worker.lock().is_some(), "Worker not initialized");
 
     // scan is non-blocking, so we must wait for it to finish
@@ -298,7 +298,7 @@ fn test_hardlink_names() {
     std::fs::hard_link(temp.path().join("orig.bin"), temp.path().join("link.bin")).unwrap();
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
     /*
     Hardlinked files share an inode, so an equality-based child lookup
     cannot tell the siblings apart - name resolution must be by identity.
@@ -318,7 +318,7 @@ fn test_name_mode_removal() {
     std::fs::write(temp.path().join("sub/afile.bin"), b"x").unwrap();
 
     let state = ScanState { filemode: FileMode::NAME, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
     assert_eq!(tree.conf().files(), 1, "name-only file not counted");
 
     let p: String = format!("{dir}/sub/afile.bin");
@@ -345,8 +345,7 @@ fn test_concurrent_same_path_insert() {
     let dir: &str = temp.path().to_str().unwrap();
     std::fs::create_dir_all(temp.path().join("a/b/c")).unwrap();
 
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, false, false);
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default()).from_path(dir);
     let target: PathBuf = temp.path().join("a/b/c");
     let (n0, d0) = (tree.conf().nodes(), tree.conf().dirs());
 
@@ -372,11 +371,11 @@ fn test_tree_update_diff() {
     std::fs::write(temp.path().join("gone/g.bin"), b"g").unwrap();
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
     tree_validate_counts(&tree);
 
     // a no-op pass must diff everything and change nothing
-    let stats: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    let stats: UpdateStats = tree.update(dir, Some(true)).expect("update failed");
     assert!(!stats.changed(), "no-op update changed something: {stats}");
     assert!(stats.scanned_dirs >= 3, "root, sub and gone should be diffed: {stats}");
 
@@ -389,7 +388,7 @@ fn test_tree_update_diff() {
     std::fs::write(temp.path().join("sub/tmp.bin"), b"r").unwrap();
     std::fs::rename(temp.path().join("sub/tmp.bin"), temp.path().join("sub/a.bin")).unwrap();
 
-    let stats: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    let stats: UpdateStats = tree.update(dir, Some(true)).expect("update failed");
     assert_eq!(stats.added_dirs, 1, "newdir should be added: {stats}");
     assert_eq!(stats.added_files, 2, "new.bin + replacement a.bin: {stats}");
     assert_eq!(stats.removed_dirs, 1, "gone should be removed: {stats}");
@@ -404,7 +403,7 @@ fn test_tree_update_diff() {
     tree_validate_counts(&tree);
 
     // and a second pass is a no-op again
-    let stats: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    let stats: UpdateStats = tree.update(dir, Some(true)).expect("update failed");
     assert!(!stats.changed(), "second update changed something: {stats}");
 }
 
@@ -424,7 +423,7 @@ fn test_tree_deep_walk() {
     std::os::unix::fs::symlink(temp.path(), temp.path().join("d0/loop")).unwrap();
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
     assert_eq!(tree.conf().errors(), 0, "deep walk reported errors");
     assert!(tree.contains(&p.join("leaf.bin").to_string_lossy()), "deepest file missing");
     assert!(!tree.contains(&format!("{dir}/d0/loop")), "symlink should not be recorded");
@@ -440,11 +439,11 @@ fn test_tree_resident_handles_released() {
     }
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, true, true);
+    let tree: DirTree = state.tree_from_path(dir, true, true).unwrap();
     assert_eq!(tree.handles_len(), 4, "walk root, a, a/x and b should be pinned");
 
     // re-populating a known subtree must not pool a second set of handles
-    tree.populate_par(&PathBuf::from(format!("{dir}/a")), &state, Some(true));
+    tree.populate_par(&PathBuf::from(format!("{dir}/a")), Some(true));
     assert_eq!(tree.handles_len(), 4, "re-populate leaked handles");
 
     // removing a subtree closes the handles of all of its directories
@@ -461,20 +460,20 @@ fn test_tree_update_rejects_unscanned() {
     std::fs::create_dir(temp.path().join("sub")).unwrap();
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
     let nodes: u32 = tree.conf().nodes();
 
     // the trie root and the intermediate nodes above the walk root
     let parent: String = temp.path().parent().unwrap().to_string_lossy().into_owned();
     for p in [PATH_SEP, parent.as_str()] {
-        let res = tree.update(p, &state, Some(true));
+        let res = tree.update(p, Some(true));
         assert!(res.is_err(), "update({p}) should be rejected: {res:?}");
     }
     assert_eq!(tree.conf().nodes(), nodes, "rejected updates must not touch the tree");
 
     // the walk root and its subdirs remain updatable
-    tree.update(dir, &state, Some(true)).expect("update of the tree root failed");
-    tree.update(&format!("{dir}/sub"), &state, Some(true)).expect("update of sub failed");
+    tree.update(dir, Some(true)).expect("update of the tree root failed");
+    tree.update(&format!("{dir}/sub"), Some(true)).expect("update of sub failed");
 }
 
 #[test]
@@ -485,13 +484,13 @@ fn test_tree_update_diff_name_mode() {
     std::fs::write(temp.path().join("sub/a.bin"), b"x").unwrap();
 
     let state = ScanState { filemode: FileMode::NAME, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
     assert_eq!(tree.conf().files(), 1, "name-only file not counted");
 
     std::fs::write(temp.path().join("sub/b.bin"), b"y").unwrap();
     std::fs::remove_file(temp.path().join("sub/a.bin")).unwrap();
 
-    let stats: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    let stats: UpdateStats = tree.update(dir, Some(true)).expect("update failed");
     assert_eq!(stats.added_files, 1, "b.bin should be added: {stats}");
     assert_eq!(stats.removed_files, 1, "a.bin should be removed: {stats}");
     assert_eq!(tree.conf().files(), 1, "file count should be steady");
@@ -508,7 +507,7 @@ fn test_tree_update_mtime_precheck() {
     std::fs::write(temp.path().join("sub2/b.bin"), b"y").unwrap();
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: DirTree = DirTree::new_from_path(dir, &state, true, false);
+    let tree: DirTree = state.tree_from_path(dir, true, false).unwrap();
 
     /*
     Freshly built: fs timestamps and node scan times are within the
@@ -518,19 +517,19 @@ fn test_tree_update_mtime_precheck() {
     sleep before the refreshing pass.
     */
     std::thread::sleep(Duration::from_millis(3500));
-    let s1: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    let s1: UpdateStats = tree.update(dir, Some(true)).expect("update failed");
     assert_eq!(s1.skipped_dirs, 0, "first pass must diff everything: {s1}");
     assert!(!s1.changed(), "first pass changed something: {s1}");
 
     // now the refreshed baselines dominate: one stat per dir, no diffs
-    let s2: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    let s2: UpdateStats = tree.update(dir, Some(true)).expect("update failed");
     assert_eq!(s2.scanned_dirs, 0, "second pass should diff nothing: {s2}");
     assert_eq!(s2.skipped_dirs, 3, "root, sub and sub2 should be skipped: {s2}");
     assert!(!s2.changed(), "second pass changed something: {s2}");
 
     // a new entry bumps its dir's mtime and forces a real diff there only
     std::fs::write(temp.path().join("sub/new.bin"), b"n").unwrap();
-    let s3: UpdateStats = tree.update(dir, &state, Some(true)).expect("update failed");
+    let s3: UpdateStats = tree.update(dir, Some(true)).expect("update failed");
     assert_eq!(s3.added_files, 1, "new.bin should be found: {s3}");
     assert_eq!(s3.scanned_dirs, 1, "only sub should be diffed: {s3}");
     assert_eq!(s3.skipped_dirs, 2, "root and sub2 should be skipped: {s3}");
@@ -550,9 +549,9 @@ fn test_tree_watcher_renames() {
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
     let tree: Arc<DirTree> =
-        Arc::new(DirTree::new_from_path(dir, &state, true, false));
+        Arc::new(state.tree_from_path(dir, true, false).unwrap());
     let watcher: Arc<TreeWatcher> =
-        TreeWatcher::start(tree.clone(), state.clone()).expect("watcher should start");
+        TreeWatcher::start(tree.clone()).expect("watcher should start");
 
     // same-dir file rename
     std::fs::rename(temp.path().join("sub/a.bin"), temp.path().join("sub/renamed.bin")).unwrap();
@@ -606,22 +605,78 @@ fn test_tree_watcher_renames() {
 }
 
 #[test]
-fn test_tree_build_errors() {
+fn test_tree_no_root() {
+    // no from_path(): nothing to walk or build from
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default());
+    let res = tree.walk();
+    assert!(matches!(res, Err(TreeError::NoRoot)), "{res:?}");
+    let res = DirTree::new(FileMode::NODE, Filters::default()).build();
+    assert!(matches!(res, Err(TreeError::NoRoot)), "{res:?}");
+}
+
+#[test]
+fn test_tree_visitor_forces_parallel() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
+    for d in ["keep", "skip"] {
+        std::fs::create_dir(temp.path().join(d)).unwrap();
+        std::fs::write(temp.path().join(d).join("f.bin"), b"x").unwrap();
+    }
 
-    // no from_path(): no root to build from
-    let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let res = DirTree::new(FileMode::NODE, Filters::default()).build(&state);
-    assert!(matches!(res, Err(TreeError::NoRoot)), "{res:?}");
-
-    // a visitor would never run in sync mode
-    let state = ScanState { filemode: FileMode::NODE, sync: true, ..Default::default() };
-    let res = DirTree::new(FileMode::NODE, Filters::default())
+    // the sync walker would ignore the visitor and record skip/ as well
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
         .from_path(dir)
-        .with_visitor(Arc::new(MaxDepthVisitor::new(1)))
-        .build(&state);
-    assert!(matches!(res, Err(TreeError::VisitorInSyncMode)), "{res:?}");
+        .with_recursive(true)
+        .with_sync(true);
+    let visitor = NamePruneVisitor::new(tree.strings(), &["skip"]);
+    let tree: DirTree = tree.with_visitor(Arc::new(visitor));
+    tree.walk().unwrap();
+    assert!(tree.contains(&format!("{dir}/keep/f.bin")));
+    assert!(!tree.contains(&format!("{dir}/skip")), "the visitor did not run");
+    tree_validate_counts(&tree);
+}
+
+/// Counts what a [TreeObserver] is told, for [test_tree_observer].
+#[derive(Debug, Default)]
+struct CountingObserver {
+    dirs: AtomicU64,
+    files: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl TreeObserver for CountingObserver {
+    fn dirs_added(&self, n: u64) {
+        self.dirs.fetch_add(n, Relaxed);
+    }
+
+    fn files_added(&self, n: u64, bytes: u64) {
+        self.files.fetch_add(n, Relaxed);
+        self.bytes.fetch_add(bytes, Relaxed);
+    }
+}
+
+#[test]
+fn test_tree_observer() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir_all(temp.path().join("a/b")).unwrap();
+    std::fs::write(temp.path().join("top.bin"), b"12345").unwrap();
+    std::fs::write(temp.path().join("a/one.bin"), b"123").unwrap();
+    std::fs::write(temp.path().join("a/b/two.bin"), b"12").unwrap();
+
+    // both walkers report the same: the root, a, a/b and three files
+    for sync in [false, true] {
+        let obs: Arc<CountingObserver> = Arc::new(CountingObserver::default());
+        let tree: DirTree = DirTree::new(FileMode::NODE | FileMode::SIZE, Filters::default())
+            .from_path(dir)
+            .with_recursive(true)
+            .with_sync(sync)
+            .with_observer(obs.clone());
+        tree.walk().unwrap();
+        assert_eq!(obs.dirs.load(Relaxed), 3, "dirs, sync={sync}");
+        assert_eq!(obs.files.load(Relaxed), 3, "files, sync={sync}");
+        assert_eq!(obs.bytes.load(Relaxed), 10, "bytes, sync={sync}");
+    }
 }
 
 #[test]
@@ -631,10 +686,7 @@ fn test_tree_rescan_via_worker() {
     std::fs::write(temp.path().join("a.bin"), b"x").unwrap();
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
-        .from_path(dir)
-        .build(&state)
-        .unwrap();
+    let tree: Arc<DirTree> = state.new_tree(dir).build().unwrap();
     tree.scan(dir, Some(true));
     let p_a: String = format!("{dir}/a.bin");
     wait_for(|| tree.contains(&p_a), "initial scan should find a.bin");
@@ -659,9 +711,9 @@ fn test_tree_watcher() {
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
     let tree: Arc<DirTree> =
-        Arc::new(DirTree::new_from_path(dir, &state, true, false));
+        Arc::new(state.tree_from_path(dir, true, false).unwrap());
     let watcher: Arc<TreeWatcher> =
-        TreeWatcher::start(tree.clone(), state.clone()).expect("watcher should start");
+        TreeWatcher::start(tree.clone()).expect("watcher should start");
     assert!(watcher.watches_len() >= 2, "root + sub should be watched");
     assert_eq!(watcher.failed_watches(), 0, "no watch failures expected");
 
@@ -700,9 +752,9 @@ fn test_tree_watcher_special_files() {
     let dir: &str = temp.path().to_str().unwrap();
 
     let state = ScanState { filemode: FileMode::NODE, ..Default::default() };
-    let tree: Arc<DirTree> = Arc::new(DirTree::new_from_path(dir, &state, true, false));
+    let tree: Arc<DirTree> = Arc::new(state.tree_from_path(dir, true, false).unwrap());
     let _watcher: Arc<TreeWatcher> =
-        TreeWatcher::start(tree.clone(), state.clone()).expect("watcher should start");
+        TreeWatcher::start(tree.clone()).expect("watcher should start");
     let files: u32 = tree.conf().files();
 
     // neither a (dangling) symlink nor a FIFO is a regular file
@@ -737,7 +789,7 @@ fn create_test_tree(recursive: bool) -> (&'static str, DirTree, u8) {
     setup_tests();
     let (path, state) =
         unsafe { (TESTDIR.as_ref().unwrap().path().to_str().unwrap(), STATE.as_ref().unwrap()) };
-    let tree: DirTree = DirTree::new_from_path(path, state, recursive, false);
+    let tree: DirTree = state.tree_from_path(path, recursive, false).unwrap();
     assert_eq!(tree.root.node_t, NodeType::Root);
     assert_eq!(*tree.from(), PathBuf::from(path));
     assert_eq!(tree.state(), TreeState::Ready);

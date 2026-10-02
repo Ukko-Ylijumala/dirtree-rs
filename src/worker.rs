@@ -2,11 +2,10 @@
 
 use super::dirtree::DirTree;
 use super::event::{TreeEvent, TreeOp, TreeState};
-use crate::ScanState;
 use std::{hint, path::PathBuf, sync::Arc, thread, time::Duration};
 
 /// Background worker thread for handling [TreeOperation]s.
-pub(super) fn tree_worker(t: Arc<DirTree>, state: ScanState) {
+pub(super) fn tree_worker(t: Arc<DirTree>) {
     let mut spin_ctr: u8 = 0;
     loop {
         if t.is_quitting() {
@@ -44,9 +43,9 @@ pub(super) fn tree_worker(t: Arc<DirTree>, state: ScanState) {
                         // A configured visitor forces the parallel walker
                         // because the visitor protocol is parallel-only.
                         if t.has_visitor() {
-                            t.populate_par(&p, &state, Some(true));
+                            t.populate_par(&p, Some(true));
                         } else {
-                            t.populate(&p, &state, Some(true));
+                            t.populate(&p, Some(true));
                         }
                     }
 
@@ -56,9 +55,9 @@ pub(super) fn tree_worker(t: Arc<DirTree>, state: ScanState) {
                             t.set_state(TreeState::Active(op));
                         }
                         if t.has_visitor() {
-                            t.populate_par(&p, &state, recursive);
+                            t.populate_par(&p, recursive);
                         } else {
-                            t.populate(&p, &state, recursive);
+                            t.populate(&p, recursive);
                         }
                     }
 
@@ -75,7 +74,7 @@ pub(super) fn tree_worker(t: Arc<DirTree>, state: ScanState) {
                     TreeOp::Update(ref path) => {
                         let p: PathBuf = path.clone();
                         t.set_state(TreeState::Active(op.clone()));
-                        match t.update(p.to_string_lossy().as_ref(), &state, None) {
+                        match t.update(p.to_string_lossy().as_ref(), None) {
                             Ok(stats) => {
                                 let msg: String = format!("Updated: {stats}");
                                 t.add_event(

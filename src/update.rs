@@ -24,7 +24,6 @@ use super::dirtree::{DirTree, ENTRY_BATCH_MIN, MAX_RECURSE_DEPTH};
 use super::event::{TreeEvent, TreeOp};
 use super::hash::DirTreeXxh3Hasher;
 use super::node::{DirTreeHashMap, MaybeNode, Node, NodeType, ctime_stamp};
-use crate::ScanState;
 
 use dirhandle::{DirHandle, EntryExt};
 use timesince::SecondsSinceEpoch;
@@ -139,11 +138,10 @@ impl DirTree {
     Blocking; runs the per-directory diffs in parallel on the rayon
     pool. For the queued (non-blocking) form, see [DirTree::rescan].
     */
-    #[instrument(level = "debug", skip(self, state))]
+    #[instrument(level = "debug", skip(self))]
     pub fn update(
         &self,
         path: &str,
-        state: &ScanState,
         recursive: Option<bool>,
     ) -> Result<UpdateStats, Error> {
         let node: Arc<Node> = self
@@ -172,7 +170,7 @@ impl DirTree {
         let full: PathBuf = node.path(&self.strings);
         let recursive: bool = recursive.unwrap_or(self.conf.recursive());
         let ctr: UpdateCtr = UpdateCtr::default();
-        rayon::scope(|s| self.update_inner(&full, node, state, recursive, &ctr, s, 0));
+        rayon::scope(|s| self.update_inner(&full, node, recursive, &ctr, s, 0));
         let stats: UpdateStats = ctr.snapshot();
         debug!(target: "UPDATE", "{}: {stats}", full.display());
         Ok(stats)
@@ -185,7 +183,6 @@ impl DirTree {
         &'env self,
         path: &PathBuf,
         node: Arc<Node>,
-        state: &'env ScanState,
         recursive: bool,
         ctr: &'env UpdateCtr,
         rs: &rayon::Scope<'env>,
@@ -227,11 +224,11 @@ impl DirTree {
                     let child_p: PathBuf = path.join(self.get_string(name_idx));
                     if frames < MAX_RECURSE_DEPTH {
                         self.update_inner(
-                            &child_p, child, state, recursive, ctr, rs, frames + 1,
+                            &child_p, child, recursive, ctr, rs, frames + 1,
                         );
                     } else {
                         rs.spawn(move |s| {
-                            self.update_inner(&child_p, child, state, recursive, ctr, s, 0)
+                            self.update_inner(&child_p, child, recursive, ctr, s, 0)
                         });
                     }
                 }
@@ -389,11 +386,11 @@ impl DirTree {
                     if is_dir {
                         let child_p: PathBuf = path.join(name_os);
                         self.update_add_dir(
-                            &node, name_idx, disk_ino, child_depth, &child_p, state, recursive,
+                            &node, name_idx, disk_ino, child_depth, &child_p, recursive,
                             ctr,
                         );
                     } else {
-                        self.update_add_file(&node, name_idx, disk_ino, child_depth, state, ctr);
+                        self.update_add_file(&node, name_idx, disk_ino, child_depth, ctr);
                     }
                 }
 
@@ -411,7 +408,7 @@ impl DirTree {
                         }
                         let child_p: PathBuf = path.join(name_os);
                         self.update_add_dir(
-                            &node, name_idx, disk_ino, child_depth, &child_p, state, recursive,
+                            &node, name_idx, disk_ino, child_depth, &child_p, recursive,
                             ctr,
                         );
                     }
@@ -437,12 +434,11 @@ impl DirTree {
                         if is_dir {
                             let child_p: PathBuf = path.join(name_os);
                             self.update_add_dir(
-                                &node, name_idx, disk_ino, child_depth, &child_p, state,
-                                recursive, ctr,
+                                &node, name_idx, disk_ino, child_depth, &child_p, recursive, ctr,
                             );
                         } else {
                             self.update_add_file(
-                                &node, name_idx, disk_ino, child_depth, state, ctr,
+                                &node, name_idx, disk_ino, child_depth, ctr,
                             );
                         }
                     } else if is_dir && recursive {
@@ -451,11 +447,11 @@ impl DirTree {
                         let child: Arc<Node> = existing.clone();
                         if frames < MAX_RECURSE_DEPTH {
                             self.update_inner(
-                                &child_p, child, state, recursive, ctr, rs, frames + 1,
+                                &child_p, child, recursive, ctr, rs, frames + 1,
                             );
                         } else {
                             rs.spawn(move |s| {
-                                self.update_inner(&child_p, child, state, recursive, ctr, s, 0)
+                                self.update_inner(&child_p, child, recursive, ctr, s, 0)
                             });
                         }
                     }
@@ -482,7 +478,6 @@ impl DirTree {
         inode: u64,
         depth: u8,
         child_p: &PathBuf,
-        state: &ScanState,
         recursive: bool,
         ctr: &UpdateCtr,
     ) {
@@ -491,11 +486,11 @@ impl DirTree {
             self.insert_child(parent, name_idx, NodeType::Directory, inode, depth);
         if created {
             ctr.added_dirs.fetch_add(1, Relaxed);
-            state.num_d.inc1();
+            self.conf.observer().dirs_added(1);
         }
         if recursive && child.is_some() {
             // a whole new subtree: full scan instead of a diff
-            self.populate_par(child_p, state, Some(true));
+            self.populate_par(child_p, Some(true));
         }
     }
 
@@ -506,7 +501,6 @@ impl DirTree {
         name_idx: u32,
         inode: u64,
         depth: u8,
-        state: &ScanState,
         ctr: &UpdateCtr,
     ) {
         let mode = self.filemode();
@@ -518,13 +512,13 @@ impl DirTree {
                 self.conf.files_mod(1);
                 self.conf.depth_compare(depth);
                 ctr.added_files.fetch_add(1, Relaxed);
-                state.num_f.inc1();
+                self.conf.observer().files_added(1, 0);
             }
         } else if mode.is_node() {
             let (_, created) = self.insert_child(parent, name_idx, NodeType::File, inode, depth);
             if created {
                 ctr.added_files.fetch_add(1, Relaxed);
-                state.num_f.inc1();
+                self.conf.observer().files_added(1, 0);
             }
         }
     }
