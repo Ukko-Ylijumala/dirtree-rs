@@ -27,6 +27,7 @@ use std::{
     time::Duration,
 };
 use miniutils::{EntryKind, PlannedEntry, Special, TreeSpec};
+use stringstore::UniqueStrStore;
 use tempfile::TempDir;
 
 const TEST_NUM: [u64; 3] = [9, 11, 7];
@@ -959,6 +960,88 @@ fn test_tree_visitor_tags() {
         tree.populate_par(&at(d), Some(true));
     }
     assert_eq!(tagged(&tree), HashSet::from([at("b"), at("c/d")]));
+}
+
+/// A walk with `marker` on a WordPress-like tree; the tagged dirs and the events, by name.
+fn marker_walk(build: impl Fn(&UniqueStrStore) -> Marker) -> (HashSet<String>, Vec<WalkEvent>, TempDir, DirTree) {
+    const TAG: ScopeTag = 3;
+    let temp: TempDir = TempDir::new().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    // site: the real thing; bare: no wp-load.php; fake: only version.php
+    for d in ["site/wp-admin", "site/wp-content/uploads/2026", "bare/wp-includes", "bare/wp-admin"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    for d in ["fake/sub/wp-includes", "linked/wp-admin", "site/wp-includes"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    for f in ["site/wp-includes/version.php", "site/wp-load.php", "fake/sub/wp-includes/version.php"] {
+        write(at(f), b"").unwrap();
+    }
+    write(at("site/wp-content/uploads/2026/x.jpg"), b"").unwrap();
+    write(at("linked/wp-load.php"), b"").unwrap();
+    // a symlink is not the directory a marker asks for
+    symlink(at("site/wp-includes"), at("linked/wp-includes")).unwrap();
+
+    let (tx, rx) = crossbeam::channel::unbounded::<WalkEvent>();
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(temp.path().to_str().unwrap())
+        .with_recursive(true);
+    let marker: Marker = build(tree.strings()).tag(TAG);
+    let tree: DirTree = tree
+        .with_visitor(Arc::new(MarkerVisitor::new().marker(marker)))
+        .with_discovery_sink(tx);
+    tree.walk().unwrap();
+    let base = |p: &Path| -> String {
+        p.strip_prefix(temp.path()).unwrap().to_string_lossy().into_owned()
+    };
+    let tagged: HashSet<String> =
+        tree.tagged(TAG).map(|d: Arc<Directory>| base(&d.path(tree.strings()))).collect();
+    let events: Vec<WalkEvent> = rx.try_iter().collect();
+    let evented: HashSet<String> = events.iter().map(|e: &WalkEvent| base(&e.path)).collect();
+    assert_eq!(tagged, evented);
+    (tagged, events, temp, tree)
+}
+
+#[test]
+fn test_marker_nested_path_claims_root() {
+    let (tagged, events, temp, tree) = marker_walk(|_| {
+        Marker::file_named("wp-includes/version.php")
+            .and_dir("wp-admin")
+            .and_file("wp-load.php")
+            .descend(false)
+    });
+    assert_eq!(tagged, HashSet::from(["site".to_owned()]));
+    assert!(events[0].claimed);
+    // claimed at the root: nothing below it was walked, uploads included
+    let site: Arc<Directory> = tree.get_dir(&encode_os(&temp.path().join("site"))).unwrap();
+    assert!(site.children().read().is_empty());
+}
+
+#[test]
+fn test_marker_names_all_required() {
+    let (tagged, _, _temp, _) = marker_walk(|_| {
+        Marker::dir_named("wp-includes").and_dir("wp-admin").and_file("wp-load.php")
+    });
+    assert_eq!(tagged, HashSet::from(["site".to_owned()]));
+    let (tagged, _, _temp, _) = marker_walk(|_| Marker::dir_named("wp-includes").and_dir("wp-admin"));
+    assert_eq!(tagged, HashSet::from(["site".to_owned(), "bare".to_owned()]));
+}
+
+#[test]
+fn test_marker_parent_target() {
+    // gated: one subdirectory looked into, at the parent's own visit
+    let (tagged, _, temp, tree) = marker_walk(|s: &UniqueStrStore| {
+        Marker::file_named("version.php")
+            .when_parent_is(s.insert("wp-includes"))
+            .target(MarkerTarget::Parent)
+            .descend(false)
+    });
+    assert_eq!(tagged, HashSet::from(["site".to_owned(), "fake/sub".to_owned()]));
+    assert!(tree.get_node(&encode_os(&temp.path().join("site/wp-content"))).is_none());
+    // ungated: every subdirectory looked into
+    let (tagged, _, _temp, _) =
+        marker_walk(|_| Marker::file_named("version.php").target(MarkerTarget::Parent));
+    assert_eq!(tagged, HashSet::from(["site".to_owned(), "fake/sub".to_owned()]));
 }
 
 /// Counts what a [TreeObserver] is told, for [test_tree_observer].

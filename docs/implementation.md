@@ -95,6 +95,7 @@ pub struct WalkContext<'a> {
 pub struct DirContext<'a> {
     pub walk: &'a WalkContext<'a>,
     pub entries: &'a [EntryExt],
+    pub dirfd: BorrowedFd<'a>,  // for type_at(): one fstatat below the dir
 }
 
 pub enum Verdict {
@@ -198,11 +199,18 @@ don't need a custom `Visitor` impl:
   Use case: skip `.git`, `node_modules`, `vendor`, `__pycache__`, `target`,
   `.venv` etc. globally.
 
-- **`MarkerVisitor`** — recognize directories by the presence of a marker
-  file or directory in their entry list. Each marker carries a
-  `ScopeTag`, a `descend: bool`, and an optional `MarkerTarget` (`Self_`
-  vs `Parent`) to distinguish "tag this dir" from "tag the parent of
-  this dir" (the WP `wp-includes/version.php` pattern). Multiple markers
+- **`MarkerVisitor`** — recognize directories by marker entries that
+  must all be present: names in the entry list, or nested paths below
+  the directory (`wp-includes/version.php`, one `fstatat` on the
+  directory's fd, made only when the first component is listed as a
+  directory). Each marker carries a `ScopeTag`, a `descend: bool`, and
+  an optional `MarkerTarget` (`Self_` vs `Parent`) to distinguish "tag
+  this dir" from "tag the parent of the dir holding the entries" (the
+  WP pattern). Every marker is evaluated at the directory it tags,
+  before that directory's subdirectories are walked, so a tag always
+  lands where it belongs and `descend(false)` claims the whole subtree
+  (a `Parent` marker looks one level down to do so: one subdirectory
+  with `when_parent_is`, every subdirectory without). Multiple markers
   can be registered on one visitor; the first match wins.
 
 - **`MaxDepthVisitor`** — enforce a global or per-scope depth cap.
@@ -223,9 +231,9 @@ let visitor = CompositeVisitor::new()
     .add(WpContentPathPruneVisitor::new(strings))   // wp-content/uploads, wp-content/cache
     .add(
         MarkerVisitor::new()
-            .marker(Marker::file_named("version.php")
-                .when_parent_is(strings.insert("wp-includes"))
-                .target(MarkerTarget::Parent)
+            // checked at the WP root itself, so the claim stops the walk there
+            .marker(Marker::file_named("wp-includes/version.php")
+                .and_dir("wp-admin")
                 .tag(TAG_WP_ROOT)
                 .descend(false)),
     );

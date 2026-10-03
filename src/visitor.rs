@@ -24,10 +24,21 @@ per child, prune wins over filter, both veto.
 [`DirTree`]: super::DirTree
 */
 
-use dirhandle::EntryExt;
+use dirhandle::{
+    EntryExt,
+    nix::{
+        dir::Type,
+        fcntl::AtFlags,
+        sys::stat::{SFlag, fstatat},
+    },
+};
 use stringstore::UniqueStrStore;
 
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    os::fd::BorrowedFd,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /**
 User-defined identifier for a recognized subtree kind.
@@ -68,12 +79,44 @@ pub struct WalkContext<'a> {
 Per-call context for [`Visitor::visit_dir`].
 
 Bundles the [`WalkContext`] with the freshly-read dirent list of the
-directory. The slice is borrowed from a `Vec<EntryExt>` collected by
-the walker; do not retain references to it past the `visit_dir` call.
+directory, and the directory's open fd. The slice is borrowed from a
+`Vec<EntryExt>` collected by the walker; do not retain references to it
+past the `visit_dir` call.
 */
+#[derive(Clone, Copy)]
 pub struct DirContext<'a> {
     pub walk: &'a WalkContext<'a>,
     pub entries: &'a [EntryExt<'a>],
+    /// The directory itself, open for `*at()` calls (see [DirContext::type_at]).
+    pub dirfd: BorrowedFd<'a>,
+}
+
+impl DirContext<'_> {
+    /// The entry of this directory named `name` (raw bytes), if listed.
+    pub fn entry(&self, name: &[u8]) -> Option<&EntryExt<'_>> {
+        self.entries.iter().find(|e: &&EntryExt| e.file_name().to_bytes() == name)
+    }
+
+    /**
+    The type of the entry at `rel`, a path relative to this directory
+    such as `wp-includes/version.php`: one `fstatat` on the directory's
+    fd, not following a symlink in the last component. [None] if there
+    is no such entry (or it cannot be reached). For an entry of this
+    directory itself, [DirContext::entry] answers without a syscall.
+    */
+    pub fn type_at(&self, rel: &[u8]) -> Option<Type> {
+        let st = fstatat(self.dirfd, rel, AtFlags::AT_SYMLINK_NOFOLLOW).ok()?;
+        Some(match SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT {
+            SFlag::S_IFDIR => Type::Directory,
+            SFlag::S_IFREG => Type::File,
+            SFlag::S_IFLNK => Type::Symlink,
+            SFlag::S_IFIFO => Type::Fifo,
+            SFlag::S_IFSOCK => Type::Socket,
+            SFlag::S_IFCHR => Type::CharacterDevice,
+            SFlag::S_IFBLK => Type::BlockDevice,
+            _ => return None,
+        })
+    }
 }
 
 /// The visitor's answer for the directory currently being walked.

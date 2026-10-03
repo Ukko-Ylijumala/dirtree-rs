@@ -6,18 +6,21 @@ Built-in [`Visitor`] implementations.
 - [`NamePruneVisitor`] - drop a fixed set of directory names by interned
   `u32` membership. The cheapest universal "skip `.git`/`node_modules`/etc."
   building block.
-- [`MarkerVisitor`] - recognize directories by the presence of a marker
-  file (or directory) in their dirent list. Each marker carries a
-  [`ScopeTag`], optional `new_scope`, optional non-descent, and an
-  optional [`MarkerTarget`] for the "the *parent* is what we recognized"
-  pattern (e.g. WordPress `wp-includes/version.php`).
+- [`MarkerVisitor`] - recognize directories by the presence of marker
+  entries: names in their dirent list, or nested paths below them
+  (`wp-includes/version.php`), all of which must be present. Each
+  marker carries a [`ScopeTag`], optional `new_scope`, optional
+  non-descent (claiming the subtree), and an optional [`MarkerTarget`]
+  for the "the *parent* is what we recognized" pattern.
 - [`MaxDepthVisitor`] - global or per-scope depth cap.
 - [`CompositeVisitor`] - fan out to N visitors and combine their verdicts.
 */
 
+use super::osname::decode_name;
 use super::visitor::*;
+use dirhandle::{EntryExt, nix::dir::Type};
 use stringstore::UniqueStrStore;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 /* ---------------------------------------- */
 /*  NamePruneVisitor                        */
@@ -63,7 +66,7 @@ impl Visitor for NamePruneVisitor {
 /*  MarkerVisitor                           */
 /* ---------------------------------------- */
 
-/// What kind of dirent counts as a marker hit.
+/// What kind of entry counts as a marker hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkerKind {
     File,
@@ -71,15 +74,38 @@ pub enum MarkerKind {
     Either,
 }
 
-/**
-Where the [`WalkEvent`](super::WalkEvent) attaches when a marker matches.
+impl MarkerKind {
+    /// Whether an entry of type `t` (`None`: no such entry) is a hit.
+    #[inline]
+    fn matches(self, t: Option<Type>) -> bool {
+        match (self, t) {
+            (_, None) => false,
+            (Self::File, Some(t)) => t == Type::File,
+            (Self::Dir, Some(t)) => t == Type::Directory,
+            (Self::Either, Some(_)) => true,
+        }
+    }
+}
 
-- [`MarkerTarget::Self_`]: the directory containing the marker is what
-  gets tagged.
-- [`MarkerTarget::Parent`]: the *parent* of the directory containing the
-  marker is what gets tagged. This is the WordPress pattern: detect
-  `version.php` inside `wp-includes`, but the "WP root" is `wp-includes`'s
-  parent.
+/**
+Which directory a marker recognizes, relative to where its entries are.
+
+- [`MarkerTarget::Self_`]: the directory holding the marker entries is
+  the one tagged.
+- [`MarkerTarget::Parent`]: the directory one level *above* them is
+  tagged. This is the WordPress pattern: `version.php` sits in
+  `wp-includes`, but the WP root is `wp-includes`' parent.
+
+A Parent marker is checked at the parent's own visit, by looking one
+level down (one `fstatat` per entry checked), before the parent's
+subdirectories are walked. So the tag lands on the parent, and
+`descend(false)` claims the parent's whole subtree. With
+[`Marker::when_parent_is`] naming the subdirectory, one subdirectory
+is checked; without it, every subdirectory of every directory walked
+is, which costs one `fstatat` per subdirectory.
+
+`Marker::file_named("wp-includes/version.php")` with the default
+target is the same recognition, spelled as a nested path.
 */
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkerTarget {
@@ -87,34 +113,69 @@ pub enum MarkerTarget {
     Parent,
 }
 
-/// One marker rule. Use the builder methods to construct and chain into [`MarkerVisitor::marker`].
+/**
+One entry a [`Marker`] requires: a name in the directory, or a relative
+path below it such as `wp-includes/version.php`. A nested path costs one
+`fstatat`, and only when its first component is listed as a directory.
+Symlinks are not followed in the last component (a symlink is neither
+a file nor a directory here), but are in the ones before it.
+*/
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MarkerEntry {
+    /// Raw bytes, compared with the listed names as they are (no UTF-8 conversion).
+    pub path: Vec<u8>,
+    pub kind: MarkerKind,
+}
+
+impl MarkerEntry {
+    /// Whether this entry is present in the directory of `ctx`, or below
+    /// its subdirectory `sub`, if given (the caller checked `sub` is one).
+    fn present(&self, ctx: &DirContext<'_>, sub: Option<&[u8]>) -> bool {
+        if let Some(sub) = sub {
+            let rel: Vec<u8> = [sub, b"/", &self.path].concat();
+            return self.kind.matches(ctx.type_at(&rel));
+        }
+        match self.path.iter().position(|&b| b == b'/') {
+            None => self
+                .kind
+                .matches(ctx.entry(&self.path).and_then(|e: &EntryExt| e.file_type())),
+            // the first component decides from the listing whether the stat is worth it
+            Some(i) => {
+                ctx.entry(&self.path[..i]).is_some_and(|e: &EntryExt| e.is_dir())
+                    && self.kind.matches(ctx.type_at(&self.path))
+            }
+        }
+    }
+}
+
+/**
+One marker rule: the entries that must all be present, and what to do
+on a match. Use the builder methods to construct and chain into
+[`MarkerVisitor::marker`].
+*/
 #[derive(Clone, Debug)]
 pub struct Marker {
-    /**
-    Raw bytes of the marker entry's basename (no trailing nul).
-    Compared against `EntryExt::file_name().to_bytes()` directly so that
-    no UTF-8 conversion is required.
-    */
-    pub name: Vec<u8>,
-    pub kind: MarkerKind,
+    /// All required, in order (cheap ones first saves stats).
+    pub entries: Vec<MarkerEntry>,
     pub tag: ScopeTag,
     pub new_scope: ScopeTag,
     pub descend: bool,
     pub target: MarkerTarget,
     /**
-    Optional gating: only fire when the parent dir's interned name
-    equals this index. Useful for the WP pattern where you want to
-    detect `version.php` only when in a dir named `wp-includes`.
+    Optional gating on the interned name of the directory holding the
+    marker entries: for [`MarkerTarget::Self_`] the directory being
+    visited, for [`MarkerTarget::Parent`] the subdirectory looked into.
+    Useful for the WP pattern, `version.php` only in a dir named
+    `wp-includes`.
     */
     pub when_parent_is: Option<u32>,
 }
 
 impl Marker {
-    /// A file-named marker. Builder pattern; chain `.tag()`, `.descend()` etc.
-    pub fn file_named(name: &str) -> Self {
+    /// A marker with one required entry of `kind` at `path`.
+    pub fn new(path: &str, kind: MarkerKind) -> Self {
         Self {
-            name: name.as_bytes().to_vec(),
-            kind: MarkerKind::File,
+            entries: vec![MarkerEntry { path: path.as_bytes().to_vec(), kind }],
             tag: 0,
             new_scope: SCOPE_NONE,
             descend: true,
@@ -123,17 +184,31 @@ impl Marker {
         }
     }
 
+    /// A file-named marker. Builder pattern; chain `.tag()`, `.descend()` etc.
+    /// `path` is a name or a relative path (see [`MarkerEntry`]).
+    pub fn file_named(path: &str) -> Self {
+        Self::new(path, MarkerKind::File)
+    }
+
     /// A directory-named marker.
-    pub fn dir_named(name: &str) -> Self {
-        Self {
-            name: name.as_bytes().to_vec(),
-            kind: MarkerKind::Dir,
-            tag: 0,
-            new_scope: SCOPE_NONE,
-            descend: true,
-            target: MarkerTarget::Self_,
-            when_parent_is: None,
-        }
+    pub fn dir_named(path: &str) -> Self {
+        Self::new(path, MarkerKind::Dir)
+    }
+
+    /// Also require an entry of `kind` at `path`.
+    pub fn and(mut self, path: &str, kind: MarkerKind) -> Self {
+        self.entries.push(MarkerEntry { path: path.as_bytes().to_vec(), kind });
+        self
+    }
+
+    /// Also require a file at `path`.
+    pub fn and_file(self, path: &str) -> Self {
+        self.and(path, MarkerKind::File)
+    }
+
+    /// Also require a directory at `path`.
+    pub fn and_dir(self, path: &str) -> Self {
+        self.and(path, MarkerKind::Dir)
     }
 
     pub fn tag(mut self, tag: ScopeTag) -> Self {
@@ -156,10 +231,36 @@ impl Marker {
         self
     }
 
-    /// Gate this marker on the parent directory's interned name.
+    /// Gate this marker on the name of the directory holding its entries.
     pub fn when_parent_is(mut self, parent_name_idx: u32) -> Self {
         self.when_parent_is = Some(parent_name_idx);
         self
+    }
+
+    /// Whether all the entries are present in the directory of `ctx` (or below `sub`).
+    fn present(&self, ctx: &DirContext<'_>, sub: Option<&[u8]>) -> bool {
+        self.entries.iter().all(|e: &MarkerEntry| e.present(ctx, sub))
+    }
+
+    /// Whether this marker recognizes the directory of `ctx`.
+    fn matches(&self, ctx: &DirContext<'_>) -> bool {
+        match (self.target, self.when_parent_is) {
+            (MarkerTarget::Self_, Some(gate)) if ctx.walk.name_idx != gate => false,
+            (MarkerTarget::Self_, _) => self.present(ctx, None),
+            (MarkerTarget::Parent, Some(gate)) => {
+                let Ok(name) = ctx.walk.strings.get(gate) else {
+                    return false;
+                };
+                let name: Cow<[u8]> = decode_name(name);
+                ctx.entry(&name).is_some_and(|e: &EntryExt| e.is_dir())
+                    && self.present(ctx, Some(&name))
+            }
+            (MarkerTarget::Parent, None) => ctx
+                .entries
+                .iter()
+                .filter(|e: &&EntryExt| e.is_dir())
+                .any(|e: &EntryExt| self.present(ctx, Some(e.file_name().to_bytes()))),
+        }
     }
 }
 
@@ -182,57 +283,14 @@ impl MarkerVisitor {
 
 impl Visitor for MarkerVisitor {
     fn visit_dir(&self, ctx: DirContext<'_>) -> Verdict {
-        for m in &self.markers {
-            if let Some(p) = m.when_parent_is {
-                /*
-                Gate: only consider this marker when the *current dir's
-                own name* (which is the parent of the entries we're
-                scanning) matches. So we test ctx.walk.name_idx, not the
-                grandparent. The naming "when_parent_is" reflects the
-                marker's perspective - the marker is a child entry, and
-                its parent is `ctx.walk`.
-                */
-                if ctx.walk.name_idx != p {
-                    continue;
-                }
-            }
-            let hit = ctx.entries.iter().any(|e| {
-                if e.file_name().to_bytes() != m.name.as_slice() {
-                    return false;
-                }
-                match m.kind {
-                    MarkerKind::File => e.is_file(),
-                    MarkerKind::Dir => e.is_dir(),
-                    MarkerKind::Either => true,
-                }
-            });
-            if !hit {
-                continue;
-            }
-            /*
-            Build the verdict. MarkerTarget::Parent is handled by the
-            walker (it adjusts where the WalkEvent's path attaches);
-            here we just signal the tag. To make the walker's job
-            straightforward we encode "target=Parent" by setting
-            descend=false (the matching dir is owned by the marker
-            logic) and the walker emits the parent's path.
-
-            For simplicity in v1: visit_dir cannot directly retarget
-            the path. We emit the matching dir's path; if the caller
-            needs the parent, they can `Path::parent()` on the receiver
-            side. This keeps the walker's emit logic uniform.
-
-            A future revision can extend Verdict with an explicit
-            PathTarget if needed.
-            */
-            let _ = m.target; // currently informational; consumer-side concern
-            return Verdict::Tag {
+        match self.markers.iter().find(|m: &&Marker| m.matches(&ctx)) {
+            Some(m) => Verdict::Tag {
                 tag: m.tag,
                 new_scope: m.new_scope,
                 descend: m.descend,
-            };
+            },
+            None => Verdict::Continue,
         }
-        Verdict::Continue
     }
 }
 
@@ -308,8 +366,7 @@ impl Visitor for CompositeVisitor {
         let mut acc = Verdict::Continue;
         for v in &self.inner {
             // Each inner visitor sees a fresh DirContext copy.
-            let dctx = DirContext { walk: ctx.walk, entries: ctx.entries };
-            acc = acc.combine(v.visit_dir(dctx));
+            acc = acc.combine(v.visit_dir(ctx));
         }
         acc
     }

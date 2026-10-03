@@ -851,6 +851,7 @@ impl DirTree {
             let verdict = v.visit_dir(DirContext {
                 walk: &walk_ctx,
                 entries: &entries,
+                dirfd,
             });
             // a rescan refreshes the tag: a marker may have come or gone
             node.set_tag(match verdict {
