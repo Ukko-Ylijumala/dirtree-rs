@@ -123,6 +123,21 @@ every `FileEntry`. That would cost about 100 MB on a 4.6M-file host.
 Both consumers need stat data only for candidates, and the per-file
 hook (#5) can stat them lazily.
 
+## Status
+
+Gaps 1–3 were fixed before the split:
+
+1. Lossless names: `src/tree/osname.rs`. Names are interned with
+   non-UTF-8 bytes as private-use escapes, the same scheme the malware
+   scanner uses for its path strings.
+2. Markers: every marker is evaluated at the directory it tags.
+   Markers take several required entries and nested paths, `Parent`
+   looks one level down, and `descend(false)` claims the subtree.
+3. Faults: `TreeObserver::fault(&TreeFault)` receives a `FaultKind`,
+   the exact path and the errno for every hole: a directory not opened
+   or not fully listed, an entry not stat'ed, a symlink target not
+   read, a directory not watched, or events lost.
+
 ## Scale
 
 On synthetic trees where every name is unique, the tree costs about

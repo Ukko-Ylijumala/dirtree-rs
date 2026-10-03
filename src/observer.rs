@@ -5,6 +5,7 @@
 without the tree knowing who listens (a progress bar, a log, nothing).
 */
 
+use super::event::TreeFault;
 use std::fmt::Debug;
 
 /// Used while no observer is set, so callers need no `Option` check.
@@ -28,6 +29,13 @@ pub trait TreeObserver: Send + Sync + Debug {
 
     /// `n` special files (symlinks, FIFOs, sockets, devices) were attached.
     fn specials_added(&self, _n: u64) {}
+
+    /**
+    Something could not be seen or done (see [FaultKind](super::FaultKind)).
+    Called once per fault, from whichever thread hit it, including the
+    repeated ones the log does not keep.
+    */
+    fn fault(&self, _fault: &TreeFault) {}
 }
 
 /// The default observer: no progress reporting.

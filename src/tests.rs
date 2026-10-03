@@ -1087,6 +1087,66 @@ fn test_tree_observer() {
     }
 }
 
+/// Collects the faults a [TreeObserver] is told of, for [test_tree_faults].
+#[derive(Debug, Default)]
+struct FaultObserver {
+    faults: Mutex<Vec<TreeFault>>,
+}
+
+impl TreeObserver for FaultObserver {
+    fn fault(&self, fault: &TreeFault) {
+        self.faults.lock().push(fault.clone());
+    }
+}
+
+/// Set the permission bits of `path`.
+fn chmod(path: &Path, mode: u32) {
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn test_tree_faults() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    // not UTF-8 either: the fault carries the exact path
+    let locked: PathBuf = temp.path().join(OsStr::from_bytes(b"lock\xe9d"));
+    std::fs::create_dir_all(locked.join("inner")).unwrap();
+    std::fs::create_dir(temp.path().join("open")).unwrap();
+    let denied = TreeFault { kind: FaultKind::OpenDir, path: Some(locked.clone()), errno: Some(libc::EACCES) };
+
+    // both walkers: the directory they cannot list is a fault, once
+    for sync in [false, true] {
+        let obs: Arc<FaultObserver> = Arc::new(FaultObserver::default());
+        let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+            .from_path(dir)
+            .with_recursive(true)
+            .with_sync(sync)
+            .with_observer(obs.clone());
+        chmod(&locked, 0o000);
+        tree.walk().unwrap();
+        chmod(&locked, 0o755);
+        assert_eq!(*obs.faults.lock(), vec![denied.clone()], "sync {sync}");
+        assert_eq!(tree.conf().errors(), 1, "sync {sync}");
+    }
+
+    // the diff-rescan too, and a stat of a path that is not there
+    let obs: Arc<FaultObserver> = Arc::new(FaultObserver::default());
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_observer(obs.clone());
+    tree.walk().unwrap();
+    chmod(&locked, 0o000);
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    chmod(&locked, 0o755);
+    assert_eq!(stats.errors, 1, "{stats}");
+    let gone: PathBuf = temp.path().join("gone");
+    tree.insert_dir(&gone, None);
+    let stat = TreeFault { kind: FaultKind::Stat, path: Some(gone), errno: Some(libc::ENOENT) };
+    assert_eq!(*obs.faults.lock(), vec![denied, stat]);
+    assert_eq!(tree.conf().errors(), 2);
+}
+
 #[test]
 fn test_tree_rescan_via_worker() {
     let temp: TempDir = TempDir::new().unwrap();

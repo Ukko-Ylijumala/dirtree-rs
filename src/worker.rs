@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
 use super::dirtree::DirTree;
-use super::event::{TreeEvent, TreeOp, TreeState};
+use super::event::{FaultKind, TreeEvent, TreeOp, TreeState};
 use super::osname::encode_os;
 use std::{hint, path::PathBuf, sync::Weak, thread, time::Duration};
 
@@ -99,7 +99,11 @@ fn worker_round(t: &DirTree, spin_ctr: &mut u8) -> Round {
                             );
                         }
                         Err(e) => {
-                            t.add_error(TreeEvent::error(&e.to_string(), &op));
+                            t.add_error(
+                                TreeEvent::error(FaultKind::Tree, &e.to_string())
+                                    .path(encode_os(&p).as_ref())
+                                    .op(&op),
+                            );
                         }
                     }
                 }

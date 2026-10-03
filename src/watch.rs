@@ -44,7 +44,7 @@ v1 caveats (deliberate, recorded for the future crate split):
 use super::dirtree::DirTree;
 use super::conf::ListHook;
 use super::error::TreeError;
-use super::event::{TreeEvent, TreeOp, TreeState};
+use super::event::{FaultKind, TreeEvent, TreeOp, TreeState};
 use super::conf::NodeCounts;
 use super::dirtree::NewChild;
 use super::node::{Child, Directory, FileEntry, FileKind, NodeView};
@@ -279,14 +279,16 @@ impl TreeWatcher {
             unsafe { libc::inotify_add_watch(self.ino_fd.as_raw_fd(), cpath.as_ptr(), DIR_MASK) };
         if wd < 0 {
             let e: io::Error = io::Error::last_os_error();
+            let ev: TreeEvent = TreeEvent::error(FaultKind::Watch, &format!("inotify watch failed: {e}"))
+                .path(encode_os(&path).as_ref())
+                .io(&e);
             if self.failed.fetch_add(1, Relaxed) == 0 {
-                // report the first failure loudly; the rest just count
+                // log the first failure loudly; the rest are only counted and reported
                 warn!("inotify watch failed for {}: {e} (see fs.inotify.max_user_watches)",
                     path.display());
-                self.tree.add_error(
-                    TreeEvent::new(&format!("inotify watch failed: {e}"))
-                        .path(encode_os(&path).as_ref()),
-                );
+                self.tree.add_error(ev);
+            } else {
+                self.tree.add_fault(&ev);
             }
             return;
         }
@@ -418,10 +420,11 @@ impl TreeWatcher {
                 debug!(target: "WATCH_MV", "{} resynced: {stats}", path.display());
                 self.sweep_dead_watches();
             }
-            Err(e) => self.tree.add_error(TreeEvent::error(
-                &format!("Moved subtree resync failed: {e}"),
-                &TreeOp::Update(path.to_path_buf()),
-            )),
+            Err(e) => self.tree.add_error(
+                TreeEvent::error(FaultKind::WatchLost, &format!("Moved subtree resync failed: {e}"))
+                    .path(path_str.as_ref())
+                    .op(&TreeOp::Update(path.to_path_buf())),
+            ),
         }
     }
 
@@ -462,7 +465,8 @@ impl TreeWatcher {
             directories are re-established by re-walking the tree -
             re-adding an existing watch is idempotent.
             */
-            let ev: TreeEvent = TreeEvent::new("inotify queue overflow, resyncing tree");
+            let ev: TreeEvent = TreeEvent::error(FaultKind::WatchLost, "inotify queue overflow, resyncing tree")
+                .path(encode_os(&self.root).as_ref());
             error!("{ev:?}");
             self.tree.add_error(ev.clone());
             self.tree.set_state(TreeState::Inconsistent(ev));
@@ -481,10 +485,11 @@ impl TreeWatcher {
                 }
                 Err(e) => {
                     // stays Inconsistent - the consumer must intervene
-                    self.tree.add_error(TreeEvent::error(
-                        &format!("Overflow resync failed: {e}"),
-                        &TreeOp::Update(self.root.clone()),
-                    ));
+                    self.tree.add_error(
+                        TreeEvent::error(FaultKind::WatchLost, &format!("Overflow resync failed: {e}"))
+                            .path(from_str.as_ref())
+                            .op(&TreeOp::Update(self.root.clone())),
+                    );
                 }
             }
             return;
@@ -536,7 +541,7 @@ impl TreeWatcher {
 
         if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
             if dir_path == self.root {
-                let ev: TreeEvent = TreeEvent::new("Tree root was removed or moved")
+                let ev: TreeEvent = TreeEvent::error(FaultKind::WatchLost, "Tree root was removed or moved")
                     .path(encode_os(&dir_path).as_ref());
                 error!("{ev:?}");
                 self.tree.add_error(ev.clone());
@@ -778,7 +783,7 @@ impl TreeWatcher {
             match self.tree.graft_subtree(parent, idx, &child, depth) {
                 Some(new_root) => self.watch_subtree(&new_root),
                 None => self.tree.add_error(
-                    TreeEvent::new("Moved directory has no place to go to")
+                    TreeEvent::error(FaultKind::Tree, "Moved directory has no place to go to")
                         .path(encode_os(&full).as_ref()),
                 ),
             }

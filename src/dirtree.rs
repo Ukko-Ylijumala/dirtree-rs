@@ -2,7 +2,7 @@
 
 use super::conf::{NodeCounts, TreeConf};
 use super::error::{TreeError, TreeResult};
-use super::event::{TreeEvent, TreeOp, TreeState};
+use super::event::{FaultKind, TreeEvent, TreeOp, TreeState};
 use super::node::{Child, Directory, FileEntry, FileKind, NodeIter, NodeRef, NodeView};
 use super::observer::TreeObserver;
 use super::osname::{decode_path, encode_os};
@@ -208,7 +208,7 @@ impl DirTree {
             // non-blocking, so it cannot fail
             let _ = self.quit_worker(false);
         } else if state == TreeState::Ready && self.has_work() {
-            self.add_error(TreeEvent::new("Work queue not empty, cannot set state::Ready"));
+            self.add_error(TreeEvent::error(FaultKind::Tree, "Work queue not empty, cannot set state::Ready"));
             return;
         }
 
@@ -232,11 +232,26 @@ impl DirTree {
         events.push_back(event);
     }
 
-    /// Add an error event to the event log and increase the error count.
+    /**
+    Add an error event to the event log, increase the error count and
+    tell the observer of the fault. Every error has a [FaultKind] (see
+    [TreeEvent::error]).
+    */
     pub(super) fn add_error(&self, event: TreeEvent) {
         error!("{event:?}");
+        self.add_fault(&event);
         self.add_event(event);
+    }
+
+    /**
+    [DirTree::add_error] without the log line and the event log entry:
+    for a fault that repeats en masse (a watch limit hit), counted and
+    reported to the observer each time, but logged only once.
+    */
+    pub(super) fn add_fault(&self, event: &TreeEvent) {
+        debug_assert!(event.fault.is_some(), "an error event without a FaultKind: {event:?}");
         self.conf.errors_inc();
+        self.conf.observer().fault(&event.to_fault());
     }
 
     /// Whether the tree's workqueue is empty.
@@ -316,7 +331,7 @@ impl DirTree {
                 state => state,
             }),
             Err(ref e) => {
-                let ev: TreeEvent = TreeEvent::new(&e.to_string());
+                let ev: TreeEvent = TreeEvent::error(FaultKind::Worker, &e.to_string());
                 self.add_error(ev.clone());
                 // the state the worker died in; Active = an op half-applied
                 if self.active_op().is_some() {
@@ -581,7 +596,19 @@ impl DirTree {
         trace!(target: "get_entries", "{}", path.display());
         match path.read_dir() {
             Ok(entries) => {
-                entries.filter_map(Result::ok).for_each(|entry: DirEntry| {
+                entries.for_each(|entry: Result<DirEntry, Error>| {
+                    let entry: DirEntry = match entry {
+                        Ok(entry) => entry,
+                        Err(e) => {
+                            self.add_error(
+                                TreeEvent::error(FaultKind::ReadDir, &format!("readdir failed: {e}"))
+                                    .path(&encode_os(path))
+                                    .io(&e)
+                                    .op(&TreeOp::Scan(path.to_path_buf(), recursive)),
+                            );
+                            return;
+                        }
+                    };
                     let name = entry.file_name();
                     let path: PathBuf = entry.path();
                     match entry.file_type() {
@@ -613,10 +640,12 @@ impl DirTree {
                                         }
                                         // likely deleted between readdir and stat
                                         Err(e) => {
-                                            self.add_error(TreeEvent::error(
-                                                &e.to_string(),
-                                                &TreeOp::Scan(path.to_path_buf(), recursive),
-                                            ));
+                                            self.add_error(
+                                                TreeEvent::error(FaultKind::Stat, &e.to_string())
+                                                    .path(&encode_os(&path))
+                                                    .io(&e)
+                                                    .op(&TreeOp::Scan(path.to_path_buf(), recursive)),
+                                            );
                                             return;
                                         }
                                     }
@@ -635,20 +664,24 @@ impl DirTree {
                             }
                         }
                         Err(e) => {
-                            self.add_error(TreeEvent::error(
-                                &e.to_string(),
-                                &TreeOp::Scan(path.to_path_buf(), recursive),
-                            ));
+                            self.add_error(
+                                TreeEvent::error(FaultKind::Stat, &e.to_string())
+                                    .path(&encode_os(&path))
+                                    .io(&e)
+                                    .op(&TreeOp::Scan(path.to_path_buf(), recursive)),
+                            );
                             debug!("Error with {}: {e}", path.display());
                         }
                     }
                 })
             }
             Err(e) => {
-                self.add_error(TreeEvent::error(
-                    &e.to_string(),
-                    &TreeOp::Scan(path.to_path_buf(), recursive),
-                ));
+                self.add_error(
+                    TreeEvent::error(FaultKind::OpenDir, &e.to_string())
+                        .path(&encode_os(path))
+                        .io(&e)
+                        .op(&TreeOp::Scan(path.to_path_buf(), recursive)),
+                );
                 debug!(target: "ERROR", "Cannot read directory {}: {e}", path.display());
             }
         };
@@ -682,10 +715,11 @@ impl DirTree {
                     Some(n) => n,
                     // also when a file occupies the path
                     None => {
-                        self.add_error(TreeEvent::error(
-                            &format!("Cannot resolve walk root as a directory: {}", path.display()),
-                            &TreeOp::Scan(path.clone(), recursive),
-                        ));
+                        self.add_error(
+                            TreeEvent::error(FaultKind::Tree, "Cannot resolve walk root as a directory")
+                                .path(&path_str)
+                                .op(&TreeOp::Scan(path.clone(), recursive)),
+                        );
                         return;
                     }
                 }
@@ -791,7 +825,12 @@ impl DirTree {
         let mut handle: DirHandle = match handle {
             Ok(h) => h,
             Err(e) => {
-                self.add_error(TreeEvent::error(&e.to_string(), &op));
+                self.add_error(
+                    TreeEvent::error(FaultKind::OpenDir, &e.to_string())
+                        .path(&encode_os(path))
+                        .io(&e)
+                        .op(&op),
+                );
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
                 return;
             }
@@ -831,10 +870,12 @@ impl DirTree {
         let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
         if let Some(e) = iter.error() {
-            self.add_error(TreeEvent::error(
-                &format!("readdir failed, listing incomplete: {e}"),
-                &op,
-            ));
+            self.add_error(
+                TreeEvent::error(FaultKind::ReadDir, &format!("readdir failed, listing incomplete: {e}"))
+                    .path(&encode_os(path))
+                    .errno(e as i32)
+                    .op(&op),
+            );
         }
         drop(iter);
         let mut scope_for_children: ScopeTag = walk.scope;
@@ -994,10 +1035,11 @@ impl DirTree {
         self.conf.observer().dirs_added(1);
         let Child::Dir(child_node) = child else {
             // a file recorded under this name (replaced since) blocks the slot
-            self.add_error(TreeEvent::error(
-                &format!("Cannot attach directory node: {:?}", name_os),
-                op,
-            ));
+            self.add_error(
+                TreeEvent::error(FaultKind::Tree, "Cannot attach directory node")
+                    .path(&encode_os(&parent_path.join(name_os)))
+                    .op(op),
+            );
             return;
         };
         if !parent_walk.recursive {
@@ -1094,9 +1136,10 @@ impl DirTree {
 
         for entry in batch {
             let Some(entry_t) = entry.file_type() else {
+                // no d_type, and the fstatat for it failed
                 let entry_p: PathBuf = parent_path.join(OsStr::from_bytes(entry.name_as_bytes()));
-                self.add_event(
-                    TreeEvent::new("Unknown entry type")
+                self.add_error(
+                    TreeEvent::error(FaultKind::Stat, "Unknown entry type")
                         .path(&encode_os(&entry_p))
                         .op(op),
                 );
@@ -1141,7 +1184,7 @@ impl DirTree {
                 continue;
             }
             let target: Option<u32> = match kind {
-                FileKind::Symlink => self.link_target_at(dirfd, entry.file_name()),
+                FileKind::Symlink => self.link_target_at(dirfd, parent_path, entry.file_name()),
                 _ => None,
             };
             let file: FileEntry = FileEntry::new(entry.ino(), kind, target);
@@ -1229,14 +1272,20 @@ impl DirTree {
     }
 
     /**
-    The interned target of the symlink `name` in the directory `dirfd`,
-    or [None] if it cannot be read (e.g. removed since it was listed).
+    The interned target of the symlink `name` in the directory `dirfd`
+    (at `parent`), or [None] if it cannot be read (e.g. removed since it
+    was listed), which is a [FaultKind::ReadLink].
     */
-    pub(super) fn link_target_at(&self, dirfd: BorrowedFd<'_>, name: &CStr) -> Option<u32> {
+    pub(super) fn link_target_at(&self, dirfd: BorrowedFd<'_>, parent: &Path, name: &CStr) -> Option<u32> {
         match readlinkat(dirfd, name) {
             Ok(target) => Some(self.strings.insert(encode_os(&target))),
             Err(e) => {
-                debug!(target: "WARN", "Cannot read symlink {name:?}: {e}");
+                let path: PathBuf = parent.join(OsStr::from_bytes(name.to_bytes()));
+                self.add_error(
+                    TreeEvent::error(FaultKind::ReadLink, &format!("Cannot read symlink: {e}"))
+                        .path(&encode_os(&path))
+                        .errno(e as i32),
+                );
                 None
             }
         }
@@ -1247,7 +1296,11 @@ impl DirTree {
         match read_link(path) {
             Ok(target) => Some(self.strings.insert(encode_os(&target))),
             Err(e) => {
-                debug!(target: "WARN", "Cannot read symlink {}: {e}", path.display());
+                self.add_error(
+                    TreeEvent::error(FaultKind::ReadLink, &format!("Cannot read symlink: {e}"))
+                        .path(&encode_os(path))
+                        .io(&e),
+                );
                 None
             }
         }
@@ -1287,8 +1340,12 @@ impl DirTree {
             None => match metadata(path) {
                 Ok(meta) => meta.ino(),
                 Err(e) => {
-                    let msg: String = format!("Cannot stat {}: {e}", path.display());
-                    self.add_error(TreeEvent::error(&msg, &TreeOp::Insert));
+                    self.add_error(
+                        TreeEvent::error(FaultKind::Stat, &format!("Cannot stat: {e}"))
+                            .path(&encode_os(path))
+                            .io(&e)
+                            .op(&TreeOp::Insert),
+                    );
                     return;
                 }
             },
@@ -1357,10 +1414,11 @@ impl DirTree {
                 Child::Dir(dir) => dir,
                 Child::File(_) => {
                     // a file occupies this path component
-                    self.add_error(TreeEvent::error(
-                        &format!("Not a directory at depth {depth}/{len}: {}", path.display()),
-                        &TreeOp::Insert,
-                    ));
+                    self.add_error(
+                        TreeEvent::error(FaultKind::Tree, &format!("Not a directory at depth {depth}/{len}"))
+                            .path(&encode_os(path))
+                            .op(&TreeOp::Insert),
+                    );
                     return;
                 }
             };
@@ -1380,13 +1438,13 @@ impl DirTree {
             Some(node) => {
                 if node.as_dir().is_some_and(|dir| dir.is_root()) {
                     let msg: &str = "Cannot remove root node";
-                    self.add_error(TreeEvent::error(msg, &op));
+                    self.add_error(TreeEvent::error(FaultKind::Tree, msg).path(path).op(&op));
                     return Err(Error::new(ErrorKind::InvalidInput, msg));
                 };
 
                 let Some(parent) = node.parent() else {
                     let msg: String = format!("Stale parent reference: {path:?}");
-                    self.add_error(TreeEvent::error(&msg, &op).node(node));
+                    self.add_error(TreeEvent::error(FaultKind::Tree, &msg).path(path).op(&op).node(node));
                     return Err(Error::new(ErrorKind::NotFound, msg));
                 };
                 debug!(target: "REMOVE_NODE", "{path:?}");
@@ -1395,7 +1453,7 @@ impl DirTree {
                 if counts.is_empty() {
                     // removed (or replaced) concurrently since the lookup
                     let msg: String = format!("Node detached during removal: {path:?}");
-                    self.add_error(TreeEvent::error(&msg, &op).node(node));
+                    self.add_error(TreeEvent::error(FaultKind::Tree, &msg).path(path).op(&op).node(node));
                     return Err(Error::new(ErrorKind::NotFound, msg));
                 }
                 Ok(Some(counts))

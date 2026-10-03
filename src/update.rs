@@ -21,7 +21,7 @@ there; adds and removes still work.
 */
 
 use super::dirtree::{DirTree, ENTRY_BATCH_MIN, MAX_RECURSE_DEPTH};
-use super::event::{TreeEvent, TreeOp};
+use super::event::{FaultKind, TreeEvent, TreeOp};
 use super::hash::DirTreeXxh3Hasher;
 use super::conf::NodeCounts;
 use super::dirtree::NewChild;
@@ -277,7 +277,12 @@ impl DirTree {
                     return;
                 }
                 ctr.errors.fetch_add(1, Relaxed);
-                self.add_error(TreeEvent::error(&e.to_string(), &op));
+                self.add_error(
+                    TreeEvent::error(FaultKind::OpenDir, &e.to_string())
+                        .path(&encode_os(path))
+                        .io(&e)
+                        .op(&op),
+                );
                 return;
             }
         };
@@ -316,10 +321,12 @@ impl DirTree {
             for good. Leave the tree (and the baseline) as they are.
             */
             ctr.errors.fetch_add(1, Relaxed);
-            self.add_error(TreeEvent::error(
-                &format!("readdir failed, listing incomplete: {e}"),
-                &op,
-            ));
+            self.add_error(
+                TreeEvent::error(FaultKind::ReadDir, &format!("readdir failed, listing incomplete: {e}"))
+                    .path(&encode_os(path))
+                    .errno(e as i32)
+                    .op(&op),
+            );
             return;
         }
         drop(iter);
@@ -383,7 +390,7 @@ impl DirTree {
             let leaf = || -> FileEntry {
                 let kind: FileKind = entry.file_type().and_then(FileKind::from_type).unwrap_or_default();
                 let target: Option<u32> = match kind {
-                    FileKind::Symlink => self.link_target_at(dirfd, entry.file_name()),
+                    FileKind::Symlink => self.link_target_at(dirfd, path, entry.file_name()),
                     _ => None,
                 };
                 FileEntry::new(disk_ino, kind, target)

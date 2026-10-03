@@ -1,9 +1,11 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
 use super::node::NodeRef;
+use super::osname::decode_path;
 use miniutils::{ToDebug, ToDisplay};
 use std::{
     fmt::{self, Debug, Display, Formatter},
+    io,
     path::PathBuf,
 };
 use timesince::TimeSinceEpoch;
@@ -92,14 +94,65 @@ impl Display for EventInfo {
     }
 }
 
+/**
+What a [TreeFault] is about. The first five are holes in what the tree
+holds of the filesystem; a consumer that reports its coverage counts
+them. An `errno` of `ENOENT` on one of them means the entry vanished
+while being handled (churn) rather than that it could not be seen.
+*/
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "size_of", derive(SizeOf))]
+#[non_exhaustive]
+pub enum FaultKind {
+    /// A directory could not be opened to be listed: its entries are missing.
+    OpenDir,
+    /// Listing a directory failed part-way: some of its entries are missing.
+    ReadDir,
+    /// An entry (or a path given to the tree) could not be stat'ed: it was skipped.
+    Stat,
+    /// A symlink's target could not be read: the entry is kept without one.
+    ReadLink,
+    /// The watcher could not watch a directory: changes in it go unseen.
+    Watch,
+    /**
+    The watcher lost track: its event queue overflowed, its root went
+    away, or a resync failed. Changes may have been missed.
+    */
+    WatchLost,
+    /// The tree's own structure got in the way (a path not in the tree, a slot taken by another kind of entry...).
+    Tree,
+    /// The background worker thread panicked.
+    Worker,
+}
+
+/**
+A fault, as a [TreeObserver](super::TreeObserver) is told of it: what,
+where, and the OS error if a syscall failed. Each fault also counts in
+[TreeConf::errors](super::TreeConf::errors), and the event log holds
+the latest ones as [TreeEvent]s.
+*/
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TreeFault {
+    pub kind: FaultKind,
+    /// The filesystem path concerned (exact bytes); [None] when not about one.
+    pub path: Option<PathBuf>,
+    /// The OS error number, when a syscall failed.
+    pub errno: Option<i32>,
+}
+
 /// A [DirTree](super::DirTree) event. Could be an error, warning, or just a notice.
 #[derive(Default, Clone, Hash, PartialEq)]
 #[cfg_attr(feature = "size_of", derive(SizeOf))]
 pub struct TreeEvent {
     pub info: EventInfo,
     pub oper: Option<TreeOp>,
+    /// Encoded (see [encode_name](super::encode_name)).
     pub path: Option<String>,
     pub node: Option<NodeRef>,
+    /// Set on errors: what the fault is about.
+    pub fault: Option<FaultKind>,
+    /// Set on errors from a failed syscall.
+    pub errno: Option<i32>,
     #[cfg_attr(feature = "size_of", size_of(skip))]
     pub when: TimeSinceEpoch,
 }
@@ -150,12 +203,33 @@ impl TreeEvent {
         }
     }
 
-    /// Create an error event.
-    pub(super) fn error(msg: &str, op: &TreeOp) -> Self {
+    /// Create an error event of `kind`; chain `path()`, `io()` and `op()` for the details.
+    pub(super) fn error(kind: FaultKind, msg: &str) -> Self {
         Self {
             info: EventInfo::err_from(&format!("ERROR: {msg}")),
-            oper: Some(op.to_owned()),
+            fault: Some(kind),
             ..Default::default()
+        }
+    }
+
+    /// Specify the OS error the event comes from, if it has one.
+    pub(super) fn io(mut self, e: &io::Error) -> Self {
+        self.errno = e.raw_os_error();
+        self
+    }
+
+    /// Specify the OS error number the event comes from.
+    pub(super) fn errno(mut self, errno: i32) -> Self {
+        self.errno = Some(errno);
+        self
+    }
+
+    /// The [TreeFault] of an error event ([FaultKind::Tree] if it has no kind).
+    pub fn to_fault(&self) -> TreeFault {
+        TreeFault {
+            kind: self.fault.unwrap_or(FaultKind::Tree),
+            path: self.path.as_deref().map(decode_path),
+            errno: self.errno,
         }
     }
 }
@@ -163,6 +237,12 @@ impl TreeEvent {
 impl Debug for TreeEvent {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let mut msg: String = format!("{} UTC: {}", self.when.to_display(), self.info);
+        if let Some(kind) = &self.fault {
+            msg.push_str(&format!(", fault: {kind:?}"));
+        }
+        if let Some(errno) = &self.errno {
+            msg.push_str(&format!(", errno: {errno}"));
+        }
         if let Some(op) = &self.oper {
             msg.push_str(&format!(", oper: {}", op.to_debug()));
         }

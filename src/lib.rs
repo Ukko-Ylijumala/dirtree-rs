@@ -49,7 +49,7 @@ pub use conf::{NodeCounts, TreeConf};
 pub use debug::{tree_print_debug, tree_validate_counts};
 pub use dirtree::{DirTree, DirTreeIterator};
 pub use error::{TreeError, TreeResult};
-pub use event::{EventInfo, TreeEvent, TreeOp, TreeState};
+pub use event::{EventInfo, FaultKind, TreeEvent, TreeFault, TreeOp, TreeState};
 pub use filemode::FileMode;
 pub use filters::Filters;
 pub use hash::DirTreeXxh3Hasher;
