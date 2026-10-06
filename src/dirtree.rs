@@ -1089,19 +1089,26 @@ impl DirTree {
     }
 
     /**
-    One batch of non-directory entries for the parallel walker. Pruning,
-    filtering and entry construction run lock-free; the survivors are then
-    stored in `parent_node`'s map under a single write lock, and
-    the shared counters are bumped once per batch instead of once per
-    entry - with per-entry updates, the global `Counter` mutexes and the
-    parent's map lock were contended by every worker at once.
+    One batch of non-directory entries for the parallel walker, in two
+    passes. The first sorts out entries of undeterminable type (reported
+    as faults) and those the name filters reject; the second interns the
+    survivors' names with one `insert_many` call, lets the visitor prune
+    them by name index, and builds their entries. Every new name takes
+    stringstore's writer mutex, and with a mutex round per name the
+    handoffs between workers dominated the walk of a tree of unique file
+    names (it got slower past 4 workers). Names are interned only when
+    something needs them: the visitor, or storing the files.
+
+    The survivors are then stored in `parent_node`'s map under a single
+    write lock, and the shared counters are bumped once per batch instead
+    of once per entry - with per-entry updates, the global `Counter`
+    mutexes and the parent's map lock were contended by every worker at
+    once.
 
     Special files are recorded with their [FileKind] and counted apart
     from regular files; a symlink's target is read through `dirfd`, the
-    directory being listed. Entries of undeterminable type are reported
-    as events. No paths are constructed, and nothing is allocated per
-    file: the interned name and the inode from the dirent are all a
-    [FileEntry] needs.
+    directory being listed. No paths are constructed: the interned name
+    and the inode from the dirent are all a [FileEntry] needs.
     */
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -1117,22 +1124,11 @@ impl DirTree {
     ) {
         let store: bool = self.filemode().is_node();
         let with_size: bool = self.filemode().is_with_size();
-        let mut children: Vec<(u32, Child)> = Vec::with_capacity(batch.len());
-        /*
-        Names still to intern, with their inodes and kinds: interned
-        together after the loop. Every new name takes stringstore's writer
-        mutex, and with a mutex round per name the handoffs between workers
-        dominated the walk of a tree of unique file names (it got slower
-        past 4 workers).
-        */
-        let mut names: Vec<Cow<str>> = Vec::with_capacity(batch.len());
-        let mut files: Vec<FileEntry> = Vec::with_capacity(batch.len());
-        // specials go in apart from the files, to be counted apart
-        let mut specials: Vec<(u32, Child)> = Vec::new();
-        let mut seen: u64 = 0;
-        let mut seen_specials: u64 = 0;
-        let mut size: u64 = 0;
+        let intern: bool = store || walk.visitor.is_some();
 
+        // the entries that pass the name filters, and their names to intern
+        let mut kept: Vec<(&EntryExt, FileKind)> = Vec::with_capacity(batch.len());
+        let mut names: Vec<Cow<str>> = Vec::with_capacity(if intern { batch.len() } else { 0 });
         for entry in batch {
             let Some(entry_t) = entry.file_type() else {
                 // no d_type, and the fstatat for it failed
@@ -1151,17 +1147,34 @@ impl DirTree {
             };
             let name_os: &OsStr = OsStr::from_bytes(entry.name_as_bytes());
             trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
-
-            // same prune + filter shape as for directories
-            let mut child_idx: Option<u32> = None;
-            if let Some(ref v) = walk.visitor {
-                let idx: u32 = self.strings.insert(encode_os(name_os).as_ref());
-                child_idx = Some(idx);
-                if v.prune_child(&parent_state.context(parent_path, depth, &self.strings), idx, false) {
-                    continue;
-                }
-            }
             if !self.conf.filters().passes(name_os, false) {
+                continue;
+            }
+            kept.push((entry, kind));
+            if intern {
+                names.push(encode_os(name_os));
+            }
+        }
+        if kept.is_empty() {
+            return;
+        }
+        let indices: Vec<u32> = match intern {
+            true => self.strings.insert_many(&names),
+            false => Vec::new(),
+        };
+
+        let ctx: WalkContext = parent_state.context(parent_path, depth, &self.strings);
+        let mut children: Vec<(u32, Child)> = Vec::with_capacity(if store { kept.len() } else { 0 });
+        // specials go in apart from the files, to be counted apart
+        let mut specials: Vec<(u32, Child)> = Vec::new();
+        let mut seen: u64 = 0;
+        let mut seen_specials: u64 = 0;
+        let mut size: u64 = 0;
+        for (i, &(entry, kind)) in kept.iter().enumerate() {
+            let idx: Option<u32> = indices.get(i).copied();
+            if let (Some(v), Some(idx)) = (&walk.visitor, idx)
+                && v.prune_child(&ctx, idx, false)
+            {
                 continue;
             }
             if kind.is_special() {
@@ -1172,33 +1185,19 @@ impl DirTree {
                     size += entry.len();
                 }
             }
-            if !store {
+            let (true, Some(idx)) = (store, idx) else {
                 continue;
-            }
+            };
             let target: Option<u32> = match kind {
                 FileKind::Symlink => {
                     self.link_target_at(walk.observer, dirfd, parent_path, entry.file_name())
                 }
                 _ => None,
             };
-            let file: FileEntry = FileEntry::new(entry.ino(), kind, target);
-            match child_idx {
-                // already interned for the visitor
-                Some(idx) if kind.is_special() => specials.push((idx, Child::File(file))),
-                Some(idx) => children.push((idx, Child::File(file))),
-                None => {
-                    names.push(encode_os(name_os));
-                    files.push(file);
-                }
-            }
-        }
-        if !names.is_empty() {
-            let indices: Vec<u32> = self.strings.insert_many(&names);
-            for (idx, file) in indices.into_iter().zip(files) {
-                match file.kind().is_special() {
-                    true => specials.push((idx, Child::File(file))),
-                    false => children.push((idx, Child::File(file))),
-                }
+            let child: Child = Child::File(FileEntry::new(entry.ino(), kind, target));
+            match kind.is_special() {
+                true => specials.push((idx, child)),
+                false => children.push((idx, child)),
             }
         }
 
