@@ -92,7 +92,7 @@ tree follow the filesystem.
 - [`docs/snapshot.md`](docs/snapshot.md): saving a tree to a file and
   loading it back (the format and its checks)
 - [`docs/consumers.md`](docs/consumers.md): what the next consumers need,
-  and the gaps still open
+  the gaps, and what each batch closed
 
 ## License
 

@@ -41,4 +41,4 @@ Read the relevant one before a non-trivial change:
 
 - `docs/implementation.md`: the visitor protocol, stored tags, walk integration.
 - `docs/snapshot.md`: the snapshot (save/load) format and its checks (`src/snapshot.rs`, `TreeOp::Save`/`Load`).
-- `docs/consumers.md`: what the WordPress scanner and a web malware scanner need, and the gaps still open (#4–#10).
+- `docs/consumers.md`: what the WordPress scanner and a web malware scanner need, the gaps (#1–#10) and what each batch closed.

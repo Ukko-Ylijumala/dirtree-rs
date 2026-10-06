@@ -165,11 +165,41 @@ Shaped by the scanner side's review of adopting the tree
 - **No opens by path below a root:** the walker's spawned descents and
   `update()` open each directory relative to its parent's fd, so trees
   deeper than `PATH_MAX` walk and update, and a symlink swapped in for an
-  ancestor cannot redirect them. The watcher still works by path.
+  ancestor cannot redirect them. (The watcher followed in batch 2.)
 
-Still open: #6 (built-in path-component prunes; the scanner keeps its
-own `Prunes::pruned` for now), #8 to #10, and opening files of a finished
-tree by node (#4).
+### Batch 2 (0.6.0)
+
+- **No path below a walk root is trusted, anywhere:** `update()`'s root,
+  `DirTree::handle()` and the watcher now open from the nearest pooled
+  handle or caller-named walk root (`Directory::is_walk_root()`) with no
+  symlink in any component (dirhandle 0.6.4's `path_fd_beneath()`). The
+  watcher watches through `/proc/self/fd` links of fds it holds, opens
+  each directory of a subtree from its parent's fd, and stats, reads
+  and scans created entries from the parent's fd. A directory swapped
+  for a symlink fails with `ELOOP` / `ENOTDIR` instead of leading
+  elsewhere, and trees deeper than `PATH_MAX` are watched.
+- **Opening files of a finished tree (#4):** `DirTree::path_fd(dir)`,
+  `FileOpener` (keeps the last directory's fd, so candidates in walk or
+  grouped order cost one directory open per directory) and
+  `open_file(dir, name)`. Candidates kept as `(Arc<Directory>, name
+  index)` open with no path built at all; the scanner's `open_stat`,
+  `reaching` and `through_proc` have a replacement.
+- **Path-component prunes (#6):** `PathPruneVisitor`, with the
+  scanner's `path_match` semantics (trailing components, `*` within one
+  component), on bytes. `matches()` answers outside a walk too (symlink
+  targets, `pruned_below`).
+- **Change sources (#8, the applying side):** `TreeChange`
+  (`Dir`/`Subtree`/`Lost`), `DirTree::apply_changes()` (coalesces a
+  batch, skips what is gone), `dir_by_fd()` (a fanotify file handle,
+  opened, to its node, checked by inode) and `update_node()`. The
+  fanotify source itself belongs to the daemon.
+- **Snapshots (#9):** `save_to()` / `load_from()` and their background
+  forms, as `docs/snapshot.md` describes.
+- **One filesystem (#10):** `with_one_filesystem(true)`; each mount
+  point skipped reaches `TreeObserver::mount_skipped()`.
+
+Still open: a fanotify change source (the daemon's), and measuring the
+memory of a real host's tree (Scale, below).
 
 ## Scale
 
