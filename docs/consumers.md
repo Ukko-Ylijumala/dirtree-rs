@@ -138,6 +138,39 @@ Gaps 1–3 were fixed before the split:
    or not fully listed, an entry not stat'ed, a symlink target not
    read, a directory not watched, or events lost.
 
+### Batch 1, after the split (0.5.0)
+
+Shaped by the scanner side's review of adopting the tree
+(`zoner-malware-scan`, `doc/2026-10-06-dirtree-integration-review.md`):
+
+- **Per-file hook (#5):** `Visitor::visit_file(&FileContext) ->
+  FileVerdict`, for every non-directory entry the prunes and filters let
+  through, whatever the file mode. The context has the entry's kind, a
+  lazy cached stat, its interned name, its directory's `WalkContext`
+  (with the directory's fd) and the whole listing for sibling lookups.
+  `FileVerdict::Store` keeps a selected file in a directory skeleton
+  (`FileMode::UNSET`).
+- **Opening relative to the directory (#4, during the walk):**
+  `WalkContext::dirfd`, and dirhandle 0.6.3's `EntryExt::open_regular()`
+  / `open_regular_at()`: no symlink followed, no blocking on a FIFO,
+  regular files only, with the stat of what was opened. Opening a file
+  of a finished tree by its node, and grouping candidates per directory,
+  are still open.
+- **Per-walk hooks (part of #7):** `populate_par_with(path, recursive,
+  &WalkHooks)` gives one walk a visitor and an observer of its own, so
+  several walks into one tree at once (one per account) keep their
+  findings, counts and faults apart while sharing the tree and its
+  string store. Several roots per tree work this way; a shared store
+  across trees is not needed for it.
+- **No opens by path below a root:** the walker's spawned descents and
+  `update()` open each directory relative to its parent's fd, so trees
+  deeper than `PATH_MAX` walk and update, and a symlink swapped in for an
+  ancestor cannot redirect them. The watcher still works by path.
+
+Still open: #6 (built-in path-component prunes; the scanner keeps its
+own `Prunes::pruned` for now), #8 to #10, and opening files of a finished
+tree by node (#4).
+
 ## Scale
 
 On synthetic trees where every name is unique, the tree costs about

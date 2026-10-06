@@ -46,7 +46,15 @@ code. Each tag marks the tree code as it stood in that statter release.
 - **Visitor protocol:** markers, including nested paths such as
   `wp-includes/version.php`, tag and claim subtrees. Prunes and depth
   caps apply per scope. Discoveries stream out as `WalkEvent`s, and tags
-  are stored on the directories.
+  are stored on the directories. A per-file hook sees every file with its
+  kind, a lazy stat and its siblings, can open it relative to its
+  directory while the walk goes on, and can have it stored even when the
+  tree keeps only directories.
+- **Several walks into one tree** at once, each with a visitor and an
+  observer of its own (`populate_par_with`, `WalkHooks`).
+- **No path below a root is opened by name:** each directory is opened
+  relative to its parent's fd, so trees deeper than `PATH_MAX` walk and
+  update, and a symlink swapped in for an ancestor cannot redirect them.
 - **Observer:** progress and every fault, as a `FaultKind` with the exact
   path and errno, go to a `TreeObserver`, so a consumer can account for
   coverage.
