@@ -11,11 +11,11 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     collections::hash_map::DefaultHasher,
-    ffi::{CString, OsStr},
+    ffi::{CStr, CString, OsStr},
     mem::size_of,
     fs::{remove_file, rename, write},
     hash::{Hash, Hasher},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, OwnedFd},
     os::unix::{ffi::OsStrExt, fs::symlink},
     panic,
     path::{Path, PathBuf},
@@ -28,7 +28,7 @@ use std::{
 };
 use miniutils::{EntryKind, PlannedEntry, Special, TreeSpec};
 use stringstore::UniqueStrStore;
-use dirhandle::DirHandle;
+use dirhandle::{DirHandle, open_regular_at};
 use tempfile::TempDir;
 
 const TEST_NUM: [u64; 3] = [9, 11, 7];
@@ -561,15 +561,76 @@ fn test_tree_past_path_max() {
     // a file added at the bottom, through the fds of the levels above it
     let root: DirHandle = DirHandle::new(temp.path()).unwrap();
     let at_bottom: DirHandle = DirHandle::open_beneath(&root, bottom.strip_prefix(temp.path()).unwrap()).unwrap();
-    let flags: i32 = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC;
-    let fd: i32 = unsafe { libc::openat(at_bottom.as_raw_fd(), c"new.txt".as_ptr(), flags, 0o644) };
-    assert!(fd >= 0, "create at the bottom failed");
-    unsafe { libc::close(fd) };
+    create_at(&at_bottom, c"new.txt");
 
     let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
     assert_eq!(*obs.faults.lock(), vec![], "update faults");
     assert_eq!((stats.added_files, stats.errors), (1, 0), "{stats}");
     assert!(tree.contains(&bottom.join("new.txt").to_string_lossy()));
+
+    // the bottom by its node: a diff rooted there, an O_PATH fd, a pooled handle
+    let bottom_s: String = bottom.to_string_lossy().into_owned();
+    create_at(&at_bottom, c"newer.txt");
+    let stats: UpdateStats = tree.update(&bottom_s, Some(false)).unwrap();
+    assert_eq!((stats.added_files, stats.errors), (1, 0), "{stats}");
+    let node: Arc<Directory> = tree.get_dir(&bottom_s).unwrap();
+    let fd: OwnedFd = tree.path_fd(&node).expect("O_PATH fd past PATH_MAX");
+    assert!(open_regular_at(&fd, c"newer.txt").is_ok());
+    let listed: usize = tree.handle(&bottom_s).expect("handle past PATH_MAX").iter().count();
+    assert_eq!(listed, node.children().read().len());
+    tree.handle_close(&bottom_s);
+    assert_eq!(*obs.faults.lock(), vec![], "faults by node");
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_opens_never_follow_symlinks() {
+    /*
+    A directory swapped for a symlink after the walk: opening it, or
+    anything below it, by its node must not follow the link to wherever
+    it points. The walk root is a symlink too, and that one is followed:
+    the caller named it.
+    */
+    let temp: TempDir = TempDir::new().unwrap();
+    let real: PathBuf = temp.path().join("real");
+    std::fs::create_dir_all(real.join("a/b/c")).unwrap();
+    write(real.join("a/b/c/f.bin"), b"x").unwrap();
+    std::fs::create_dir_all(temp.path().join("other/c")).unwrap();
+    write(temp.path().join("other/c/evil.bin"), b"x").unwrap();
+    symlink(&real, temp.path().join("root")).unwrap();
+    let dir: String = temp.path().join("root").to_string_lossy().into_owned();
+
+    let obs: Arc<FaultObserver> = Arc::new(FaultObserver::default());
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(&dir)
+        .with_recursive(true)
+        .with_observer(obs.clone());
+    tree.walk().unwrap();
+    let c: String = format!("{dir}/a/b/c");
+    assert!(tree.contains(&format!("{c}/f.bin")));
+    assert!(tree.handle(&c).is_some(), "opened through the symlinked root");
+    tree.handle_close(&c);
+
+    // a/b becomes a symlink to a lookalike
+    rename(real.join("a/b"), real.join("a/b.moved")).unwrap();
+    symlink(temp.path().join("other"), real.join("a/b")).unwrap();
+    let node: Arc<Directory> = tree.get_dir(&c).unwrap();
+    let err = tree.path_fd(&node).expect_err("ELOOP expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+    assert!(tree.handle(&c).is_none());
+    // a diff rooted below the swap does not pick up what the link points to
+    let stats: UpdateStats = tree.update(&c, Some(true)).unwrap();
+    assert_eq!(stats.errors, 1, "{stats}");
+    assert!(!tree.contains(&format!("{c}/evil.bin")));
+    let faults: Vec<(FaultKind, Option<i32>)> =
+        obs.faults.lock().iter().map(|f: &TreeFault| (f.kind, f.errno)).collect();
+    assert_eq!(faults, vec![(FaultKind::OpenDir, Some(libc::ELOOP))]);
+
+    // a diff from above sees the swap for what it is
+    tree.update(&format!("{dir}/a"), Some(true)).unwrap();
+    let b: Option<NodeRef> = tree.get_node(&format!("{dir}/a/b"));
+    assert_eq!(b.and_then(|n: NodeRef| n.file_kind()), Some(FileKind::Symlink));
+    assert!(tree.contains(&format!("{dir}/a/b.moved/c/f.bin")));
     tree_validate_counts(&tree);
 }
 
@@ -1585,6 +1646,50 @@ fn test_tree_watcher() {
 
     watcher.stop();
     tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_watcher_past_path_max() {
+    // watched directory by directory from their parents' fds, never by path
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let spec: TreeSpec = TreeSpec::new()
+        .levels(30, 1, 0)
+        .dir_names(|idx| format!("{}{:02}", "w".repeat(198), idx.len()));
+    spec.create(temp.path()).unwrap();
+    let bottom: PathBuf = spec.plan(temp.path()).last().unwrap().path;
+    assert!(bottom.as_os_str().len() > libc::PATH_MAX as usize);
+
+    let tree: Arc<DirTree> = Arc::new(walked_tree(dir, FileMode::NODE, false));
+    let watcher: Arc<TreeWatcher> = TreeWatcher::start(tree.clone()).expect("watcher should start");
+    assert_eq!(watcher.failed_watches(), 0);
+    assert_eq!(watcher.watches_len(), 31, "the root and 30 levels");
+
+    // a file, then a new directory with a file in it, at the bottom
+    let root: DirHandle = DirHandle::new(temp.path()).unwrap();
+    let at_bottom: DirHandle = DirHandle::open_beneath(&root, bottom.strip_prefix(temp.path()).unwrap()).unwrap();
+    create_at(&at_bottom, c"f.bin");
+    let p: String = bottom.join("f.bin").to_string_lossy().into_owned();
+    wait_for(|| tree.contains(&p), "file at the bottom");
+    assert_eq!(unsafe { libc::mkdirat(at_bottom.as_raw_fd(), c"new".as_ptr(), 0o755) }, 0);
+    let p: String = bottom.join("new").to_string_lossy().into_owned();
+    wait_for(|| tree.contains(&p), "directory at the bottom");
+    let at_new: DirHandle = DirHandle::open_at(&at_bottom, c"new").unwrap();
+    create_at(&at_new, c"g.bin");
+    let p: String = bottom.join("new/g.bin").to_string_lossy().into_owned();
+    wait_for(|| tree.contains(&p), "file in the new directory");
+
+    watcher.stop();
+    assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
+    tree_validate_counts(&tree);
+}
+
+/// Create the empty file `name` in the directory `dir`.
+fn create_at(dir: &DirHandle, name: &CStr) {
+    let flags: i32 = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC;
+    let fd: i32 = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o644) };
+    assert!(fd >= 0, "create {name:?} failed");
+    unsafe { libc::close(fd) };
 }
 
 /// Poll `cond` for up to ~2 seconds before failing the test with `msg`.

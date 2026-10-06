@@ -18,7 +18,10 @@ use super::osname::decode_os;
 use super::utils::PATH_SEP;
 use super::visitor::{SCOPE_NONE, ScopeTag};
 
-use dirhandle::{DirFd, nix::dir::Type};
+use dirhandle::{
+    DirFd,
+    nix::{dir::Type, sys::stat::SFlag},
+};
 use stringstore::UniqueStrStore;
 
 use parking_lot::RwLock;
@@ -32,7 +35,7 @@ use std::{
     os::fd::RawFd,
     os::unix::fs::FileTypeExt,
     path::PathBuf,
-    sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed},
+    sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed},
     sync::{Arc, Weak},
 };
 
@@ -95,6 +98,13 @@ pub struct Directory {
     set). Refreshed each time the walker visits the directory.
     */
     tag: AtomicU16,
+    /**
+    Whether a caller named this directory as a walk root (or as the
+    tree's root path): it may be opened by its path, symlinks included,
+    and the directories below it are opened from it, never by a path.
+    See `DirTree::dir_at`. Sits in what was padding.
+    */
+    walk_root: AtomicBool,
     fd: DirFd,
     children: Children,
 }
@@ -117,6 +127,7 @@ impl Directory {
             stamp: AtomicU64::new(0),
             name: AtomicU32::new(name_idx),
             tag: AtomicU16::new(SCOPE_NONE),
+            walk_root: AtomicBool::new(false),
             fd: DirFd::default(),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
@@ -179,6 +190,17 @@ impl Directory {
     #[inline]
     pub(super) fn set_tag(&self, tag: ScopeTag) {
         self.tag.store(tag, Relaxed);
+    }
+
+    /// Whether a caller named this directory as a walk root (see the field).
+    #[inline]
+    pub fn is_walk_root(&self) -> bool {
+        self.walk_root.load(Relaxed)
+    }
+
+    /// Mark this directory as a walk root named by a caller.
+    pub(super) fn set_walk_root(&self) {
+        self.walk_root.store(true, Relaxed);
     }
 
     /// Returns the [[DirFd]] for this [[Directory]].
@@ -354,6 +376,20 @@ impl Directory {
 }
 
 /* ######################################################################### */
+
+/// The entry type a `st_mode` names; [None] for one no file can have.
+pub(super) fn mode_type(mode: u32) -> Option<Type> {
+    Some(match SFlag::from_bits_truncate(mode) & SFlag::S_IFMT {
+        SFlag::S_IFDIR => Type::Directory,
+        SFlag::S_IFREG => Type::File,
+        SFlag::S_IFLNK => Type::Symlink,
+        SFlag::S_IFIFO => Type::Fifo,
+        SFlag::S_IFSOCK => Type::Socket,
+        SFlag::S_IFCHR => Type::CharacterDevice,
+        SFlag::S_IFBLK => Type::BlockDevice,
+        _ => return None,
+    })
+}
 
 /**
 What a non-directory entry is, from its directory entry type (`d_type`,

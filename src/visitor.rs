@@ -25,14 +25,14 @@ per child, prune wins over filter, both veto.
 [`DirTree`]: super::DirTree
 */
 
-use super::node::FileKind;
+use super::node::{FileKind, mode_type};
 
 use dirhandle::{
     EntryExt,
     nix::{
         dir::Type,
         fcntl::AtFlags,
-        sys::stat::{SFlag, fstatat},
+        sys::stat::fstatat,
     },
 };
 use stringstore::UniqueStrStore;
@@ -139,16 +139,7 @@ impl DirContext<'_> {
     */
     pub fn type_at(&self, rel: &[u8]) -> Option<Type> {
         let st = fstatat(self.walk.dirfd, rel, AtFlags::AT_SYMLINK_NOFOLLOW).ok()?;
-        Some(match SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT {
-            SFlag::S_IFDIR => Type::Directory,
-            SFlag::S_IFREG => Type::File,
-            SFlag::S_IFLNK => Type::Symlink,
-            SFlag::S_IFIFO => Type::Fifo,
-            SFlag::S_IFSOCK => Type::Socket,
-            SFlag::S_IFCHR => Type::CharacterDevice,
-            SFlag::S_IFBLK => Type::BlockDevice,
-            _ => return None,
-        })
+        mode_type(st.st_mode)
     }
 }
 

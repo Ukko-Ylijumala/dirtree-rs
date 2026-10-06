@@ -5,7 +5,7 @@ use super::error::{TreeError, TreeResult};
 use super::event::{FaultKind, TreeEvent, TreeOp, TreeState};
 use super::node::{Child, Directory, FileEntry, FileKind, NodeIter, NodeRef, NodeView};
 use super::observer::TreeObserver;
-use super::osname::{decode_path, encode_os};
+use super::osname::{decode_os, decode_path, encode_os};
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
 use super::visitor::*;
 use super::worker::tree_worker;
@@ -13,7 +13,7 @@ use super::{FileMode, Filters};
 use super::utils::{PATH_SEP, panic_message, path_parts};
 
 use dirhandle::{
-    CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles, path_fd_at,
+    CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles, path_fd_at, path_fd_beneath,
     nix::{
         fcntl::{OFlag, open, readlinkat},
         sys::stat::Mode,
@@ -115,18 +115,21 @@ struct WalkState {
 }
 
 /**
-Where the walker and the diff-rescan open a directory from. A walk or
-update root is opened by its path, following symlinks as a root given
-by the caller should. Every directory below it is opened relative to
-its parent's fd, never by a path, so it is the very directory its parent
-listed however deep it lies: a symlink swapped in for it or for any
-ancestor cannot redirect the open, and paths past `PATH_MAX` work.
+Where the walker, the diff-rescan, the watcher and [DirTree::handle]
+open a directory from. A walk root named by the caller is opened by its
+path, following symlinks as a root given by the caller should. Every
+directory below one is opened relative to an fd, never by a path, so it
+is the very directory its parent listed however deep it lies: a symlink
+swapped in for it or for any ancestor cannot redirect the open, and
+paths past `PATH_MAX` work. [DirTree::dir_at] finds the fd to start from.
 */
 pub(super) enum DirAt {
-    /// By its path: a root.
+    /// By its path: a walk root, or a directory above every walk root.
     Path,
     /// `name` in its parent, held open as an `O_PATH` fd shared by the parent's subdirectories.
     In(Arc<OwnedFd>, CString),
+    /// At a relative path below an `O_PATH` fd of a walk root or a pooled directory; no symlink in it.
+    Beneath(Arc<OwnedFd>, PathBuf),
 }
 
 /**
@@ -510,6 +513,9 @@ impl DirTree {
         // the root actually stored: a second from_path() keeps the first
         if let Some(from) = self.conf.from() {
             self.insert_dir(from, None);
+            if let Some(node) = self.get_dir(encode_os(from).as_ref()) {
+                node.set_walk_root();
+            }
         }
         self.set_state(TreeState::Empty);
         self
@@ -792,6 +798,9 @@ impl DirTree {
                 }
             }
         };
+        if matches!(at, DirAt::Path) {
+            node.set_walk_root();
+        }
         let walk: Walk = self.new_walk(path, recursive, hooks);
         let state: WalkState = self.initial_walk_state(path);
         // a symlinked walk root is followed, see DirAt
@@ -935,14 +944,14 @@ impl DirTree {
         skip the state pass (a directory fstat and a digest per entry)
         and the dir-first lookahead.
         */
-        // a watcher watches this directory before it is read (see ListHook)
-        self.conf.before_listing(&node);
         /*
         For readlinkat() on the symlinks listed here. Taken before the
         listing borrows the handle mutably; the handle is only moved once
         every entry has been processed, so the fd stays open meanwhile.
         */
         let dirfd: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(handle.as_raw_fd()) };
+        // a watcher watches this directory before it is read (see ListHook)
+        self.conf.before_listing(&node, dirfd);
         let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
         if let Some(e) = iter.error() {
@@ -1768,7 +1777,9 @@ impl DirTree {
     /**
     If we have a directory handle for a path, return its [CheckedOutHandle].
     If we don't have an open handle, but we have a [Directory] for such
-    directory, we try opening a handle and returning it.
+    directory, we try opening a handle and returning it: from the nearest
+    walk root or pooled ancestor, never through a symlink (see
+    [DirTree::path_fd]).
     */
     pub fn handle(&self, path: &str) -> Option<CheckedOutHandle<'_>> {
         let dir: Arc<Directory> = self.get_dir(path)?;
@@ -1776,7 +1787,8 @@ impl DirTree {
         if dir.fd().is_open() {
             self.handles.get(dir.fd().fd())
         } else {
-            let handle: CheckedOutHandle = self.handles.open(&dir.path(&self.strings)).ok()?;
+            let opened: DirHandle = self.dir_at(&dir).ok()?.open(&dir.path(&self.strings)).ok()?;
+            let handle: CheckedOutHandle = self.handles.adopt(opened);
             match dir.fd_set(handle.as_raw_fd()) {
                 Ok(_) => Some(handle),
                 // lost a race to another opener: keep theirs, close ours
@@ -1786,6 +1798,58 @@ impl DirTree {
                 }
             }
         }
+    }
+
+    /**
+    An `O_PATH` fd of the directory `dir`: to `fstat`, and to open its
+    entries from (dirhandle's `open_regular_at()`, `read_nofollow_at()`,
+    `DirHandle::open_at()`), one open per directory for a whole group of
+    files.
+
+    No path below a walk root is trusted. It goes up from `dir` to the
+    nearest directory that is either pooled (an open handle: resident
+    mode, or [DirTree::handle]) or a walk root named by the caller
+    ([DirTree::populate_par_with], the tree's root path, which may be a
+    symlink), and resolves the rest from there with no symlink in any
+    component, however deep `dir` lies. So a directory swapped for a
+    symlink fails with `ELOOP` instead of leading elsewhere. A directory
+    with neither above it lies above every walk root, outside what was
+    walked: it is opened by its path.
+
+    Fails when the directory or its anchor cannot be opened, or when
+    `dir` is no longer attached to the tree.
+    */
+    pub fn path_fd(&self, dir: &Arc<Directory>) -> Result<OwnedFd, Error> {
+        self.dir_at(dir)?.path_fd(&dir.path(&self.strings))
+    }
+
+    /// Where to open the directory `dir` from (see [DirAt]), as [DirTree::path_fd] describes.
+    pub(super) fn dir_at(&self, dir: &Arc<Directory>) -> Result<DirAt, Error> {
+        let mut names: Vec<u32> = Vec::new();
+        let mut current: Arc<Directory> = dir.clone();
+        let anchor: OwnedFd = loop {
+            if current.fd().is_open()
+                && let Some(handle) = self.handles.get(current.fd().fd())
+            {
+                break path_fd_at(&*handle, c".")?;
+            }
+            if current.is_walk_root() {
+                break path_fd_by_path(&current.path(&self.strings))?;
+            }
+            if current.is_root() {
+                return Ok(DirAt::Path);
+            }
+            names.push(current.name_idx());
+            current = current
+                .parent()
+                .ok_or_else(|| Error::new(ErrorKind::NotFound, "directory detached from the tree"))?;
+        };
+        let rel: PathBuf = names
+            .iter()
+            .rev()
+            .map(|idx: &u32| decode_os(unsafe { self.strings.borrow_str(*idx) }))
+            .collect();
+        Ok(DirAt::Beneath(Arc::new(anchor), rel))
     }
 
     /// Remove a handle for a directory path and clear the [DirFd] in the [Directory].
@@ -2016,17 +2080,16 @@ impl DirAt {
         match self {
             Self::Path => DirHandle::new(path),
             Self::In(parent, name) => DirHandle::open_at(&**parent, name.as_c_str()),
+            Self::Beneath(anchor, rel) => DirHandle::open_beneath(&**anchor, rel),
         }
     }
 
     /// An `O_PATH` fd of the directory (at `path`): to stat it, and to open its entries from.
     pub(super) fn path_fd(&self, path: &Path) -> Result<OwnedFd, Error> {
         match self {
-            Self::Path => {
-                let flags: OFlag = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
-                Ok(open(path, flags, Mode::empty())?)
-            }
+            Self::Path => path_fd_by_path(path),
             Self::In(parent, name) => path_fd_at(&**parent, name.as_c_str()),
+            Self::Beneath(anchor, rel) => path_fd_beneath(&**anchor, rel),
         }
     }
 }
@@ -2081,6 +2144,12 @@ fn partition_dirs_first(entries: &mut [EntryExt<'_>]) -> usize {
         }
     }
     n_dirs
+}
+
+/// An `O_PATH` fd of the directory at `path`, symlinks followed: a root's, see [DirAt::Path].
+fn path_fd_by_path(path: &Path) -> Result<OwnedFd, Error> {
+    let flags: OFlag = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    Ok(open(path, flags, Mode::empty())?)
 }
 
 /**

@@ -36,7 +36,7 @@ git = "https://github.com/Ukko-Ylijumala/custom_xxh3"
 
 [dependencies.dirhandle]
 git = "https://github.com/Ukko-Ylijumala/dirhandle-rs"
-version = "0.6.3"
+version = "0.6.4"
 
 [dependencies.stringstore]
 git = "https://github.com/Ukko-Ylijumala/stringstore-rs"

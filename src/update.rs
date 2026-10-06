@@ -192,7 +192,11 @@ impl DirTree {
         let full: PathBuf = node.path(&self.strings);
         let recursive: bool = recursive.unwrap_or(self.conf.recursive());
         let ctr: UpdateCtr = UpdateCtr::default();
-        rayon::scope(|s| self.update_inner(&full, node, DirAt::Path, recursive, &ctr, s, 0));
+        // opened from its walk root (or a pooled ancestor), not by its path
+        match self.dir_at(&node) {
+            Ok(at) => rayon::scope(|s| self.update_inner(&full, node, at, recursive, &ctr, s, 0)),
+            Err(e) => self.update_open_failed(&full, &node, e, &ctr),
+        }
         let stats: UpdateStats = ctr.snapshot();
         debug!(target: "UPDATE", "{}: {stats}", full.display());
         Ok(stats)

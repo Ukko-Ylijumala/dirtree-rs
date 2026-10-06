@@ -41,28 +41,30 @@ v1 caveats (deliberate, recorded for the future crate split):
   between the walk and its start.
 */
 
-use super::dirtree::DirTree;
+use super::dirtree::{DirAt, DirTree, WalkHooks};
 use super::conf::ListHook;
 use super::error::TreeError;
 use super::event::{FaultKind, TreeEvent, TreeOp, TreeState};
 use super::conf::NodeCounts;
 use super::dirtree::NewChild;
-use super::node::{Child, Directory, FileEntry, FileKind, NodeView};
-use super::osname::encode_os;
-use super::traverse::traverse_from;
+use super::node::{Child, Directory, FileEntry, FileKind, mode_type};
+use super::osname::{decode_os, encode_os};
 
 use dashmap::DashMap;
+use dirhandle::{
+    nix::{fcntl::AtFlags, sys::stat::fstatat},
+    path_fd_at,
+};
 use parking_lot::Mutex;
 use tracing::{debug, error, trace, warn};
 
 use std::{
+    borrow::Cow,
     ffi::{CString, OsStr},
-    fs::symlink_metadata,
     io,
     mem::size_of,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
@@ -91,6 +93,8 @@ const DIR_MASK: u32 = libc::IN_CREATE
     | libc::IN_MOVE_SELF
     | libc::IN_ONLYDIR
     | libc::IN_EXCL_UNLINK;
+/// Where a process's open fds can be named by a path, for inotify (see `proc_fd_path`).
+const PROC_SELF_FD: &str = "/proc/self/fd";
 /**
 How long a detached `IN_MOVED_FROM` subtree waits for its matching
 `IN_MOVED_TO` cookie before being dropped as moved-out-of-tree. The
@@ -204,11 +208,13 @@ impl TreeWatcher {
 
         // every scan from here on watches each directory before reading it
         let weak: Weak<Self> = Arc::downgrade(&watcher);
-        watcher.tree.conf.set_list_hook(Some(ListHook(Arc::new(move |node: &Arc<Directory>| {
-            if let Some(w) = weak.upgrade() {
-                w.add_watch(node);
-            }
-        }))));
+        watcher.tree.conf.set_list_hook(Some(ListHook(Arc::new(
+            move |node: &Arc<Directory>, dirfd: BorrowedFd<'_>| {
+                if let Some(w) = weak.upgrade() {
+                    w.add_watch(node, dirfd);
+                }
+            },
+        ))));
         Ok(watcher)
     }
 
@@ -268,41 +274,101 @@ impl TreeWatcher {
 
     /* --------------------------------- */
 
-    /// Add a watch for a single directory node.
-    fn add_watch(&self, node: &Arc<Directory>) {
-        let path: PathBuf = node.path(self.tree.strings());
-        let cpath: CString = match CString::new(path.as_os_str().as_bytes()) {
-            Ok(c) => c,
-            Err(_) => return, // interior NUL cannot happen for real paths
-        };
+    /**
+    Add a watch for the directory `node`, open as `fd`. inotify takes a
+    path, so it is given the fd's `/proc/self/fd` link: the watch lands
+    on the directory held open, never on whatever a path names by now.
+    */
+    fn add_watch(&self, node: &Arc<Directory>, fd: BorrowedFd<'_>) {
+        let link: CString = proc_fd_path(fd);
         let wd: i32 =
-            unsafe { libc::inotify_add_watch(self.ino_fd.as_raw_fd(), cpath.as_ptr(), DIR_MASK) };
+            unsafe { libc::inotify_add_watch(self.ino_fd.as_raw_fd(), link.as_ptr(), DIR_MASK) };
         if wd < 0 {
-            let e: io::Error = io::Error::last_os_error();
-            let ev: TreeEvent = TreeEvent::error(FaultKind::Watch, &format!("inotify watch failed: {e}"))
-                .path(encode_os(&path).as_ref())
-                .io(&e);
-            if self.failed.fetch_add(1, Relaxed) == 0 {
-                // log the first failure loudly; the rest are only counted and reported
-                warn!("inotify watch failed for {}: {e} (see fs.inotify.max_user_watches)",
-                    path.display());
-                self.tree.add_error(ev);
-            } else {
-                self.tree.add_fault(&ev);
-            }
-            return;
+            return self.watch_failed(node, &io::Error::last_os_error());
         }
-        trace!(target: "WATCH_ADD", "wd {wd} -> {}", path.display());
+        trace!(target: "WATCH_ADD", "wd {wd} -> {}", node.path(self.tree.strings()).display());
         self.watches.insert(wd, Arc::downgrade(node));
     }
 
-    /// Watch a directory node and every directory below it.
+    /// Record that the directory `node` could not be watched (or opened to be).
+    fn watch_failed(&self, node: &Arc<Directory>, e: &io::Error) {
+        let path: PathBuf = node.path(self.tree.strings());
+        let ev: TreeEvent = TreeEvent::error(FaultKind::Watch, &format!("inotify watch failed: {e}"))
+            .path(encode_os(&path).as_ref())
+            .io(e);
+        if self.failed.fetch_add(1, Relaxed) == 0 {
+            // log the first failure loudly; the rest are only counted and reported
+            warn!("inotify watch failed for {}: {e} (see fs.inotify.max_user_watches)",
+                path.display());
+            self.tree.add_error(ev);
+        } else {
+            self.tree.add_fault(&ev);
+        }
+    }
+
+    /**
+    Watch a directory node and every directory below it. Each is opened
+    (`O_PATH`) from its parent's fd, the first one as
+    [`DirTree::path_fd`] opens it, so no watch goes through a path. A
+    directory's fd is held until its last subdirectory has been opened:
+    the fds open at once grow with the depth, not with the breadth.
+    */
     fn watch_subtree(&self, node: &Arc<Directory>) {
-        traverse_from(node, &mut |n: NodeView<'_>| {
-            if let NodeView::Dir(dir) = n {
-                self.add_watch(dir);
+        let top: OwnedFd = match self.tree.path_fd(node) {
+            Ok(fd) => fd,
+            Err(e) => return self.watch_failed(node, &e),
+        };
+        // directories still to watch, with their parent's fd
+        let mut todo: Vec<(Arc<Directory>, Arc<OwnedFd>)> = Vec::new();
+        let watch = |dir: &Arc<Directory>, fd: OwnedFd, todo: &mut Vec<_>| {
+            self.add_watch(dir, fd.as_fd());
+            let fd: Arc<OwnedFd> = Arc::new(fd);
+            for child in dir.children().read().values() {
+                if let Child::Dir(sub) = child {
+                    todo.push((sub.clone(), fd.clone()));
+                }
             }
-        });
+        };
+        watch(node, top, &mut todo);
+        while let Some((dir, parent)) = todo.pop() {
+            let name: Cow<OsStr> = decode_os(dir.name(self.tree.strings()));
+            match path_fd_at(&*parent, &*name) {
+                Ok(fd) => watch(&dir, fd, &mut todo),
+                Err(e) => self.watch_failed(&dir, &e),
+            }
+        }
+    }
+
+    /**
+    An `O_PATH` fd of the watched directory `node`, to stat and scan its
+    new entries from ([None] if it cannot be opened: then it is gone, and
+    its parent's event says so, or the open is a fault).
+    */
+    fn dir_fd(&self, node: &Arc<Directory>, path: &Path) -> Option<OwnedFd> {
+        match self.tree.path_fd(node) {
+            Ok(fd) => Some(fd),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.tree.add_fault(
+                    &TreeEvent::error(FaultKind::OpenDir, &format!("Cannot open watched directory: {e}"))
+                        .path(encode_os(&path).as_ref())
+                        .io(&e),
+                );
+                None
+            }
+        }
+    }
+
+    /**
+    Scan the new directory `name` of the directory open as `parent` (the
+    new one at `full`), opened from that fd. Watch-then-list, per
+    directory: the scan runs the watcher's ListHook on each directory it
+    reaches, the new one included, before reading it.
+    */
+    fn scan_new_dir(&self, parent: OwnedFd, full: &Path, name: &OsStr) {
+        if let Some(at) = DirAt::child(&Arc::new(parent), name) {
+            self.tree.populate_par_at(full, &at, Some(true), &WalkHooks::default());
+        }
     }
 
     /// Drop watches whose nodes have been removed from the tree.
@@ -572,56 +638,63 @@ impl TreeWatcher {
             if !self.tree.conf.filters().passes(name, is_dir) {
                 return;
             }
-            if is_dir {
-                debug!(target: "WATCH_MKDIR", "{}", full.display());
-                self.tree.insert_dir(&full, None);
-                self.tree.conf.observer().dirs_added(1);
-                /*
-                Watch-then-list, per directory: the scan runs the watcher's
-                ListHook on each directory it reaches, the new one included,
-                before reading it. An entry created before a directory's
-                watch is in its listing, one created after it produces an
-                event. (Watching the subtree only after the whole scan lost
-                entries created in a subdirectory between its listing and
-                its watch.)
-                */
-                self.tree.populate_par(&full, Some(true));
-            } else {
-                /*
-                IN_CREATE fires for every entry type. Like the walker and the
-                diff, record each with its FileKind, special files included.
-                lstat, so a symlink is not followed - that also yields the
-                inode, and the insert needs no stat of its own.
-                */
-                let (ino, kind): (u64, FileKind) = match symlink_metadata(&full) {
-                    Ok(meta) => match FileKind::from_std(meta.file_type()) {
-                        Some(kind) => (meta.ino(), kind),
-                        None => return,
-                    },
-                    Err(_) => return, // already gone again
-                };
-                debug!(target: "WATCH_CREATE", "{}", full.display());
-                let idx: u32 = self.tree.strings.insert(encode_os(&name).as_ref());
-                let depth: u8 = full
-                    .components()
-                    .count()
-                    .saturating_sub(1)
-                    .min(u8::MAX as usize) as u8;
-                let counted: bool = if self.tree.filemode().is_node() {
-                    let target: Option<u32> = match kind {
-                        FileKind::Symlink => self.tree.link_target(&full),
-                        _ => None,
-                    };
-                    let file: FileEntry = FileEntry::new(ino, kind, target);
-                    self.tree.insert_child(&node, idx, NewChild::File(file), depth).1
-                } else {
-                    true // counted, but not stored
-                };
-                match counted && kind.is_special() {
-                    true => self.tree.conf.observer().specials_added(1),
-                    false if counted => self.tree.conf.observer().files_added(1, 0),
-                    false => {}
+            /*
+            IN_CREATE fires for every entry type. Like the walker and the
+            diff, record each with its FileKind, special files included.
+            fstatat from the directory's fd, not following a symlink: that
+            also yields the inode, and the insert needs no stat of its own.
+            */
+            let Some(here) = self.dir_fd(&node, &dir_path) else {
+                return;
+            };
+            let Ok(st) = fstatat(&here, name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+                return; // already gone again
+            };
+            let Some(t) = mode_type(st.st_mode) else {
+                return;
+            };
+            let (ino, kind): (u64, FileKind) = match FileKind::from_type(t) {
+                Some(kind) => (st.st_ino, kind),
+                None => {
+                    debug!(target: "WATCH_MKDIR", "{}", full.display());
+                    self.tree.insert_dir(&full, Some(st.st_ino));
+                    self.tree.conf.observer().dirs_added(1);
+                    /*
+                    An entry created before a directory's watch is in its
+                    listing, one created after it produces an event.
+                    (Watching the subtree only after the whole scan lost
+                    entries created in a subdirectory between its listing
+                    and its watch.)
+                    */
+                    return self.scan_new_dir(here, &full, name);
                 }
+            };
+            debug!(target: "WATCH_CREATE", "{}", full.display());
+            let idx: u32 = self.tree.strings.insert(encode_os(&name).as_ref());
+            let depth: u8 = full
+                .components()
+                .count()
+                .saturating_sub(1)
+                .min(u8::MAX as usize) as u8;
+            let counted: bool = if self.tree.filemode().is_node() {
+                let target: Option<u32> = match (kind, CString::new(name.as_bytes())) {
+                    (FileKind::Symlink, Ok(cname)) => self.tree.link_target_at(
+                        self.tree.conf.observer(),
+                        here.as_fd(),
+                        &dir_path,
+                        &cname,
+                    ),
+                    _ => None,
+                };
+                let file: FileEntry = FileEntry::new(ino, kind, target);
+                self.tree.insert_child(&node, idx, NewChild::File(file), depth).1
+            } else {
+                true // counted, but not stored
+            };
+            match counted && kind.is_special() {
+                true => self.tree.conf.observer().specials_added(1),
+                false if counted => self.tree.conf.observer().files_added(1, 0),
+                false => {}
             }
         } else if mask & libc::IN_DELETE != 0 {
             debug!(target: "WATCH_RM", "{}", full.display());
@@ -767,10 +840,14 @@ impl TreeWatcher {
             */
             self.tree.release_handles(&child);
             drop(child); // release the old subtree before re-scanning
-            self.tree.insert_dir(&full, None);
-            self.tree.conf.observer().dirs_added(1);
-            // watched directory by directory as the scan reaches them, see WATCH_MKDIR
-            self.tree.populate_par(&full, Some(true));
+            // scanned from the parent's fd, watched directory by directory, see scan_new_dir()
+            if let Some(here) = self.dir_fd(parent, dir_path)
+                && let Ok(st) = fstatat(&here, name, AtFlags::AT_SYMLINK_NOFOLLOW)
+            {
+                self.tree.insert_dir(&full, Some(st.st_ino));
+                self.tree.conf.observer().dirs_added(1);
+                self.scan_new_dir(here, &full, name);
+            }
             self.sweep_dead_watches();
         } else {
             /*
@@ -795,6 +872,12 @@ impl TreeWatcher {
         }
         true
     }
+}
+
+/// The `/proc/self/fd` link of `fd`, to name the very directory it holds open by a path.
+fn proc_fd_path(fd: BorrowedFd<'_>) -> CString {
+    // digits and slashes: no NUL
+    CString::new(format!("{PROC_SELF_FD}/{}", fd.as_raw_fd())).unwrap_or_default()
 }
 
 /* ===== test hooks ===== */

@@ -10,6 +10,7 @@ use crossbeam::channel::Sender;
 use parking_lot::RwLock;
 use std::{
     fmt::{self, Debug, Display, Formatter},
+    os::fd::BorrowedFd,
     path::PathBuf,
     sync::Arc,
     sync::OnceLock,
@@ -27,8 +28,8 @@ and none falls in between.
 #[derive(Clone)]
 pub(super) struct ListHook(pub(super) Arc<ListHookFn>);
 
-/// The function a [ListHook] runs, given the directory's node.
-pub(super) type ListHookFn = dyn Fn(&Arc<Directory>) + Send + Sync;
+/// The function a [ListHook] runs, given the directory's node and its open fd.
+pub(super) type ListHookFn = dyn Fn(&Arc<Directory>, BorrowedFd<'_>) + Send + Sync;
 
 impl Debug for ListHook {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -245,13 +246,13 @@ impl TreeConf {
         *self.list_hook.write() = hook;
     }
 
-    /// Run the [ListHook], if one is set, for the directory `node` about to be listed.
+    /// Run the [ListHook], if one is set, for the directory `node` (open as `dirfd`) about to be listed.
     #[inline]
-    pub(super) fn before_listing(&self, node: &Arc<Directory>) {
+    pub(super) fn before_listing(&self, node: &Arc<Directory>, dirfd: BorrowedFd<'_>) {
         // cloned out, so that the hook runs without the lock held
         let hook: Option<ListHook> = self.list_hook.read().clone();
         if let Some(hook) = hook {
-            (hook.0)(node);
+            (hook.0)(node, dirfd);
         }
     }
 

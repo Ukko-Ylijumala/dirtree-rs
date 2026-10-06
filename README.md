@@ -52,9 +52,13 @@ code. Each tag marks the tree code as it stood in that statter release.
   tree keeps only directories.
 - **Several walks into one tree** at once, each with a visitor and an
   observer of its own (`populate_par_with`, `WalkHooks`).
-- **No path below a root is opened by name:** each directory is opened
-  relative to its parent's fd, so trees deeper than `PATH_MAX` walk and
-  update, and a symlink swapped in for an ancestor cannot redirect them.
+- **No path below a root is opened by name:** the walker, `update()`,
+  the watcher and `handle()` open each directory relative to its
+  parent's fd, or below the nearest walk root or pooled handle with no
+  symlink in any component. Trees deeper than `PATH_MAX` walk, update
+  and are watched, and a symlink swapped in for an ancestor cannot
+  redirect them. `path_fd()` hands out such an fd of any directory in
+  the tree, to open its files from.
 - **Observer:** progress and every fault, as a `FaultKind` with the exact
   path and errno, go to a `TreeObserver`, so a consumer can account for
   coverage.
