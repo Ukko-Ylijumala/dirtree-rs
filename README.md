@@ -44,7 +44,8 @@ code. Each tag marks the tree code as it stood in that statter release.
   diff-rescans a subtree, skipping unchanged directories on one `stat`
   each.
 - **Visitor protocol:** markers, including nested paths such as
-  `wp-includes/version.php`, tag and claim subtrees. Prunes and depth
+  `wp-includes/version.php`, tag and claim subtrees. Prunes (by name,
+  or by path-component globs such as `wp-content/uploads`) and depth
   caps apply per scope. Discoveries stream out as `WalkEvent`s, and tags
   are stored on the directories. A per-file hook sees every file with its
   kind, a lazy stat and its siblings, can open it relative to its

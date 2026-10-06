@@ -6,6 +6,8 @@ Built-in [`Visitor`] implementations.
 - [`NamePruneVisitor`] - drop a fixed set of directory names by interned
   `u32` membership. The cheapest universal "skip `.git`/`node_modules`/etc."
   building block.
+- [`PathPruneVisitor`] - drop directories whose trailing path components
+  match a glob pattern, such as `wp-content/uploads`.
 - [`MarkerVisitor`] - recognize directories by the presence of marker
   entries: names in their dirent list, or nested paths below them
   (`wp-includes/version.php`), all of which must be present. Each
@@ -19,8 +21,12 @@ Built-in [`Visitor`] implementations.
 use super::osname::decode_name;
 use super::visitor::*;
 use dirhandle::{EntryExt, nix::dir::Type};
+use regex::bytes::Regex;
 use stringstore::UniqueStrStore;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, iter::once, os::unix::ffi::OsStrExt, sync::Arc};
+
+/// A glob's `?` as a regex: one character, or one byte that is not UTF-8.
+const GLOB_ONE: &str = r"(?s:.|(?-u:[\x80-\xFF]))";
 
 /* ---------------------------------------- */
 /*  NamePruneVisitor                        */
@@ -59,6 +65,145 @@ impl Visitor for NamePruneVisitor {
         that the simple loop is the right default.
         */
         is_dir && self.names.contains(&child)
+    }
+}
+
+/* ---------------------------------------- */
+/*  PathPruneVisitor                        */
+/* ---------------------------------------- */
+
+/**
+Prune directories by their path: each pattern is `/`-separated glob
+components (`*`, `?`, `[...]` / `[!...]`), matched against the TRAILING
+components of a subdirectory's path, one component each. `*` never
+crosses a `/`, so a leading `*` reads as "at least one directory above".
+
+Matched against the full path, components above the walk root
+included; the walk root itself is never pruned. Names are compared as
+their on-disk bytes, so a pattern also matches a non-UTF-8 name where
+its glob allows. A pruned directory is not recorded, nor walked: its
+whole subtree is gone, which is what matching any ancestor would give.
+Files are not pruned here.
+
+For example:
+*/
+// (attributes: a glob's `*/` would end a block comment)
+#[doc = "- `wp-content/uploads` prunes every `uploads` directly in a `wp-content`;"]
+#[doc = "- `*/domains/*/logs` prunes `/home/u/domains/example.com/logs`;"]
+#[doc = "- `cache` alone is a name prune ([NamePruneVisitor] is the cheaper form)."]
+#[derive(Debug, Clone)]
+pub struct PathPruneVisitor {
+    patterns: Vec<Vec<GlobPart>>,
+}
+
+/// One component of a [PathPruneVisitor] pattern.
+#[derive(Debug, Clone)]
+enum GlobPart {
+    /// No glob characters: compared byte for byte.
+    Literal(Box<[u8]>),
+    /// `*` alone: any one component.
+    Any,
+    Glob(Regex),
+}
+
+impl PathPruneVisitor {
+    /// Compile `patterns`; fails on a malformed glob (an unclosed `[`, for one).
+    pub fn new<S: AsRef<str>>(patterns: &[S]) -> Result<Self, regex::Error> {
+        let mut compiled: Vec<Vec<GlobPart>> = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            let parts: Vec<GlobPart> = pattern
+                .as_ref()
+                .split('/')
+                .filter(|c: &&str| !c.is_empty())
+                .map(GlobPart::new)
+                .collect::<Result<_, _>>()?;
+            if !parts.is_empty() {
+                compiled.push(parts);
+            }
+        }
+        Ok(Self { patterns: compiled })
+    }
+
+    /// The number of patterns (empty ones are dropped).
+    pub fn patterns_len(&self) -> usize {
+        self.patterns.len()
+    }
+
+    /**
+    Whether a pattern matches the trailing components of `parent`/`name`.
+    Walked from the end, so the question costs no allocation: it is asked
+    of every subdirectory against every pattern.
+    */
+    pub fn matches(&self, parent: &[u8], name: &[u8]) -> bool {
+        self.patterns.iter().any(|pattern: &Vec<GlobPart>| {
+            let mut parts = once(name)
+                .chain(parent.rsplit(|b: &u8| *b == b'/').filter(|c: &&[u8]| !c.is_empty()));
+            pattern.iter().rev().all(|p: &GlobPart| parts.next().is_some_and(|c: &[u8]| p.matches(c)))
+        })
+    }
+}
+
+impl GlobPart {
+    fn new(component: &str) -> Result<Self, regex::Error> {
+        if component == "*" {
+            return Ok(Self::Any);
+        }
+        if !component.contains(['*', '?', '[']) {
+            return Ok(Self::Literal(component.as_bytes().into()));
+        }
+        let mut re: String = String::from("^");
+        let mut chars = component.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '*' => re.push_str(&format!("{GLOB_ONE}*")),
+                '?' => re.push_str(GLOB_ONE),
+                '[' => {
+                    re.push('[');
+                    if chars.next_if(|c: &char| *c == '!' || *c == '^').is_some() {
+                        re.push('^');
+                    }
+                    // a `]` first in the class is a member, not its end
+                    if chars.next_if_eq(&']').is_some() {
+                        re.push_str(r"\]");
+                    }
+                    loop {
+                        match chars.next() {
+                            Some(']') => break,
+                            Some(c @ ('\\' | '[' | '&' | '~' | '^')) => {
+                                re.push('\\');
+                                re.push(c);
+                            }
+                            Some(c) => re.push(c),
+                            // unclosed: the regex parser says so
+                            None => return Regex::new(&re).map(Self::Glob),
+                        }
+                    }
+                    re.push(']');
+                }
+                c => re.push_str(&regex::escape(c.encode_utf8(&mut [0u8; 4]))),
+            }
+        }
+        re.push('$');
+        Regex::new(&re).map(Self::Glob)
+    }
+
+    #[inline]
+    fn matches(&self, component: &[u8]) -> bool {
+        match self {
+            Self::Literal(lit) => **lit == *component,
+            Self::Any => true,
+            Self::Glob(re) => re.is_match(component),
+        }
+    }
+}
+
+impl Visitor for PathPruneVisitor {
+    fn prune_child(&self, parent: &WalkContext<'_>, child: u32, is_dir: bool) -> bool {
+        if !is_dir {
+            return false;
+        }
+        let name: Cow<[u8]> = decode_name(unsafe { parent.strings.borrow_str(child) });
+        self.matches(parent.path.as_os_str().as_bytes(), &name)
     }
 }
 

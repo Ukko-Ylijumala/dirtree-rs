@@ -1083,6 +1083,50 @@ fn test_tree_visitor_forces_parallel() {
 }
 
 #[test]
+fn test_path_prune_matches() {
+    let v = PathPruneVisitor::new(&["wp-content/uploads", "*/domains/*/logs", "/cache/", "sess_[0-9a-f]?", "[!.]*.bak"]).unwrap();
+    let m = |parent: &[u8], name: &[u8]| v.matches(parent, name);
+    assert!(m(b"/home/u/site/wp-content", b"uploads"));
+    assert!(!m(b"/home/u/site/wp-content/x", b"uploads"), "trailing components only");
+    assert!(!m(b"/home/u/site", b"uploads"));
+    assert!(m(b"/home/u/domains/example.com", b"logs"));
+    assert!(!m(b"/domains/example.com", b"logs"), "a leading * needs a component above");
+    assert!(m(b"/a/b", b"cache"), "slashes around a pattern change nothing");
+    assert!(m(b"/a", b"sess_7f"));
+    assert!(!m(b"/a", b"sess_7"), "? needs one character");
+    assert!(m(b"/a", b"sess_9\xff"), "? takes a byte that is not UTF-8");
+    assert!(m(b"/a", b"old.bak") && !m(b"/a", b".old.bak"));
+    assert!(m(b"/a", "\u{e4}.bak".as_bytes()), "* takes characters");
+    // non-UTF-8 components above, compared as bytes
+    assert!(m(b"/x/\xffd/wp-content", b"uploads"));
+    assert!(PathPruneVisitor::new(&["a/[bc"]).is_err(), "unclosed class");
+    assert!(PathPruneVisitor::new(&["", "/"]).unwrap().patterns_len() == 0);
+}
+
+#[test]
+fn test_tree_path_prune() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    for d in ["s1/wp-content/uploads/2024", "s1/wp-content/plugins", "s2/uploads", "domains/ex.com/logs", "domains/ex.com/public"] {
+        std::fs::create_dir_all(temp.path().join(d)).unwrap();
+        write(temp.path().join(d).join("f.php"), b"x").unwrap();
+    }
+    let visitor = PathPruneVisitor::new(&["wp-content/uploads", "*/domains/*/logs"]).unwrap();
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_visitor(Arc::new(visitor));
+    tree.walk().unwrap();
+    for kept in ["s1/wp-content/plugins/f.php", "s2/uploads/f.php", "domains/ex.com/public/f.php"] {
+        assert!(tree.contains(&format!("{dir}/{kept}")), "{kept} kept");
+    }
+    for pruned in ["s1/wp-content/uploads", "domains/ex.com/logs"] {
+        assert!(!tree.contains(&format!("{dir}/{pruned}")), "{pruned} pruned");
+    }
+    tree_validate_counts(&tree);
+}
+
+#[test]
 fn test_tree_visitor_tags() {
     const TAG: ScopeTag = 7;
     let temp: TempDir = TempDir::new().unwrap();

@@ -220,13 +220,22 @@ the cancel signal beyond the flag check; the visitor owns the *policy*
 
 ## Built-in visitors
 
-The library ships four small, composable visitors so common patterns
+The library ships five small, composable visitors so common patterns
 don't need a custom `Visitor` impl:
 
 - **`NamePruneVisitor`** — prune a fixed set of dir names. Pre-interns
   the name set at construction; `prune_child` is a `u32` membership test.
   Use case: skip `.git`, `node_modules`, `vendor`, `__pycache__`, `target`,
   `.venv` etc. globally.
+
+- **`PathPruneVisitor`** — prune directories whose trailing path
+  components match a `/`-separated glob (`wp-content/uploads`,
+  `*/domains/*/logs`), one component per glob component, `*` never
+  crossing a `/`. Literal components are compared as bytes, globs as
+  byte regexes, so non-UTF-8 names match too. Pruning the directory
+  itself drops its whole subtree, which is what matching any ancestor
+  would give. `matches(parent, name)` answers the same question outside
+  a walk (e.g. for a symlink target).
 
 - **`MarkerVisitor`** — recognize directories by marker entries that
   must all be present: names in the entry list, or nested paths below
