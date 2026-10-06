@@ -909,9 +909,8 @@ impl DirTree {
         let mut skip_children: bool = false;
         if let Some(ref v) = walk.visitor {
             let verdict = v.visit_dir(DirContext {
-                walk: &state.context(path, depth, &self.strings),
+                walk: &state.context(path, dirfd, depth, &self.strings),
                 entries: &entries,
-                dirfd,
             });
             // a rescan refreshes the tag: a marker may have come or gone
             node.set_tag(match verdict {
@@ -949,10 +948,12 @@ impl DirTree {
             let (dirs, files) = entries.split_at(n_dirs);
             node.reserve_children(entries.len());
             let each_dir = |entry: &EntryExt| {
-                self.process_par_dir(walk, path, &state, &node, scope_for_children, depth, frames, rs, entry);
+                self.process_par_dir(
+                    walk, path, dirfd, &state, &node, scope_for_children, depth, frames, rs, entry,
+                );
             };
             let each_files = |chunk: &[EntryExt]| {
-                self.process_par_files(walk, path, &state, &node, depth, dirfd, chunk);
+                self.process_par_files(walk, path, dirfd, &state, &node, depth, &entries, chunk);
             };
             rayon::join(
                 || dirs.par_iter().for_each(each_dir),
@@ -990,6 +991,7 @@ impl DirTree {
         &'env self,
         walk: &'env Walk<'env>,
         parent_path: &Path,
+        parent_fd: BorrowedFd<'_>,
         parent_state: &WalkState,
         parent_node: &Arc<Directory>,
         scope_for_children: ScopeTag,
@@ -1016,7 +1018,8 @@ impl DirTree {
         if let Some(ref v) = walk.visitor {
             let idx: u32 = self.strings.insert(encode_os(name_os).as_ref());
             child_idx = Some(idx);
-            if v.prune_child(&parent_state.context(parent_path, depth, &self.strings), idx, true) {
+            let ctx: WalkContext = parent_state.context(parent_path, parent_fd, depth, &self.strings);
+            if v.prune_child(&ctx, idx, true) {
                 return;
             }
         }
@@ -1093,7 +1096,8 @@ impl DirTree {
     passes. The first sorts out entries of undeterminable type (reported
     as faults) and those the name filters reject; the second interns the
     survivors' names with one `insert_many` call, lets the visitor prune
-    them by name index, and builds their entries. Every new name takes
+    them by name index and see each one ([Visitor::visit_file], which
+    may also have it stored or dropped), and builds their entries. Every new name takes
     stringstore's writer mutex, and with a mutex round per name the
     handoffs between workers dominated the walk of a tree of unique file
     names (it got slower past 4 workers). Names are interned only when
@@ -1116,10 +1120,11 @@ impl DirTree {
         &self,
         walk: &Walk<'_>,
         parent_path: &Path,
+        dirfd: BorrowedFd<'_>,
         parent_state: &WalkState,
         parent_node: &Directory,
         depth: usize,
-        dirfd: BorrowedFd<'_>,
+        listing: &[EntryExt<'_>],
         batch: &[EntryExt<'_>],
     ) {
         let store: bool = self.filemode().is_node();
@@ -1163,7 +1168,7 @@ impl DirTree {
             false => Vec::new(),
         };
 
-        let ctx: WalkContext = parent_state.context(parent_path, depth, &self.strings);
+        let ctx: WalkContext = parent_state.context(parent_path, dirfd, depth, &self.strings);
         let mut children: Vec<(u32, Child)> = Vec::with_capacity(if store { kept.len() } else { 0 });
         // specials go in apart from the files, to be counted apart
         let mut specials: Vec<(u32, Child)> = Vec::new();
@@ -1172,9 +1177,14 @@ impl DirTree {
         let mut size: u64 = 0;
         for (i, &(entry, kind)) in kept.iter().enumerate() {
             let idx: Option<u32> = indices.get(i).copied();
-            if let (Some(v), Some(idx)) = (&walk.visitor, idx)
-                && v.prune_child(&ctx, idx, false)
-            {
+            let verdict: FileVerdict = match (&walk.visitor, idx) {
+                (Some(v), Some(name_idx)) => match v.prune_child(&ctx, name_idx, false) {
+                    true => FileVerdict::Drop,
+                    false => v.visit_file(&FileContext { walk: &ctx, entry, name_idx, kind, listing }),
+                },
+                _ => FileVerdict::Keep,
+            };
+            if verdict == FileVerdict::Drop {
                 continue;
             }
             if kind.is_special() {
@@ -1185,7 +1195,7 @@ impl DirTree {
                     size += entry.len();
                 }
             }
-            let (true, Some(idx)) = (store, idx) else {
+            let (true, Some(idx)) = (store || verdict == FileVerdict::Store, idx) else {
                 continue;
             };
             let target: Option<u32> = match kind {
@@ -1946,9 +1956,15 @@ impl Walk<'_> {
 }
 
 impl WalkState {
-    /// The [WalkContext] of the directory at `path` that this state belongs to, for the visitor.
+    /// The [WalkContext] of the directory at `path` (open as `dirfd`) that this state belongs to.
     #[inline]
-    fn context<'a>(&self, path: &'a Path, depth: usize, strings: &'a UniqueStrStore) -> WalkContext<'a> {
+    fn context<'a>(
+        &self,
+        path: &'a Path,
+        dirfd: BorrowedFd<'a>,
+        depth: usize,
+        strings: &'a UniqueStrStore,
+    ) -> WalkContext<'a> {
         WalkContext {
             path,
             name_idx: self.name_idx,
@@ -1956,6 +1972,7 @@ impl WalkState {
             depth,
             scope: self.scope,
             strings,
+            dirfd,
         }
     }
 }

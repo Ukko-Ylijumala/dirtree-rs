@@ -961,6 +961,89 @@ fn test_tree_visitor_tags() {
     assert_eq!(tagged(&tree), HashSet::from([at("b"), at("c/d")]));
 }
 
+/// What [PhpSelector] saw of a `.php` file: its name, size, whether a `.htaccess` is beside it, its content.
+type PhpSeen = (String, u64, bool, Vec<u8>);
+
+/**
+Selects the regular `.php` files of a walk, read through their directory's
+fd, and has them stored whatever the file mode; drops `*.log` files.
+*/
+#[derive(Debug, Default)]
+struct PhpSelector {
+    seen: Mutex<Vec<PhpSeen>>,
+    calls: AtomicU64,
+}
+
+impl Visitor for PhpSelector {
+    fn visit_file(&self, ctx: &FileContext<'_>) -> FileVerdict {
+        self.calls.fetch_add(1, Relaxed);
+        let name: &[u8] = ctx.entry.name_as_bytes();
+        if name.ends_with(b".log") {
+            return FileVerdict::Drop;
+        }
+        if !name.ends_with(b".php") || ctx.kind != FileKind::File {
+            return FileVerdict::Keep;
+        }
+        let (mut file, st) = ctx.entry.open_regular().unwrap();
+        let mut content: Vec<u8> = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut content).unwrap();
+        let name: String = ctx.walk.strings.get(ctx.name_idx).unwrap().to_owned();
+        let beside: bool = ctx.sibling(b".htaccess").is_some();
+        self.seen.lock().push((name, st.st_size as u64, beside, content));
+        FileVerdict::Store
+    }
+}
+
+#[test]
+fn test_visitor_visit_file() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    for d in ["site/sub", "mail/cur", "mail/new", "mail/tmp"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    write(at("site/index.php"), b"<?php a").unwrap();
+    write(at("site/.htaccess"), b"").unwrap();
+    write(at("site/readme.txt"), b"r").unwrap();
+    write(at("site/error.log"), b"e").unwrap();
+    write(at("site/sub/deep.php"), b"<?php b").unwrap();
+    symlink("index.php", at("site/link.php")).unwrap();
+    mkfifo(&at("site/pipe.php"));
+    write(at("mail/new/msg.php"), b"<?php c").unwrap();
+
+    // a directory skeleton (no files stored), the claimed maildir not looked into
+    let obs: Arc<CountingObserver> = Arc::new(CountingObserver::default());
+    let selector: Arc<PhpSelector> = Arc::new(PhpSelector::default());
+    let maildir = Marker::dir_named("cur").and_dir("new").and_dir("tmp").tag(9).descend(false);
+    let visitor = CompositeVisitor::new()
+        .add(MarkerVisitor::new().marker(maildir))
+        .add_arc(selector.clone());
+    let tree: DirTree = DirTree::new(FileMode::UNSET, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_visitor(Arc::new(visitor))
+        .with_observer(obs.clone());
+    tree.walk().unwrap();
+
+    let mut seen: Vec<PhpSeen> = selector.seen.lock().clone();
+    seen.sort();
+    assert_eq!(seen, [
+        ("deep.php".to_owned(), 7, false, b"<?php b".to_vec()),
+        ("index.php".to_owned(), 7, true, b"<?php a".to_vec()),
+    ]);
+    // every file but the maildir's, specials included
+    assert_eq!(selector.calls.load(Relaxed), 7);
+    // only the selected files are stored, and the dropped log is not counted
+    for (path, stored) in [("site/index.php", true), ("site/sub/deep.php", true), ("site/readme.txt", false)] {
+        assert_eq!(tree.contains(&at(path).to_string_lossy()), stored, "{path}");
+    }
+    assert_eq!(tree.conf().files(), 2);
+    assert_eq!(obs.files.load(Relaxed), 4, "index, readme, deep, and the link");
+    // the claimed maildir is recorded, nothing below it
+    assert!(tree.contains(&at("mail").to_string_lossy()));
+    assert!(!tree.contains(&at("mail/new").to_string_lossy()));
+}
+
 /// A walk with `marker` on a WordPress-like tree; the tagged dirs and the events, by name.
 fn marker_walk(build: impl Fn(&UniqueStrStore) -> Marker) -> (HashSet<String>, Vec<WalkEvent>, TempDir, DirTree) {
     const TAG: ScopeTag = 3;

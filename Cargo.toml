@@ -36,7 +36,7 @@ git = "https://github.com/Ukko-Ylijumala/custom_xxh3"
 
 [dependencies.dirhandle]
 git = "https://github.com/Ukko-Ylijumala/dirhandle-rs"
-version = "0.6.2"
+version = "0.6.3"
 
 [dependencies.stringstore]
 git = "https://github.com/Ukko-Ylijumala/stringstore-rs"
@@ -47,7 +47,7 @@ version = "0.3.4"
 git = "https://github.com/Ukko-Ylijumala/timesince-rs"
 
 [dependencies.miniutils]
-version = "0.3.4"
+version = "0.3.5"
 git = "https://github.com/Ukko-Ylijumala/miniutils-rs"
 default-features = false
 
@@ -56,7 +56,7 @@ ctor = "0.2"
 tempfile = "3.10"
 
 [dev-dependencies.miniutils]
-version = "0.3.4"
+version = "0.3.5"
 git = "https://github.com/Ukko-Ylijumala/miniutils-rs"
 default-features = false
 features = ["testtree"]

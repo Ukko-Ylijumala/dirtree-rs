@@ -29,11 +29,15 @@ Goals:
 - Per-scope max-depth so phase-2 scans (e.g. enumerating top-level entries
   of `plugins/`) can be expressed as part of the same walk if desired.
 
+- A per-file hook (`visit_file`) that sees every non-directory entry with
+  its kind, a lazy stat and its siblings, so a consumer can select and
+  open candidates relative to their directory while the walk goes on.
+
 Non-goals:
 
-- Reading file contents during the walk. Bounded reads (e.g. the 8 KB plugin
-  header read in the WP scanner) belong in a downstream consumer driven by
-  the discovery channel.
+- Reading file contents in the walker itself. Bounded reads (e.g. the 8 KB
+  plugin header read in the WP scanner) belong to the consumer: in its
+  `visit_file`, or downstream of the discovery channel.
 - DB enrichment, header parsing, or any other domain processing.
 - Replacing `Filters` (regex include/exclude). The two coexist; visitors
   are evaluated alongside, not instead of, the regex filters.
@@ -90,12 +94,20 @@ pub struct WalkContext<'a> {
     pub depth: usize,
     pub scope: ScopeTag,
     pub strings: &'a UniqueStrStore,
+    pub dirfd: BorrowedFd<'a>,  // the directory, open: for *at() calls
 }
 
 pub struct DirContext<'a> {
     pub walk: &'a WalkContext<'a>,
     pub entries: &'a [EntryExt],
-    pub dirfd: BorrowedFd<'a>,  // for type_at(): one fstatat below the dir
+}
+
+pub struct FileContext<'a> {
+    pub walk: &'a WalkContext<'a>,   // of the file's directory
+    pub entry: &'a EntryExt<'a>,     // lazy stat, open_regular()
+    pub name_idx: u32,
+    pub kind: FileKind,
+    pub listing: &'a [EntryExt<'a>], // siblings, see sibling()
 }
 
 pub enum Verdict {
@@ -104,9 +116,12 @@ pub enum Verdict {
     Tag { tag: ScopeTag, new_scope: ScopeTag, descend: bool },
 }
 
+pub enum FileVerdict { Keep, Store, Drop }
+
 pub trait Visitor: Send + Sync {
     fn visit_dir(&self, _ctx: DirContext<'_>) -> Verdict { Verdict::Continue }
     fn prune_child(&self, _parent: &WalkContext<'_>, _child_name_idx: u32, _is_dir: bool) -> bool { false }
+    fn visit_file(&self, _ctx: &FileContext<'_>) -> FileVerdict { FileVerdict::Keep }
     fn max_depth(&self, _scope: ScopeTag) -> usize { 0 }
 }
 ```
@@ -136,6 +151,20 @@ following extra steps per directory:
 7. For each child entry, before insertion / recursion, call
    `visitor.prune_child(&ctx, child_name_idx, is_dir)`. If it returns
    `true`, the child is dropped.
+8. For each non-directory entry that survived, call
+   `visitor.visit_file(&FileContext)`, before the entry is counted and
+   stored, whatever the file mode:
+    - `Keep`: count it, and store it if the file mode stores files.
+    - `Store`: count it and store it anyway. With a mode that stores no
+      files (`FileMode::UNSET`), the tree is a directory skeleton plus
+      the files the visitor selected.
+    - `Drop`: as a prune, neither counted nor stored.
+
+File entries are handled in batches (`process_par_files`): the names
+the filters let through are interned with one `insert_many` call, and
+only then pruned and visited by name index. Steps 7 and 8 run on many
+walker threads at once, and `SkipChildren` or a claim skips both for
+the directory's own entries.
 
 The existing `Filters` regex include/exclude still runs alongside the
 visitor's `prune_child`. They compose: prune wins, then filter. This means
@@ -219,7 +248,8 @@ don't need a custom `Visitor` impl:
 - **`CompositeVisitor`** — fan out to N visitors. Verdict combination
   rule: most restrictive wins (`SkipChildren` > `Tag{descend:false}` >
   `Tag{descend:true}` > `Continue`). Multiple `Tag`s emit multiple
-  `WalkEvent`s. Prune is OR (any inner pruning prunes). Max-depth is min
+  `WalkEvent`s. Prune is OR (any inner pruning prunes). Every inner
+  `visit_file` runs, and `Drop` > `Store` > `Keep`. Max-depth is min
   (any inner depth cap caps).
 
 ## Worked example: WordPress scanner

@@ -382,6 +382,15 @@ impl Visitor for CompositeVisitor {
             .any(|v| v.prune_child(parent, child_name_idx, is_dir))
     }
 
+    fn visit_file(&self, ctx: &FileContext<'_>) -> FileVerdict {
+        // every inner visitor sees the entry, even after one has dropped it
+        let mut acc = FileVerdict::Keep;
+        for v in &self.inner {
+            acc = acc.combine(v.visit_file(ctx));
+        }
+        acc
+    }
+
     fn max_depth(&self, scope: ScopeTag) -> usize {
         // Min of non-zero caps; 0 means unbounded.
         let mut min_cap: usize = 0;

@@ -5,11 +5,12 @@ Visitor protocol for [`DirTree`].
 
 See `docs/implementation.md` for the design rationale. Brief summary:
 
-- [`Visitor`] is a per-directory hook + per-child prune + per-scope depth
-  cap. It is invoked from the parallel walker (`populate_par_inner`),
-  never from the synchronous `populate` path.
+- [`Visitor`] is a per-directory hook + per-child prune + per-file hook +
+  per-scope depth cap. It is invoked from the parallel walker
+  (`populate_par_inner`), never from the synchronous `populate` path.
 - [`Verdict`] is the visitor's answer for a directory: continue, skip
   children, or tag (with optional new scope, optional non-descent).
+  [`FileVerdict`] is its answer for a file: keep, store anyway, or drop.
 - [`WalkContext`] / [`DirContext`] carry pre-interned `u32` name indices
   so prune callbacks can answer with a handful of integer compares and
   zero allocations.
@@ -23,6 +24,8 @@ per child, prune wins over filter, both veto.
 
 [`DirTree`]: super::DirTree
 */
+
+use super::node::FileKind;
 
 use dirhandle::{
     EntryExt,
@@ -73,28 +76,58 @@ pub struct WalkContext<'a> {
     /// Reference to the tree's string interner. Visitors that need to
     /// resolve a `u32` back to a `&str` (rare) can use this.
     pub strings: &'a UniqueStrStore,
+    /**
+    The directory itself, open: for `*at()` calls relative to it, such
+    as dirhandle's `open_regular_at()` or [DirContext::type_at]. Open
+    entries through it, never through `path`: a path may be longer than
+    `PATH_MAX`, and any of its components may have been swapped for a
+    symlink since the walk passed it.
+    */
+    pub dirfd: BorrowedFd<'a>,
 }
 
 /**
 Per-call context for [`Visitor::visit_dir`].
 
 Bundles the [`WalkContext`] with the freshly-read dirent list of the
-directory, and the directory's open fd. The slice is borrowed from a
-`Vec<EntryExt>` collected by the walker; do not retain references to it
-past the `visit_dir` call.
+directory (whose fd is [`WalkContext::dirfd`]). The slice is borrowed
+from a `Vec<EntryExt>` collected by the walker; do not retain references
+to it past the `visit_dir` call.
 */
 #[derive(Clone, Copy)]
 pub struct DirContext<'a> {
     pub walk: &'a WalkContext<'a>,
     pub entries: &'a [EntryExt<'a>],
-    /// The directory itself, open for `*at()` calls (see [DirContext::type_at]).
-    pub dirfd: BorrowedFd<'a>,
+}
+
+/**
+Per-call context for [`Visitor::visit_file`]: one non-directory entry,
+in the [`WalkContext`] of its directory (`walk.dirfd` is that directory,
+open), with the directory's whole listing for sibling lookups.
+
+The entry carries its type from `readdir` and a lazy, cached stat:
+`entry.stat()` (or `len()`, `mode()`, `mtime()`, ...) is one `fstatat` on
+the directory's fd, the first time only. `entry.open_regular()` opens it
+for reading - no symlink followed, no blocking on a FIFO, regular files
+only - and fills that cache from the opened file. Do not retain the
+references past the `visit_file` call.
+*/
+#[derive(Clone, Copy)]
+pub struct FileContext<'a> {
+    pub walk: &'a WalkContext<'a>,
+    pub entry: &'a EntryExt<'a>,
+    /// Interned name of the entry.
+    pub name_idx: u32,
+    /// The entry's kind (a regular file, a symlink or another special file).
+    pub kind: FileKind,
+    /// Every entry of the directory, subdirectories included.
+    pub listing: &'a [EntryExt<'a>],
 }
 
 impl DirContext<'_> {
     /// The entry of this directory named `name` (raw bytes), if listed.
     pub fn entry(&self, name: &[u8]) -> Option<&EntryExt<'_>> {
-        self.entries.iter().find(|e: &&EntryExt| e.file_name().to_bytes() == name)
+        listed(self.entries, name)
     }
 
     /**
@@ -105,7 +138,7 @@ impl DirContext<'_> {
     directory itself, [DirContext::entry] answers without a syscall.
     */
     pub fn type_at(&self, rel: &[u8]) -> Option<Type> {
-        let st = fstatat(self.dirfd, rel, AtFlags::AT_SYMLINK_NOFOLLOW).ok()?;
+        let st = fstatat(self.walk.dirfd, rel, AtFlags::AT_SYMLINK_NOFOLLOW).ok()?;
         Some(match SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT {
             SFlag::S_IFDIR => Type::Directory,
             SFlag::S_IFREG => Type::File,
@@ -117,6 +150,18 @@ impl DirContext<'_> {
             _ => return None,
         })
     }
+}
+
+impl FileContext<'_> {
+    /// The entry of the same directory named `name` (raw bytes), if listed: no syscall.
+    pub fn sibling(&self, name: &[u8]) -> Option<&EntryExt<'_>> {
+        listed(self.listing, name)
+    }
+}
+
+/// The entry of `entries` named `name` (raw bytes), if any.
+fn listed<'e>(entries: &'e [EntryExt<'e>], name: &[u8]) -> Option<&'e EntryExt<'e>> {
+    entries.iter().find(|e: &&EntryExt| e.name_as_bytes() == name)
 }
 
 /// The visitor's answer for the directory currently being walked.
@@ -191,6 +236,40 @@ impl Verdict {
 }
 
 /**
+The visitor's answer for a non-directory entry ([`Visitor::visit_file`]).
+*/
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FileVerdict {
+    /// Count the entry, and store it if the tree's [`FileMode`](super::FileMode) stores files.
+    #[default]
+    Keep,
+    /**
+    Count the entry and store it whatever the file mode: e.g. a
+    directory skeleton (a mode that stores no files) that keeps the
+    files a scanner selected, and nothing else.
+    */
+    Store,
+    /// Drop the entry, as [`Visitor::prune_child`] would: neither counted nor stored.
+    Drop,
+}
+
+impl FileVerdict {
+    /**
+    Combine two answers. Used by [`super::CompositeVisitor`].
+
+    Precedence: `Drop` > `Store` > `Keep`.
+    */
+    pub fn combine(self, other: Self) -> Self {
+        use FileVerdict::*;
+        match (self, other) {
+            (Drop, _) | (_, Drop) => Drop,
+            (Store, _) | (_, Store) => Store,
+            _ => Keep,
+        }
+    }
+}
+
+/**
 A single discovery event emitted whenever a [`Visitor`] returns
 [`Verdict::Tag`]. Streamed on the optional `Sender<WalkEvent>`
 configured on the tree.
@@ -241,6 +320,24 @@ pub trait Visitor: Send + Sync + std::fmt::Debug {
     }
 
     /**
+    Called for each non-directory entry (a regular file, a symlink or
+    another special file) that `prune_child` and the name filters let
+    through, before it is counted and stored - whatever the tree's file
+    mode, also when files are not stored at all. Not called for the
+    entries of a directory whose `visit_dir` declined its children.
+
+    The place for per-file work during the walk: select a candidate by
+    name or [`FileContext::kind`], look at its lazy stat or its
+    siblings, open it relative to its directory, and hand it on (e.g.
+    through a channel the visitor owns), so the work overlaps the walk.
+    Calls come from many walker threads at once. Default:
+    [`FileVerdict::Keep`].
+    */
+    fn visit_file(&self, _ctx: &FileContext<'_>) -> FileVerdict {
+        FileVerdict::Keep
+    }
+
+    /**
     Per-scope max recursion depth. `0` means unbounded. Called once
     per directory, before its `visit_dir`. Default: unbounded.
     */
@@ -258,6 +355,10 @@ impl<V: Visitor + ?Sized> Visitor for Arc<V> {
     #[inline]
     fn prune_child(&self, p: &WalkContext<'_>, c: u32, is_dir: bool) -> bool {
         (**self).prune_child(p, c, is_dir)
+    }
+    #[inline]
+    fn visit_file(&self, ctx: &FileContext<'_>) -> FileVerdict {
+        (**self).visit_file(ctx)
     }
     #[inline]
     fn max_depth(&self, scope: ScopeTag) -> usize {
