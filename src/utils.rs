@@ -6,6 +6,7 @@
 
 use std::{
     any::Any,
+    os::fd::{AsRawFd, BorrowedFd},
     sync::{
         atomic::{AtomicU32, Ordering::Relaxed},
         Arc, Weak,
@@ -14,6 +15,13 @@ use std::{
 
 /// Path component separator of the paths the tree stores.
 pub(crate) const PATH_SEP: &str = "/";
+/// Where a process's open fds can be named by a path (see [proc_fd_path]).
+const PROC_SELF_FD: &str = "/proc/self/fd";
+
+/// The `/proc/self/fd` link of `fd`: a path that names what `fd` holds open, for calls that take only a path.
+pub(crate) fn proc_fd_path(fd: BorrowedFd<'_>) -> String {
+    format!("{PROC_SELF_FD}/{}", fd.as_raw_fd())
+}
 
 // Define a trait to handle conversion to a Weak reference
 pub(crate) trait ToWeak<T> {

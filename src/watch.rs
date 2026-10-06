@@ -49,6 +49,7 @@ use super::conf::NodeCounts;
 use super::dirtree::NewChild;
 use super::node::{Child, Directory, FileEntry, FileKind, mode_type};
 use super::osname::{decode_os, encode_os};
+use super::utils::proc_fd_path;
 
 use dashmap::DashMap;
 use dirhandle::{
@@ -93,8 +94,6 @@ const DIR_MASK: u32 = libc::IN_CREATE
     | libc::IN_MOVE_SELF
     | libc::IN_ONLYDIR
     | libc::IN_EXCL_UNLINK;
-/// Where a process's open fds can be named by a path, for inotify (see `proc_fd_path`).
-const PROC_SELF_FD: &str = "/proc/self/fd";
 /**
 How long a detached `IN_MOVED_FROM` subtree waits for its matching
 `IN_MOVED_TO` cookie before being dropped as moved-out-of-tree. The
@@ -280,7 +279,8 @@ impl TreeWatcher {
     on the directory held open, never on whatever a path names by now.
     */
     fn add_watch(&self, node: &Arc<Directory>, fd: BorrowedFd<'_>) {
-        let link: CString = proc_fd_path(fd);
+        // digits and slashes: no NUL
+        let link: CString = CString::new(proc_fd_path(fd)).unwrap_or_default();
         let wd: i32 =
             unsafe { libc::inotify_add_watch(self.ino_fd.as_raw_fd(), link.as_ptr(), DIR_MASK) };
         if wd < 0 {
@@ -872,12 +872,6 @@ impl TreeWatcher {
         }
         true
     }
-}
-
-/// The `/proc/self/fd` link of `fd`, to name the very directory it holds open by a path.
-fn proc_fd_path(fd: BorrowedFd<'_>) -> CString {
-    // digits and slashes: no NUL
-    CString::new(format!("{PROC_SELF_FD}/{}", fd.as_raw_fd())).unwrap_or_default()
 }
 
 /* ===== test hooks ===== */

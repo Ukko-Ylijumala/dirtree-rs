@@ -70,7 +70,7 @@ pub use observer::{NoopObserver, TreeObserver};
 pub use opener::FileOpener;
 pub use osname::{decode_name, decode_os, decode_path, encode_name, encode_os, is_escaped};
 pub use traverse::{traverse_from, traverse_from_par, walk_nodes};
-pub use update::UpdateStats;
+pub use update::{TreeChange, UpdateStats};
 pub use visitor::*;
 pub use visitors::*;
 pub use watch::TreeWatcher;

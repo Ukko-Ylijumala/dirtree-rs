@@ -15,7 +15,7 @@ use std::{
     mem::size_of,
     fs::{remove_file, rename, write},
     hash::{Hash, Hasher},
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::{ffi::OsStrExt, fs::symlink},
     panic,
     path::{Path, PathBuf},
@@ -793,6 +793,66 @@ fn test_snapshot_files_and_worker() {
     again.save_to(&file).unwrap();
     tree.stop_worker().unwrap();
     loaded.stop_worker().unwrap();
+}
+
+#[test]
+fn test_apply_changes() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |p: &str| temp.path().join(p);
+    for d in ["a", "b", "c/d", "e"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    write(at("b/x.bin"), b"x").unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    let node = |p: &str| tree.get_dir(&format!("{dir}/{p}")).unwrap();
+
+    write(at("a/new.bin"), b"").unwrap();
+    remove_file(at("b/x.bin")).unwrap();
+    write(at("c/d/new.bin"), b"").unwrap();
+    std::fs::remove_dir(at("e")).unwrap();
+    let e: Arc<Directory> = node("e");
+    tree.remove(&format!("{dir}/e")).unwrap();
+    let stats: UpdateStats = tree.apply_changes([
+        TreeChange::Dir(node("a")),
+        TreeChange::Dir(node("c/d")), // covered by c's subtree
+        TreeChange::Subtree(node("c")),
+        TreeChange::Dir(node("a")), // twice
+        TreeChange::Dir(node("b")),
+        TreeChange::Dir(e), // no longer in the tree
+    ]);
+    assert_eq!((stats.added_files, stats.removed_files, stats.errors), (2, 1, 0), "{stats}");
+    assert_eq!(stats.scanned_dirs, 4, "a, b, c and c/d, once each: {stats}");
+    assert!(tree.contains(&format!("{dir}/c/d/new.bin")));
+
+    // lost changes: every walk root's subtree
+    write(at("b/y.bin"), b"").unwrap();
+    let stats: UpdateStats = tree.apply_changes([TreeChange::Dir(node("a")), TreeChange::Lost]);
+    assert_eq!(stats.added_files, 1, "{stats}");
+    assert_eq!(stats.scanned_dirs, 5, "the root, a, b, c, c/d: {stats}");
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_dir_by_fd() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    std::fs::create_dir_all(temp.path().join("a/b")).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    let b: DirHandle = DirHandle::new(&temp.path().join("a/b")).unwrap();
+    let found: Arc<Directory> = tree.dir_by_fd(b.as_fd()).expect("a/b by its fd");
+    assert!(Arc::ptr_eq(&found, &tree.get_dir(&format!("{dir}/a/b")).unwrap()));
+    /*
+    Replaced by another directory of the same name: not the one the tree
+    holds. The old one stays open, so its inode cannot be reused.
+    */
+    std::fs::remove_dir(temp.path().join("a/b")).unwrap();
+    std::fs::create_dir(temp.path().join("a/b")).unwrap();
+    let new_b: DirHandle = DirHandle::new(&temp.path().join("a/b")).unwrap();
+    assert!(tree.dir_by_fd(new_b.as_fd()).is_none(), "another inode");
+    assert!(tree.dir_by_fd(b.as_fd()).is_none(), "removed: no path");
+    let other: TempDir = TempDir::new().unwrap();
+    assert!(tree.dir_by_fd(DirHandle::new(other.path()).unwrap().as_fd()).is_none());
 }
 
 #[test]

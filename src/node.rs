@@ -139,6 +139,20 @@ impl Directory {
         self.parent.is_none()
     }
 
+    /// Whether this directory is still in its tree: every ancestor up to the root is.
+    pub fn is_attached(&self) -> bool {
+        let Some(mut current) = self.parent() else {
+            return self.is_root();
+        };
+        while !current.is_root() {
+            match current.parent() {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// The parent directory; [None] for the root, or for a directory
     /// whose parent has been removed from the tree.
     #[inline]

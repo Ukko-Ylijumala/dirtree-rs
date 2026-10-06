@@ -6,8 +6,10 @@ the differences to the tree - insert entries that appeared, remove
 entries that vanished, replace entries whose inode changed, and
 optionally recurse into unchanged subdirectories to diff them too.
 
-This is the repair primitive behind [`TreeOp::Update`] and the inotify
-queue-overflow recovery in [`TreeWatcher`](super::TreeWatcher). Unlike
+This is the repair primitive behind [`TreeOp::Update`], the inotify
+queue-overflow recovery in [`TreeWatcher`](super::TreeWatcher), and
+[`DirTree::apply_changes`], which applies what any other change source
+(fanotify, a change log, a poll) reports. Unlike
 a blind re-scan (which can only ever add nodes), the diff detects and
 removes stale tree entries as well.
 
@@ -27,15 +29,18 @@ use super::conf::NodeCounts;
 use super::dirtree::NewChild;
 use super::node::{Child, DirTreeHashMap, Directory, FileEntry, FileKind, NodeRef, ctime_stamp};
 use super::osname::{decode_os, encode_os};
+use super::utils::proc_fd_path;
 
-use dirhandle::{DirHandle, EntryExt, nix::sys::stat::fstat};
+use dirhandle::{DirHandle, EntryExt, nix::{fcntl::readlink, sys::stat::fstat}};
 use timesince::SecondsSinceEpoch;
 use tracing::{debug, instrument, trace};
 
 use std::{
     borrow::Cow,
+    collections::HashSet,
     ffi::OsStr,
     fmt::{self, Display, Formatter},
+    ops::AddAssign,
     io::{Error, ErrorKind},
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
     os::unix::ffi::OsStrExt,
@@ -109,6 +114,39 @@ impl Display for UpdateStats {
     }
 }
 
+impl AddAssign for UpdateStats {
+    fn add_assign(&mut self, o: Self) {
+        self.scanned_dirs += o.scanned_dirs;
+        self.skipped_dirs += o.skipped_dirs;
+        self.added_dirs += o.added_dirs;
+        self.added_files += o.added_files;
+        self.added_specials += o.added_specials;
+        self.removed_dirs += o.removed_dirs;
+        self.removed_files += o.removed_files;
+        self.removed_specials += o.removed_specials;
+        self.replaced += o.replaced;
+        self.errors += o.errors;
+    }
+}
+
+/**
+A change to apply to a tree ([`DirTree::apply_changes`]), as a change
+source reports it. Each names the directory by its node: a source that
+has a directory fd (fanotify's file handles, through
+`open_by_handle_at`) finds it with [`DirTree::dir_by_fd`]. A file
+changed in place needs none: the tree holds no content, and its entry
+stays the same.
+*/
+#[derive(Clone, Debug)]
+pub enum TreeChange {
+    /// Entries of this directory came, went or were replaced: diff its listing.
+    Dir(Arc<Directory>),
+    /// Anything below this directory may have changed: diff the whole subtree.
+    Subtree(Arc<Directory>),
+    /// The source lost changes (its queue overflowed): diff every walk root's subtree.
+    Lost,
+}
+
 /// Internal atomic accumulator shared across the parallel diff.
 #[derive(Default)]
 struct UpdateCtr {
@@ -165,16 +203,22 @@ impl DirTree {
         path: &str,
         recursive: Option<bool>,
     ) -> Result<UpdateStats, Error> {
-        let node: Arc<Directory> = match self.get_node(path) {
-            Some(NodeRef::Dir(dir)) => dir,
-            Some(NodeRef::File { .. }) => {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("Not a directory: {path}"),
-                ));
-            }
-            None => return Err(Error::new(ErrorKind::NotFound, format!("Not in tree: {path}"))),
-        };
+        match self.get_node(path) {
+            Some(NodeRef::Dir(dir)) => self.update_node(&dir, recursive),
+            Some(NodeRef::File { .. }) => Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Not a directory: {path}"),
+            )),
+            None => Err(Error::new(ErrorKind::NotFound, format!("Not in tree: {path}"))),
+        }
+    }
+
+    /// [DirTree::update] of the directory `node`, for a caller that holds it already.
+    pub fn update_node(&self, node: &Arc<Directory>, recursive: Option<bool>) -> Result<UpdateStats, Error> {
+        if !node.is_attached() {
+            return Err(Error::new(ErrorKind::NotFound, "Directory no longer in the tree"));
+        }
+        let node: Arc<Directory> = node.clone();
         /*
         The trie root and the intermediate nodes above a walk root (inode
         0, created without a stat) were never listed: their children are
@@ -182,14 +226,14 @@ impl DirTree {
         its other entries on disk as new and fully scan them (all of `/`
         for the trie root).
         */
+        // canonical path from the trie (normalizes e.g. trailing slashes)
+        let full: PathBuf = node.path(&self.strings);
         if node.inode() == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
-                format!("Not a scanned directory (above the tree root?): {path}"),
+                format!("Not a scanned directory (above the tree root?): {}", full.display()),
             ));
         }
-        // canonical path from the trie (normalizes e.g. trailing slashes)
-        let full: PathBuf = node.path(&self.strings);
         let recursive: bool = recursive.unwrap_or(self.conf.recursive());
         let ctr: UpdateCtr = UpdateCtr::default();
         // opened from its walk root (or a pooled ancestor), not by its path
@@ -546,5 +590,91 @@ impl DirTree {
                 self.conf.observer().files_added(1, 0);
             }
         }
+    }
+}
+
+/* ===== change sources ===== */
+
+impl DirTree {
+    /**
+    Apply a batch of changes from a change source (see [TreeChange]):
+    each directory named is diffed, a subtree in full. A change already
+    covered by a subtree change in the batch is dropped, as is a second
+    change of one directory; one that is no longer in the tree (removed
+    by an earlier change) is skipped. A [TreeChange::Lost] diffs the
+    subtree of every walk root instead. Returns what the diffs did.
+    */
+    pub fn apply_changes<I: IntoIterator<Item = TreeChange>>(&self, changes: I) -> UpdateStats {
+        let mut subtrees: Vec<Arc<Directory>> = Vec::new();
+        let mut dirs: Vec<Arc<Directory>> = Vec::new();
+        for change in changes {
+            match change {
+                TreeChange::Dir(d) => dirs.push(d),
+                TreeChange::Subtree(d) => subtrees.push(d),
+                TreeChange::Lost => {
+                    subtrees = self.walk_roots();
+                    dirs.clear();
+                    break;
+                }
+            }
+        }
+        let whole: HashSet<*const Directory> = subtrees.iter().map(Arc::as_ptr).collect();
+        let covered = |d: &Arc<Directory>, from_parent: bool| -> bool {
+            let mut current: Option<Arc<Directory>> = if from_parent { d.parent() } else { Some(d.clone()) };
+            while let Some(c) = current {
+                if whole.contains(&Arc::as_ptr(&c)) {
+                    return true;
+                }
+                current = c.parent();
+            }
+            false
+        };
+        let mut seen: HashSet<*const Directory> = HashSet::new();
+        let mut stats: UpdateStats = UpdateStats::default();
+        let todo = subtrees
+            .iter()
+            .filter(|d| !covered(d, true))
+            .map(|d| (d, true))
+            .chain(dirs.iter().filter(|d| !covered(d, false)).map(|d| (d, false)));
+        for (dir, recursive) in todo {
+            if !seen.insert(Arc::as_ptr(dir)) {
+                continue;
+            }
+            match self.update_node(dir, Some(recursive)) {
+                Ok(s) => stats += s,
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(_) => stats.errors += 1,
+            }
+        }
+        stats
+    }
+
+    /**
+    The tree's directory open as `fd`, for a change source that reports
+    a directory by an fd or a file handle (fanotify; `open_by_handle_at`
+    gives the fd). Found by the path the kernel has for the fd, and
+    checked by inode, so [None] for a directory the tree does not hold,
+    one removed since, or one the tree knows by another path (a walk root
+    named through a symlink: the kernel's path has none).
+    */
+    pub fn dir_by_fd(&self, fd: BorrowedFd<'_>) -> Option<Arc<Directory>> {
+        let st: libc::stat = fstat(fd).ok()?;
+        let path = readlink(proc_fd_path(fd).as_str()).ok()?;
+        let dir: Arc<Directory> = self.get_dir(encode_os(&path).as_ref())?;
+        (dir.inode() == st.st_ino).then_some(dir)
+    }
+
+    /// The topmost walk roots: walk-root directories with no walk root above them.
+    pub(super) fn walk_roots(&self) -> Vec<Arc<Directory>> {
+        let mut roots: Vec<Arc<Directory>> = Vec::new();
+        let mut todo: Vec<Arc<Directory>> = vec![self.root()];
+        while let Some(dir) = todo.pop() {
+            if dir.is_walk_root() {
+                roots.push(dir);
+                continue;
+            }
+            todo.extend(dir.children().read().values().filter_map(|c: &Child| c.as_dir().cloned()));
+        }
+        roots
     }
 }
