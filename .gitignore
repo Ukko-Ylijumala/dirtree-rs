@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+
+# Profiling etc:
+*.log
+perf.data*
+heaptrack.*

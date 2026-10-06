@@ -95,8 +95,7 @@ Trie structure for storing a directory tree.
 
 You can use it f.ex. like this:
 ```
-use statter::{FileMode, Filters};
-use statter::tree::DirTree;
+use dirtree::{DirTree, FileMode, Filters};
 
 let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
     .from_path("/tmp")

@@ -6,7 +6,6 @@
 use super::*;
 use super::utils::PATH_SEP;
 use ctor::dtor;
-use libc;
 use parking_lot::Mutex;
 use std::{
     borrow::Cow,

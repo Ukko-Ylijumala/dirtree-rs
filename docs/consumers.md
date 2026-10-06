@@ -4,7 +4,7 @@ This is an evaluation, made before the tree module's crate split, of
 what the next two users of the tree need from it and what it still
 lacks:
 
-- **The WordPress scanner.** Still in planning (`docs/design.md`); its
+- **The WordPress scanner.** Still in planning (`docs/design.md` in its own repo, `wp-scanner`); its
   code is a stub.
 - **A web malware scanner** for shared hosting servers, currently a
   separate project with its own walker. It scans 4–6M files per host,
@@ -18,7 +18,7 @@ discovery channel, cancellation, depth limits and stored tags. Two parts
 its plan depends on do not work yet:
 
 1. **Tagging the parent is a no-op.** `MarkerTarget::Parent` is only
-   informational in `MarkerVisitor` (`src/tree/visitors.rs`). Both the
+   informational in `MarkerVisitor` (`src/visitors.rs`). Both the
    `WalkEvent` and the stored tag land on `wp-includes`, not on the WP
    root, so `DirTree::tagged(TAG_WP_ROOT)` returns the wrong
    directories.
@@ -127,7 +127,7 @@ hook (#5) can stat them lazily.
 
 Gaps 1–3 were fixed before the split:
 
-1. Lossless names: `src/tree/osname.rs`. Names are interned with
+1. Lossless names: `src/osname.rs`. Names are interned with
    non-UTF-8 bytes as private-use escapes, the same scheme the malware
    scanner uses for its path strings.
 2. Markers: every marker is evaluated at the directory it tags.

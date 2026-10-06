@@ -1,0 +1,62 @@
+[package]
+name = "dirtree"
+version = "0.4.0"
+authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
+description = "Parallel directory tree walker and in-memory filesystem trie"
+repository = "https://github.com/Ukko-Ylijumala/dirtree-rs"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+categories = ["filesystem", "caching"]
+keywords = ["filesystem", "directory", "trie", "walker", "inotify"]
+publish = false
+edition = "2024"
+# custom_xxh3 and stringstore declare 1.93
+rust-version = "1.93"
+
+[features]
+#default = ["size_of"]
+size_of = ["dep:size-of", "custom_xxh3/size_of", "dirhandle/size_of", "stringstore/size_of"]
+
+[dependencies]
+rayon = "1.10"
+crossbeam = "0.8"
+parking_lot = "0.12"
+tracing = "0.1"
+libc = "0.2"
+regex = "1.12"
+dashmap = "6.2"
+
+[dependencies.size-of]
+git = "https://github.com/Ukko-Ylijumala/size-of"
+version = "0.1.7"
+optional = true
+
+[dependencies.custom_xxh3]
+git = "https://github.com/Ukko-Ylijumala/custom_xxh3"
+
+[dependencies.dirhandle]
+git = "https://github.com/Ukko-Ylijumala/dirhandle-rs"
+version = "0.6.2"
+
+[dependencies.stringstore]
+git = "https://github.com/Ukko-Ylijumala/stringstore-rs"
+version = "0.4.4"
+
+[dependencies.timesince]
+version = "0.3.4"
+git = "https://github.com/Ukko-Ylijumala/timesince-rs"
+
+[dependencies.miniutils]
+version = "0.3.4"
+git = "https://github.com/Ukko-Ylijumala/miniutils-rs"
+default-features = false
+
+[dev-dependencies]
+ctor = "0.2"
+tempfile = "3.10"
+
+[dev-dependencies.miniutils]
+version = "0.3.4"
+git = "https://github.com/Ukko-Ylijumala/miniutils-rs"
+default-features = false
+features = ["testtree"]

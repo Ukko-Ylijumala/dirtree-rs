@@ -4,10 +4,10 @@ This document describes the visitor protocol added to `DirTree` to support
 domain-specific scans (WordPress installations, code repositories, build
 artifacts, etc.) without baking any domain knowledge into the tree itself.
 
-The driving use case is the WordPress scanner sketched in `docs/design.md`,
-but the protocol is intentionally general: the same trait shape supports any
-"walk a tree, recognize subtrees, prune aggressively, emit results as you go"
-workload.
+The driving use case is the WordPress scanner sketched in the `wp-scanner`
+repo's `docs/design.md`, but the protocol is intentionally general: the
+same trait shape supports any "walk a tree, recognize subtrees, prune
+aggressively, emit results as you go" workload.
 
 ## Goals and non-goals
 
@@ -274,10 +274,8 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
 
 ## Future work (not in this PR)
 
-- Splitting the tree module out into its own crate so other projects
-  can depend on it without pulling in statter's CLI surface.
 - Tree snapshots (save to / load from a file, then `update()` to
-  resync), planned for after the split: see `docs/snapshot.md`.
+  resync), planned next: see `docs/snapshot.md`.
 - Removal hooks on `TreeObserver` (`dirs_removed` / `files_removed`,
   default no-ops), so an observer can track the live tree size through
   `update()` and the watcher. `UpdateStats` already carries the removal

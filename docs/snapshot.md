@@ -2,8 +2,8 @@
 
 Status: **planned, not implemented.** It is to be built after the tree
 module is split into its own crate. Implementing it means replacing
-the `TreeOp::Serialize` / `TreeOp::Deserialize` stubs (`src/tree/event.rs`,
-`src/tree/worker.rs`) with `TreeOp::Save` / `TreeOp::Load`.
+the `TreeOp::Serialize` / `TreeOp::Deserialize` stubs (`src/event.rs`,
+`src/worker.rs`) with `TreeOp::Save` / `TreeOp::Load`.
 
 ## Purpose
 
@@ -13,7 +13,7 @@ start from it instead of walking the filesystem again:
 1. Load the snapshot. This makes no filesystem calls apart from
    reading the file and one `stat` of the root.
 2. Run `update()` on the root. The diff-rescan's pre-check
-   (`src/tree/update.rs`) skips a directory, on a single `stat`, when
+   (`src/update.rs`) skips a directory, on a single `stat`, when
    its ctime still equals the stamp stored for it. So only the
    directories that changed since the save are listed and diffed.
 

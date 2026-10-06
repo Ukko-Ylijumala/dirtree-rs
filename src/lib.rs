@@ -1,9 +1,17 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
 /*!
-Trie-based directory tree, scanned and held in memory.
+A parallel directory walker that keeps the tree in memory as a trie:
+directories as shared nodes, files as small values in their parent,
+names interned once. It can stay resident and follow the filesystem
+(an inotify watcher, a diff-rescan), and lets a [`Visitor`] recognize,
+tag and prune subtrees while walking. Linux only.
 
-The module is split into several submodules for clarity:
+Design notes live in `docs/`: the visitor protocol
+(`implementation.md`), planned snapshots (`snapshot.md`), and what the
+next consumers need (`consumers.md`).
+
+The crate is split into several modules for clarity:
 - `node`:     the building blocks of the trie: `Directory` (a shared node), `FileEntry` (stored by value), `Child`, `FileKind`, `NodeRef`, `NodeView`.
 - `hash`:     [`DirTreeXxh3Hasher`] used for [`HashMap`](std::collections::HashMap) keys in the trie.
 - `conf`:     [`TreeConf`] - atomic counters and feature flags.
