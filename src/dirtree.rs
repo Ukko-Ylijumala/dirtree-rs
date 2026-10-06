@@ -71,6 +71,21 @@ pub(super) enum NewChild {
 }
 
 /**
+The hooks of one walk ([DirTree::populate_par_with]), each in place of
+the tree's own ([DirTree::with_visitor], [DirTree::with_observer]) when
+set. A consumer walking several roots into one tree at once (one per
+account of a hosting server, say) gives each walk a visitor and an
+observer of its own, so that what one walk finds, counts and fails on
+stays apart from the others, while the tree and its string store are
+shared.
+*/
+#[derive(Clone, Default, Debug)]
+pub struct WalkHooks {
+    pub visitor: Option<Arc<dyn Visitor>>,
+    pub observer: Option<Arc<dyn TreeObserver>>,
+}
+
+/**
 What a parallel walk resolves once, at its start, and every directory
 of it shares by reference: the hooks it calls, whether it recurses, and
 the depth of its root.
@@ -712,9 +727,23 @@ impl DirTree {
     Uses [[DirHandle]] to read the directory entries, and its [DirHandle::iter]
     method which tries to return inner directories first using a small
     buffer to look ahead in the directory stream.
+
+    Several walks may run on one tree at once, from different threads
+    (each in a [rayon::scope] of its own): nodes are created under their
+    parent's lock, and the counters are atomic. See also
+    [DirTree::populate_par_with].
     */
     /// NOTE: If `recursive` is [None], the tree's default is used.
     pub fn populate_par(&self, path: &Path, recursive: Option<bool>) {
+        self.populate_par_with(path, recursive, &WalkHooks::default());
+    }
+
+    /**
+    [DirTree::populate_par] with `hooks` of its own for this walk: a
+    visitor and an observer that replace the tree's, where set. The
+    tree-wide counters (and [TreeConf::errors]) still count everything.
+    */
+    pub fn populate_par_with(&self, path: &Path, recursive: Option<bool>, hooks: &WalkHooks) {
         // the walker passes owned paths down; one conversion per walk root
         let path: &PathBuf = &path.to_path_buf();
         /*
@@ -743,7 +772,7 @@ impl DirTree {
                 }
             }
         };
-        let walk: Walk = self.new_walk(path, recursive);
+        let walk: Walk = self.new_walk(path, recursive, hooks);
         let state: WalkState = self.initial_walk_state(path);
         // the walk root is opened by path; a symlinked root is followed
         let handle: Result<DirHandle, Error> = DirHandle::new(path);
@@ -751,7 +780,7 @@ impl DirTree {
     }
 
     /// The [Walk] of a walk from `path`: its hooks, recursion and root depth, resolved once.
-    fn new_walk(&self, path: &Path, recursive: Option<bool>) -> Walk<'_> {
+    fn new_walk<'w>(&'w self, path: &Path, recursive: Option<bool>, hooks: &'w WalkHooks) -> Walk<'w> {
         // number of path components below the filesystem root
         let base_depth: u8 = path
             .components()
@@ -759,8 +788,8 @@ impl DirTree {
             .saturating_sub(1)
             .min(u8::MAX as usize) as u8;
         Walk {
-            visitor: self.conf.visitor(),
-            observer: self.conf.observer(),
+            visitor: hooks.visitor.clone().or_else(|| self.conf.visitor()),
+            observer: hooks.observer.as_deref().unwrap_or(self.conf.observer()),
             recursive: recursive.unwrap_or(self.conf.recursive()),
             base_depth,
         }

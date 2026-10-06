@@ -55,7 +55,7 @@ mod worker;
 
 pub use conf::{NodeCounts, TreeConf};
 pub use debug::{tree_print_debug, tree_validate_counts};
-pub use dirtree::{DirTree, DirTreeIterator};
+pub use dirtree::{DirTree, DirTreeIterator, WalkHooks};
 pub use error::{TreeError, TreeResult};
 pub use event::{EventInfo, FaultKind, TreeEvent, TreeFault, TreeOp, TreeState};
 pub use filemode::FileMode;

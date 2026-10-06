@@ -34,6 +34,12 @@ pub trait TreeObserver: Send + Sync + Debug {
     Something could not be seen or done (see [FaultKind](super::FaultKind)).
     Called once per fault, from whichever thread hit it, including the
     repeated ones the log does not keep.
+
+    This is the one complete record of the holes in a walk: a consumer
+    that reports its coverage must take it from here. The tree's event
+    log keeps only its latest few thousand events, and the faults of a
+    walk with hooks of its own ([`WalkHooks`](super::WalkHooks)) reach
+    that walk's observer, not the tree's.
     */
     fn fault(&self, _fault: &TreeFault) {}
 }

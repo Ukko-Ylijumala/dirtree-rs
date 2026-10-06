@@ -1229,6 +1229,86 @@ fn test_tree_faults() {
     assert_eq!(tree.conf().errors(), 2);
 }
 
+/// Counts and collects faults, for [test_tree_walk_hooks].
+#[derive(Debug, Default)]
+struct UnitObserver {
+    counts: CountingObserver,
+    faults: FaultObserver,
+}
+
+impl TreeObserver for UnitObserver {
+    fn dirs_added(&self, n: u64) {
+        self.counts.dirs_added(n);
+    }
+
+    fn files_added(&self, n: u64, bytes: u64) {
+        self.counts.files_added(n, bytes);
+    }
+
+    fn fault(&self, fault: &TreeFault) {
+        self.faults.fault(fault);
+    }
+}
+
+#[test]
+fn test_tree_walk_hooks() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    // two units: a/ with one .php file and an unreadable directory, b/ with two .php files
+    for d in ["a/x", "a/locked", "b/y"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    for f in ["a/x/one.php", "b/two.php", "b/y/three.php", "b/y/note.txt"] {
+        write(at(f), b"<?php").unwrap();
+    }
+
+    // the tree's own hooks, which the walks' replace
+    let tree_obs: Arc<CountingObserver> = Arc::new(CountingObserver::default());
+    let tree_sel: Arc<PhpSelector> = Arc::new(PhpSelector::default());
+    let tree: DirTree = DirTree::new(FileMode::UNSET, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_visitor(tree_sel.clone())
+        .with_observer(tree_obs.clone());
+
+    // both units walked into the one tree at once, each with hooks of its own
+    let units: Vec<(PathBuf, Arc<UnitObserver>, Arc<PhpSelector>)> = ["a", "b"]
+        .map(|u| (at(u), Arc::default(), Arc::default()))
+        .into();
+    chmod(&at("a/locked"), 0o000);
+    thread::scope(|s| {
+        for (path, obs, sel) in &units {
+            let hooks = WalkHooks { visitor: Some(sel.clone()), observer: Some(obs.clone()) };
+            let tree: &DirTree = &tree;
+            s.spawn(move || tree.populate_par_with(path, Some(true), &hooks));
+        }
+    });
+    chmod(&at("a/locked"), 0o755);
+
+    let names = |sel: &PhpSelector| -> Vec<String> {
+        let mut names: Vec<String> = sel.seen.lock().iter().map(|seen: &PhpSeen| seen.0.clone()).collect();
+        names.sort();
+        names
+    };
+    let (a, b) = (&units[0], &units[1]);
+    assert_eq!(names(&a.2), ["one.php"]);
+    assert_eq!(names(&b.2), ["three.php", "two.php"]);
+    assert_eq!((a.1.counts.dirs.load(Relaxed), a.1.counts.files.load(Relaxed)), (2, 1));
+    assert_eq!((b.1.counts.dirs.load(Relaxed), b.1.counts.files.load(Relaxed)), (1, 3));
+    let denied = TreeFault { kind: FaultKind::OpenDir, path: Some(at("a/locked")), errno: Some(libc::EACCES) };
+    assert_eq!(*a.1.faults.faults.lock(), vec![denied]);
+    assert!(b.1.faults.faults.lock().is_empty());
+
+    // the tree's hooks saw nothing, but the tree holds and counts both units
+    assert_eq!(tree_sel.calls.load(Relaxed), 0);
+    assert_eq!(tree_obs.files.load(Relaxed), 0);
+    assert_eq!(tree.conf().files(), 3);
+    assert_eq!(tree.conf().errors(), 1);
+    assert!(tree.contains(&at("b/y/three.php").to_string_lossy()));
+    tree_validate_counts(&tree);
+}
+
 #[test]
 fn test_tree_rescan_via_worker() {
     let temp: TempDir = TempDir::new().unwrap();
