@@ -583,6 +583,56 @@ fn test_tree_past_path_max() {
     tree_validate_counts(&tree);
 }
 
+#[derive(Debug, Default)]
+struct MountObserver {
+    skipped: Mutex<Vec<PathBuf>>,
+}
+
+impl TreeObserver for MountObserver {
+    fn mount_skipped(&self, path: &Path) {
+        self.skipped.lock().push(path.to_path_buf());
+    }
+}
+
+#[test]
+fn test_tree_one_filesystem() {
+    /*
+    No mount without privileges, so this walks /dev, which has mount
+    points of its own (pts, shm, mqueue...): each one directly in /dev
+    is left unlisted, and nothing else is.
+    */
+    let mounts: HashSet<PathBuf> = std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .filter_map(|l: &str| l.split(' ').nth(4).map(PathBuf::from))
+        .collect();
+    let direct: Vec<&PathBuf> = mounts.iter().filter(|m| m.parent() == Some(Path::new("/dev"))).collect();
+    let obs: Arc<MountObserver> = Arc::new(MountObserver::default());
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path("/dev")
+        .with_recursive(true)
+        .with_one_filesystem(true)
+        .with_observer(obs.clone());
+    tree.walk().unwrap();
+    let skipped: Vec<PathBuf> = obs.skipped.lock().clone();
+    for m in &direct {
+        assert!(skipped.contains(m), "{} not skipped: {skipped:?}", m.display());
+        let node: Arc<Directory> = tree.get_dir(&m.to_string_lossy()).expect("mount point node kept");
+        assert!(node.children().read().is_empty(), "{} listed", m.display());
+    }
+    for s in &skipped {
+        assert!(mounts.contains(s), "{} is not a mount point", s.display());
+    }
+
+    // a diff leaves them out again
+    obs.skipped.lock().clear();
+    tree.update("/dev", Some(true)).unwrap();
+    for m in &direct {
+        assert!(obs.skipped.lock().contains(m), "{} not skipped by the diff", m.display());
+    }
+    tree_validate_counts(&tree);
+}
+
 #[test]
 fn test_file_opener() {
     let temp: TempDir = TempDir::new().unwrap();

@@ -96,6 +96,8 @@ struct Walk<'w> {
     /// Whether this walk descends into subdirectories: the per-op flag,
     /// or the tree default.
     recursive: bool,
+    /// Whether this walk stays on one filesystem (see [WalkState::dev]).
+    one_fs: bool,
     /// Absolute path depth of the walk root (path components below `/`),
     /// used to keep the tree's depth counter in absolute-path terms while
     /// the walker itself tracks depth relative to the walk root.
@@ -112,6 +114,13 @@ struct WalkState {
     scope: ScopeTag,
     name_idx: u32,
     parent_name_idx: Option<u32>,
+    /**
+    The device (`st_dev`) of the filesystem the walk is on, when it stays
+    on one: the parent's on entry to a directory, which a directory on
+    another one does not match, and then the directory's own. 0 when
+    unknown (a walk root), or when the walk crosses filesystems.
+    */
+    dev: u64,
 }
 
 /**
@@ -560,7 +569,20 @@ impl DirTree {
         self
     }
 
-    /// Builder: walk with the synchronous walker (ignored when a visitor is set).
+    /**
+    Builder: stay on the filesystem of each walk root. A directory on
+    another one (a mount point) keeps its node, but is not listed, and
+    the observer hears of it ([`TreeObserver::mount_skipped`]). Costs one
+    `fstat` per directory, on the fd the walker holds anyway. Applies to
+    walks and to [`DirTree::update`]; a walk root is always listed, the
+    caller named it. Like a visitor, forces the parallel walker.
+    */
+    pub fn with_one_filesystem(self, val: bool) -> Self {
+        self.conf.set_one_fs(val);
+        self
+    }
+
+    /// Builder: walk with the synchronous walker (ignored when a visitor is set, or with one filesystem).
     pub fn with_sync(self, val: bool) -> Self {
         self.conf.set_sync(val);
         self
@@ -633,7 +655,7 @@ impl DirTree {
     NOTE: If `recursive` is [None], the tree's default is used.
     */
     pub fn populate_auto(&self, path: &Path, recursive: Option<bool>) {
-        match !self.conf.sync() || self.has_visitor() {
+        match !self.conf.sync() || self.has_visitor() || self.conf.one_fs() {
             true => self.populate_par(path, recursive),
             false => self.populate(path, recursive),
         }
@@ -765,11 +787,21 @@ impl DirTree {
     tree-wide counters (and [TreeConf::errors]) still count everything.
     */
     pub fn populate_par_with(&self, path: &Path, recursive: Option<bool>, hooks: &WalkHooks) {
-        self.populate_par_at(path, &DirAt::Path, recursive, hooks);
+        self.populate_par_at(path, &DirAt::Path, 0, recursive, hooks);
     }
 
-    /// [DirTree::populate_par_with] of the directory at `path`, opened from `at`.
-    pub(super) fn populate_par_at(&self, path: &Path, at: &DirAt, recursive: Option<bool>, hooks: &WalkHooks) {
+    /**
+    [DirTree::populate_par_with] of the directory at `path`, opened from
+    `at`; `dev` is its parent's device if known, else 0 (see [WalkState::dev]).
+    */
+    pub(super) fn populate_par_at(
+        &self,
+        path: &Path,
+        at: &DirAt,
+        dev: u64,
+        recursive: Option<bool>,
+        hooks: &WalkHooks,
+    ) {
         // the walker passes owned paths down; one conversion per walk root
         let path: &PathBuf = &path.to_path_buf();
         /*
@@ -802,7 +834,7 @@ impl DirTree {
             node.set_walk_root();
         }
         let walk: Walk = self.new_walk(path, recursive, hooks);
-        let state: WalkState = self.initial_walk_state(path);
+        let state: WalkState = self.initial_walk_state(path, dev);
         // a symlinked walk root is followed, see DirAt
         let handle: Result<DirHandle, Error> = at.open(path);
         rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, 0, 0));
@@ -820,6 +852,7 @@ impl DirTree {
             visitor: hooks.visitor.clone().or_else(|| self.conf.visitor()),
             observer: hooks.observer.as_deref().unwrap_or(self.conf.observer()),
             recursive: recursive.unwrap_or(self.conf.recursive()),
+            one_fs: self.conf.one_fs(),
             base_depth,
         }
     }
@@ -828,8 +861,9 @@ impl DirTree {
     Build the [`WalkState`] for the very first call into the walker.
     The interned name is the basename of `path`; if `path` has no
     basename (e.g. `/`) we fall back to interning the empty string.
+    `dev` is the parent's device when known (see [WalkState::dev]).
     */
-    fn initial_walk_state(&self, path: &Path) -> WalkState {
+    fn initial_walk_state(&self, path: &Path, dev: u64) -> WalkState {
         let name_idx = path
             .file_name()
             .map(|n| self.strings.insert(encode_os(&n).as_ref()))
@@ -838,6 +872,7 @@ impl DirTree {
             scope: SCOPE_NONE,
             name_idx,
             parent_name_idx: None,
+            dev,
         }
     }
 
@@ -921,6 +956,17 @@ impl DirTree {
             }
         };
         trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
+        let mut state: WalkState = state;
+        if walk.one_fs
+            && let Ok(st) = handle.stat()
+        {
+            if state.dev != 0 && st.st_dev != state.dev {
+                debug!(target: "MOUNT_SKIP", "{}", path.display());
+                walk.observer.mount_skipped(path);
+                return;
+            }
+            state.dev = st.st_dev;
+        }
 
         /*
         Collect the dirents first (visit_dir needs the full list anyway),
@@ -1128,6 +1174,7 @@ impl DirTree {
             scope: scope_for_children,
             name_idx: child_idx,
             parent_name_idx: Some(parent_state.name_idx),
+            dev: parent_state.dev,
         };
         // spawning is slower than direct recursion, so only spawn after
         // MAX_RECURSE_DEPTH frames to bound stack use; semantic depth

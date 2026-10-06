@@ -128,6 +128,8 @@ pub struct TreeConf {
     recursive: AtomicBool,
     resident: AtomicBool,
     sync: AtomicBool,
+    /// Stay on the filesystem of each walk root (see `DirTree::with_one_filesystem`).
+    one_fs: AtomicBool,
 }
 
 impl TreeConf {
@@ -195,6 +197,9 @@ impl TreeConf {
     pub(super) fn sync(&self) -> bool {
         self.sync.load(Relaxed)
     }
+    pub(super) fn one_fs(&self) -> bool {
+        self.one_fs.load(Relaxed)
+    }
 
     pub(super) fn set_recursive(&self, val: bool) {
         self.recursive.store(val, Relaxed);
@@ -204,6 +209,9 @@ impl TreeConf {
     }
     pub(super) fn set_sync(&self, val: bool) {
         self.sync.store(val, Relaxed);
+    }
+    pub(super) fn set_one_fs(&self, val: bool) {
+        self.one_fs.store(val, Relaxed);
     }
 
     /// A snapshot of the configured visitor, if any.

@@ -6,7 +6,7 @@ without the tree knowing who listens (a progress bar, a log, nothing).
 */
 
 use super::event::TreeFault;
-use std::fmt::Debug;
+use std::{fmt::Debug, path::Path};
 
 /// Used while no observer is set, so callers need no `Option` check.
 pub(super) static NOOP_OBSERVER: NoopObserver = NoopObserver;
@@ -42,6 +42,15 @@ pub trait TreeObserver: Send + Sync + Debug {
     that walk's observer, not the tree's.
     */
     fn fault(&self, _fault: &TreeFault) {}
+
+    /**
+    The directory at `path` is on another filesystem than its parent, and
+    was not listed: the tree stays on one filesystem
+    ([`DirTree::with_one_filesystem`](super::DirTree::with_one_filesystem)).
+    Not a fault, but a part of the tree left out on purpose, for a
+    consumer that reports its coverage. Its node stays, with no entries.
+    */
+    fn mount_skipped(&self, _path: &Path) {}
 }
 
 /// The default observer: no progress reporting.

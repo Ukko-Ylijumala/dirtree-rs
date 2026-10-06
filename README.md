@@ -51,6 +51,8 @@ code. Each tag marks the tree code as it stood in that statter release.
   kind, a lazy stat and its siblings, can open it relative to its
   directory while the walk goes on, and can have it stored even when the
   tree keeps only directories.
+- **One filesystem**, optionally (`with_one_filesystem`): mount points
+  keep their node but are not listed, and the observer hears of each one.
 - **Several walks into one tree** at once, each with a visitor and an
   observer of its own (`populate_par_with`, `WalkHooks`).
 - **No path below a root is opened by name:** the walker, `update()`,

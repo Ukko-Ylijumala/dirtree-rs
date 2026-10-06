@@ -367,7 +367,7 @@ impl TreeWatcher {
     */
     fn scan_new_dir(&self, parent: OwnedFd, full: &Path, name: &OsStr) {
         if let Some(at) = DirAt::child(&Arc::new(parent), name) {
-            self.tree.populate_par_at(full, &at, Some(true), &WalkHooks::default());
+            self.tree.populate_par_at(full, &at, 0, Some(true), &WalkHooks::default());
         }
     }
 

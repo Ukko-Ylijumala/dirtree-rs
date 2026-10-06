@@ -194,7 +194,7 @@ impl DirTree {
         let ctr: UpdateCtr = UpdateCtr::default();
         // opened from its walk root (or a pooled ancestor), not by its path
         match self.dir_at(&node) {
-            Ok(at) => rayon::scope(|s| self.update_inner(&full, node, at, recursive, &ctr, s, 0)),
+            Ok(at) => rayon::scope(|s| self.update_inner(&full, node, at, 0, recursive, &ctr, s, 0)),
             Err(e) => self.update_open_failed(&full, &node, e, &ctr),
         }
         let stats: UpdateStats = ctr.snapshot();
@@ -205,7 +205,8 @@ impl DirTree {
     /**
     Diff one directory, opened from `at` (see [DirAt]), and recurse.
     `frames` bounds direct recursion before offloading to the rayon
-    scope, like the parallel walker.
+    scope, like the parallel walker. `dev` is the parent's device when
+    the tree stays on one filesystem and it is known, else 0.
 
     The directory is held as an `O_PATH` fd throughout: the pre-check
     stats it, the diff lists it, and its subdirectories are opened
@@ -217,6 +218,7 @@ impl DirTree {
         path: &PathBuf,
         node: Arc<Directory>,
         at: DirAt,
+        dev: u64,
         recursive: bool,
         ctr: &'env UpdateCtr,
         rs: &rayon::Scope<'env>,
@@ -229,15 +231,33 @@ impl DirTree {
             Ok(fd) => Arc::new(fd),
             Err(e) => return self.update_open_failed(path, &node, e, ctr),
         };
+        let stamp: u64 = node.scan_stamp();
+        let one_fs: bool = self.conf.one_fs();
+        let st: Option<libc::stat> = match one_fs || stamp != 0 {
+            true => fstat(&*here).ok(),
+            false => None,
+        };
+        // staying on one filesystem: a mount point is left unlisted, as by the walker
+        let dev: u64 = match st {
+            Some(st) if one_fs => {
+                if dev != 0 && st.st_dev != dev {
+                    debug!(target: "MOUNT_SKIP", "{}", path.display());
+                    self.conf.observer().mount_skipped(path);
+                    return;
+                }
+                st.st_dev
+            }
+            _ => dev,
+        };
         // a subdirectory of this one, to diff (or scan) next
         let recurse = |child_p: PathBuf, child: Arc<Directory>, name: &OsStr| {
             let Some(at) = DirAt::child(&here, name) else {
                 return;
             };
             if frames < MAX_RECURSE_DEPTH {
-                self.update_inner(&child_p, child, at, recursive, ctr, rs, frames + 1);
+                self.update_inner(&child_p, child, at, dev, recursive, ctr, rs, frames + 1);
             } else {
-                rs.spawn(move |s| self.update_inner(&child_p, child, at, recursive, ctr, s, 0));
+                rs.spawn(move |s| self.update_inner(&child_p, child, at, dev, recursive, ctr, s, 0));
             }
         };
 
@@ -252,9 +272,8 @@ impl DirTree {
         server cannot hide a change. Only nodes whose baseline was set
         by an earlier, settled full diff qualify (see [MTIME_SLACK_SECS]).
         */
-        let stamp: u64 = node.scan_stamp();
         if stamp != 0
-            && let Ok(st) = fstat(&*here)
+            && let Some(st) = st
             && ctime_stamp(st.st_ctime, st.st_ctime_nsec) == stamp
         {
             trace!(target: "UPDATE_SKIP", "{} unchanged since {stamp}", path.display());
@@ -477,7 +496,11 @@ impl DirTree {
             && let Some(at) = child_p.file_name().and_then(|n: &OsStr| DirAt::child(parent_fd, n))
         {
             // a whole new subtree: full scan instead of a diff
-            self.populate_par_at(child_p, &at, Some(true), &WalkHooks::default());
+            let dev: u64 = match self.conf.one_fs() {
+                true => fstat(&**parent_fd).map_or(0, |st: libc::stat| st.st_dev),
+                false => 0,
+            };
+            self.populate_par_at(child_p, &at, dev, Some(true), &WalkHooks::default());
         }
     }
 
