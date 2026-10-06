@@ -25,6 +25,12 @@ pub enum TreeError {
     its worker was stopped, is quitting or has died.
     */
     WorkerNotRunning,
+    /// Reading or writing a snapshot file failed.
+    Io(io::Error),
+    /// A snapshot file failed a check of its format, integrity or fit (see `docs/snapshot.md`).
+    BadSnapshot(String),
+    /// A snapshot loads only into a tree that is uninitialized or empty.
+    NotEmpty,
 }
 
 impl Display for TreeError {
@@ -34,14 +40,23 @@ impl Display for TreeError {
             Self::WorkerSpawn(e) => write!(f, "failed to start the tree worker thread: {e}"),
             Self::WorkerPanicked(msg) => write!(f, "the tree worker thread panicked: {msg}"),
             Self::WorkerNotRunning => f.write_str("the tree worker thread is not running"),
+            Self::Io(e) => write!(f, "snapshot I/O failed: {e}"),
+            Self::BadSnapshot(reason) => write!(f, "bad snapshot: {reason}"),
+            Self::NotEmpty => f.write_str("a snapshot loads only into an empty tree"),
         }
+    }
+}
+
+impl From<io::Error> for TreeError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
     }
 }
 
 impl Error for TreeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::WorkerSpawn(e) => Some(e),
+            Self::WorkerSpawn(e) | Self::Io(e) => Some(e),
             _ => None,
         }
     }

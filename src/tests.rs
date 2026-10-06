@@ -633,6 +633,168 @@ fn test_tree_one_filesystem() {
     tree_validate_counts(&tree);
 }
 
+/// What a snapshot keeps of one node (see `tree_entries`).
+#[derive(Debug, PartialEq)]
+struct SavedNode {
+    path: PathBuf,
+    inode: u64,
+    kind: Option<FileKind>,
+    target: Option<PathBuf>,
+    stamp: u64,
+    tag: Option<ScopeTag>,
+    walk_root: bool,
+}
+
+/// Every node of `tree`, sorted by path.
+fn tree_entries(tree: &DirTree) -> Vec<SavedNode> {
+    let mut all: Vec<SavedNode> = tree
+        .iter()
+        .map(|n: NodeRef| {
+            let dir: Option<&Arc<Directory>> = n.as_dir();
+            SavedNode {
+                path: n.path(tree.strings()),
+                inode: n.inode(),
+                kind: n.file_kind(),
+                target: tree.symlink_target(&n),
+                stamp: dir.map_or(0, |d| d.scan_stamp()),
+                tag: dir.and_then(|d| d.tag()),
+                walk_root: dir.is_some_and(|d| d.is_walk_root()),
+            }
+        })
+        .collect();
+    all.sort_by(|a, b| a.path.cmp(&b.path));
+    all
+}
+
+#[test]
+fn test_snapshot_round_trip() {
+    const TAG: ScopeTag = 5;
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let spec: TreeSpec = TreeSpec::new().root_files(2).level(3, 2).level(2, 3).with(Special::SymlinkFile, 2).with(Special::Fifo, 1);
+    spec.create(temp.path()).unwrap();
+    std::fs::create_dir(temp.path().join("tagged")).unwrap();
+    write(temp.path().join("tagged/MARK"), b"").unwrap();
+    // a name that is not UTF-8
+    write(temp.path().join(OsStr::from_bytes(b"latin-\xe4.txt")), b"").unwrap();
+
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true);
+    let marker: Marker = Marker::file_named("MARK").tag(TAG);
+    let tree: DirTree = tree.with_visitor(Arc::new(MarkerVisitor::new().marker(marker)));
+    tree.walk().unwrap();
+    // stamps are set by a settled diff only (see test_tree_update_mtime_precheck)
+    std::thread::sleep(Duration::from_millis(3500));
+    tree.update(dir, Some(true)).unwrap();
+
+    let mut buf: Vec<u8> = Vec::new();
+    tree.save(&mut buf).unwrap();
+    let loaded: DirTree = DirTree::new(FileMode::NODE, Filters::default()).from_path(dir);
+    loaded.load(buf.as_slice()).unwrap();
+    assert!(loaded.is_ready());
+    assert_eq!(tree_entries(&loaded), tree_entries(&tree));
+    assert_eq!(loaded.conf().counts(), tree.conf().counts());
+    assert_eq!(loaded.conf().depth(), tree.conf().depth());
+    assert_eq!(loaded.tagged(TAG).count(), 1);
+    tree_validate_counts(&loaded);
+
+    // the warm start: every directory skipped on its stamp, nothing listed
+    let stats: UpdateStats = loaded.update(dir, Some(true)).unwrap();
+    let warm: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert_eq!((stats.scanned_dirs, warm.scanned_dirs), (0, 0), "{stats}");
+    assert_eq!(stats.skipped_dirs, warm.skipped_dirs, "{stats}");
+    assert!(stats.skipped_dirs > 5, "{stats}");
+
+    // a tree with no root path loads it from the snapshot
+    let bare: DirTree = DirTree::new(FileMode::NODE, Filters::default());
+    bare.load(buf.as_slice()).unwrap();
+    assert_eq!(bare.from().unwrap(), &PathBuf::from(dir));
+    assert_eq!(tree_entries(&bare), tree_entries(&tree));
+}
+
+#[test]
+fn test_snapshot_rejected() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(3).level(2, 2).create(temp.path()).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    let mut buf: Vec<u8> = Vec::new();
+    tree.save(&mut buf).unwrap();
+
+    let empty = || DirTree::new(FileMode::NODE, Filters::default()).from_path(dir);
+    let reason = |r: TreeResult<()>| match r {
+        Err(TreeError::BadSnapshot(reason)) => reason,
+        other => panic!("BadSnapshot expected: {other:?}"),
+    };
+    // every failure leaves the tree as it was: empty but for its root path
+    let check_empty = |t: &DirTree| {
+        assert!(t.contains(dir) && t.files().count() == 0, "left partial");
+        tree_validate_counts(t);
+    };
+
+    let mut flipped: Vec<u8> = buf.clone();
+    let mid: usize = flipped.len() / 2;
+    flipped[mid] ^= 0x40;
+    let t: DirTree = empty();
+    let why: String = reason(t.load(flipped.as_slice()));
+    check_empty(&t);
+    assert!(t.load(buf.as_slice()).is_ok(), "{why}: the tree takes a good snapshot after a bad one");
+
+    let t: DirTree = empty();
+    assert_eq!(reason(t.load(&buf[..buf.len() - 9])), "truncated");
+    check_empty(&t);
+    let t: DirTree = DirTree::new(FileMode::NAME, Filters::default()).from_path(dir);
+    assert!(reason(t.load(buf.as_slice())).starts_with("filemode"));
+    let mut long: Vec<u8> = buf.clone();
+    long.push(0);
+    assert!(reason(empty().load(long.as_slice())).starts_with("no end marker"));
+    assert!(reason(empty().load(&b"DIRTREE\0\x09\0"[..])).starts_with("version"));
+    let other: TempDir = TempDir::new().unwrap();
+    let elsewhere: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(other.path().to_str().unwrap());
+    assert!(reason(elsewhere.load(buf.as_slice())).starts_with("root"));
+    // only into an empty tree
+    assert!(matches!(tree.load(buf.as_slice()), Err(TreeError::NotEmpty)));
+}
+
+#[test]
+fn test_snapshot_files_and_worker() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(2).level(2, 2).create(temp.path()).unwrap();
+    let snap: TempDir = TempDir::new().unwrap();
+    let file: PathBuf = snap.path().join("tree.snap");
+
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .build()
+        .unwrap();
+    tree.scan(dir, Some(true)).unwrap();
+    wait_for(|| tree.is_ready(), "walk");
+    tree.save_bg(&file).unwrap();
+    wait_for(|| file.exists() && tree.is_ready(), "background save");
+    assert_eq!(std::fs::read_dir(snap.path()).unwrap().count(), 1, "no temporary left behind");
+
+    let loaded: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .build()
+        .unwrap();
+    loaded.load_bg(&file).unwrap();
+    wait_for(|| loaded.is_ready(), "background load");
+    assert_eq!(tree_entries(&loaded), tree_entries(&tree));
+    assert_eq!(loaded.conf().errors(), 0);
+
+    // and the blocking forms
+    let again: DirTree = DirTree::new(FileMode::NODE, Filters::default());
+    again.load_from(&file).unwrap();
+    assert_eq!(tree_entries(&again), tree_entries(&tree));
+    again.save_to(&file).unwrap();
+    tree.stop_worker().unwrap();
+    loaded.stop_worker().unwrap();
+}
+
 #[test]
 fn test_file_opener() {
     let temp: TempDir = TempDir::new().unwrap();

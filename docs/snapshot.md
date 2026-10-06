@@ -1,9 +1,14 @@
 # Tree snapshots — plan and file format
 
-Status: **planned, not implemented.** It is to be built after the tree
-module is split into its own crate. Implementing it means replacing
-the `TreeOp::Serialize` / `TreeOp::Deserialize` stubs (`src/event.rs`,
-`src/worker.rs`) with `TreeOp::Save` / `TreeOp::Load`.
+Status: **implemented** in 0.6.0 (`src/snapshot.rs`), as planned here
+with three changes made while building it:
+
+- A directory record has a `flags` byte: bit 0 keeps the walk-root mark
+  (`Directory::is_walk_root()`) that fd-relative opens anchor at.
+- The counts and the depth moved from the header to the trailer: the
+  header is written before the records whose counts it would carry.
+- A tree with no root path writes an empty one, with `root_dev` and
+  `root_ino` 0, and its load skips the root check.
 
 ## Purpose
 
@@ -25,8 +30,8 @@ process.
 
 Stored:
 
-- **The root path, the root's device number (`st_dev`) and the
-  filemode.**
+- **The root path, the root's device number (`st_dev`) and inode, and
+  the filemode.**
 - **The string table.** All entries are names and symlink targets, by
   index.
 - **Per directory:**
@@ -34,7 +39,8 @@ Stored:
   - inode;
   - scan stamp (the directory's own ctime as of its last settled full
     diff, 0 = none; see `MTIME_SLACK_SECS`);
-  - visitor tag.
+  - visitor tag;
+  - whether it is a walk root.
 - **Per file entry:** name, inode, `FileKind` and symlink target index.
 - **The counts and the depth.** These are checked against what was
   actually loaded.
@@ -76,12 +82,9 @@ and paths are a `u32` length plus that many bytes.
 | root_ino      | `u64`    | inode of the root                               |
 | created       | `u64`    | the tree's creation time, seconds since epoch   |
 | saved         | `u64`    | the time of the save, seconds since epoch       |
-| nodes         | `u32`    | `TreeConf` counts, root excluded                |
-| dirs          | `u32`    |                                                 |
-| files         | `u32`    |                                                 |
-| specials      | `u32`    |                                                 |
-| depth         | `u8`     |                                                 |
-| root_path     | bytes    | the tree's `from` path                          |
+| root_path     | bytes    | the tree's `from` path; empty if it has none    |
+
+`root_dev` and `root_ino` are 0 when there is no root path.
 
 ### String table
 
@@ -111,7 +114,7 @@ files and subdirectories after it. The counts in each record give the
 structure, so no parent links are stored. A reader rebuilds them with
 a stack of `(Arc<Directory>, subdirectories left)`.
 
-Directory record (30 bytes):
+Directory record (31 bytes):
 
 | Field   | Type  | Notes                                  |
 |---------|-------|----------------------------------------|
@@ -119,6 +122,7 @@ Directory record (30 bytes):
 | inode   | `u64` |                                        |
 | stamp   | `u64` | scan stamp, `0` = no baseline          |
 | tag     | `u16` | `SCOPE_NONE` (0) = untagged            |
+| flags   | `u8`  | bit 0: a walk root                     |
 | n_files | `u32` | file records that follow directly      |
 | n_dirs  | `u32` | subdirectory records after those       |
 
@@ -140,8 +144,13 @@ take about 3 MB + 17 MB.
 
 | Field    | Type     | Notes                                      |
 |----------|----------|--------------------------------------------|
-| checksum | `u64`    | xxh3-64 (default secret, seed 0) of every byte before the trailer |
-| end      | `[u8;8]` | `b"DTREEEND"`                              |
+| nodes    | `u32`    | the counts of the records written, root excluded |
+| dirs     | `u32`    |                                            |
+| files    | `u32`    |                                            |
+| specials | `u32`    |                                            |
+| depth    | `u8`     | the deepest entry written                  |
+| checksum | `u64`    | xxh3-64 (default secret, seed 0) of every byte before it |
+| end      | `[u8;8]` | `b"DTREEEND"`, and then the end of the file |
 
 The checksum is computed as the file is written and as it is read
 (streaming `Hasher`, as `custom_xxh3::CustomXxh3Hasher::new_xxh3_defaults()`
@@ -169,7 +178,9 @@ Any of these fails the load with `TreeError::BadSnapshot(reason)`:
     clear all stamps, so `update()` diffs everything once.
 - **The target tree:** a snapshot loads only into a tree that is still
   uninitialized or empty. Otherwise the load fails with
-  `TreeError::NotEmpty`.
+  `TreeError::NotEmpty`. An empty tree's root-path chain (from
+  `from_path()`) is dropped first, as the snapshot brings its own, and
+  put back if the load fails.
 
 I/O errors come back as `TreeError::Io(io::Error)`.
 
@@ -187,9 +198,14 @@ with a background save, because the worker runs one op at a time.
 
 The difference is harmless for the intended use. A directory that
 changes after it was saved gets a newer ctime than its stored stamp, so
-the `update()` after loading diffs it. The header counts are summed
+the `update()` after loading diffs it. The trailer counts are summed
 while writing, not taken from `TreeConf`, so they always match the
 records. `tree_validate_counts` after a load is the test for this.
+
+The string table is written first, up to the store's length when the
+save starts. An entry named by a string interned after that (added
+while the save runs) is left out, with its subtree: it is a change
+after the save, and its directory's ctime has moved past its stamp.
 
 ## API
 

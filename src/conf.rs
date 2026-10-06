@@ -316,6 +316,11 @@ impl TreeConf {
     }
 
     /// Compare the current depth with the given depth and set the maximum.
+    /// Forget the depth: the tree has been emptied.
+    pub(super) fn depth_reset(&self) {
+        self.depth.store(0, Relaxed);
+    }
+
     pub(super) fn depth_compare(&self, d: u8) {
         self.depth.fetch_max(d, Relaxed);
     }

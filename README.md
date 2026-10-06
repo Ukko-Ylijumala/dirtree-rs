@@ -66,6 +66,8 @@ code. Each tag marks the tree code as it stood in that statter release.
 - **Observer:** progress and every fault, as a `FaultKind` with the exact
   path and errno, go to a `TreeObserver`, so a consumer can account for
   coverage.
+- **Snapshots:** `save_to()` / `load_from()` (or in the background), then
+  `update()` of the root lists only the directories changed since the save.
 - **Optional memory accounting** via the `size_of` cargo feature.
 
 ## Usage
@@ -87,7 +89,8 @@ tree follow the filesystem.
 ## Design notes
 
 - [`docs/implementation.md`](docs/implementation.md): the visitor protocol
-- [`docs/snapshot.md`](docs/snapshot.md): planned save/load of a tree
+- [`docs/snapshot.md`](docs/snapshot.md): saving a tree to a file and
+  loading it back (the format and its checks)
 - [`docs/consumers.md`](docs/consumers.md): what the next consumers need,
   and the gaps still open
 

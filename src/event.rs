@@ -29,10 +29,10 @@ pub enum TreeOp {
     Remove(String),
     /// The tree is being updated.
     Update(PathBuf),
-    /// The tree is being serialized. TODO.
-    Serialize,
-    /// The tree is being deserialized. TODO.
-    Deserialize,
+    /// The tree is being saved to a snapshot file (see [DirTree::save_to](super::DirTree::save_to)).
+    Save(PathBuf),
+    /// The tree is being loaded from a snapshot file (see [DirTree::load_from](super::DirTree::load_from)).
+    Load(PathBuf),
     /// Signals the background worker thread that it should quit.
     Quit,
 }

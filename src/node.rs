@@ -51,7 +51,7 @@ pub(super) type NodeIter<'a> = dyn Iterator<Item = NodeRef> + 'a;
 pub(super) type DirTreeHashMap<K, V> = HashMap<K, V, DirTreeXxh3Hasher>;
 
 /// [FileEntry::target] of an entry that is not a symlink, or whose target is unknown.
-const NO_TARGET: u32 = u32::MAX;
+pub(super) const NO_TARGET: u32 = u32::MAX;
 
 /**
 A ctime as a change stamp: nanoseconds since the UNIX epoch (0 for
@@ -411,6 +411,13 @@ pub enum FileKind {
 }
 
 impl FileKind {
+    /// The kind stored as `kind as u8`; [None] for a value no kind has.
+    pub(super) fn from_repr(v: u8) -> Option<Self> {
+        [Self::File, Self::Symlink, Self::Fifo, Self::Socket, Self::CharDevice, Self::BlockDevice]
+            .into_iter()
+            .find(|k: &Self| *k as u8 == v)
+    }
+
     /// The kind of a directory entry type; [None] for a directory.
     pub fn from_type(t: Type) -> Option<Self> {
         Some(match t {

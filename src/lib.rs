@@ -24,6 +24,7 @@ The crate is split into several modules for clarity:
 - `observer`: [`TreeObserver`] - progress reporting out of the tree.
 - `opener`:   [`FileOpener`] - opening a tree's files by their node, relative to their directory.
 - `osname`:   lossless `str` encoding of non-UTF-8 filesystem names.
+- `snapshot`: saving a tree to a file and loading it back (`docs/snapshot.md`).
 - `update`:   diff-rescan (the [`TreeOp::Update`] primitive).
 - `utils`:    small shared helpers (path splitting, weak refs, atomics).
 - `worker`:   the background work-queue executor.
@@ -46,6 +47,7 @@ mod node;
 mod observer;
 mod opener;
 mod osname;
+mod snapshot;
 mod tests;
 mod traverse;
 mod update;

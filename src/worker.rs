@@ -108,9 +108,12 @@ fn worker_round(t: &DirTree, spin_ctr: &mut u8) -> Round {
                     }
                 }
 
+                TreeOp::Save(_) | TreeOp::Load(_) => {
+                    t.set_state(TreeState::Active(op.clone()));
+                    t.snapshot_op(&op);
+                }
+
                 TreeOp::Insert => {}
-                TreeOp::Serialize => {}   // TODO
-                TreeOp::Deserialize => {} // TODO
                 _ => {}
             };
             if t.no_work() {

@@ -445,7 +445,7 @@ impl DirTree {
     }
 
     /// Queue `op` for the worker, or fail if there is no worker to run it.
-    fn queue_bg_op(&self, op: TreeOp) -> TreeResult<()> {
+    pub(super) fn queue_bg_op(&self, op: TreeOp) -> TreeResult<()> {
         if !self.is_worker_running() {
             return Err(TreeError::WorkerNotRunning);
         }
@@ -519,6 +519,13 @@ impl DirTree {
     /// Set the root (filesystem) path of the tree.
     pub fn from_path(self, path: &str) -> Self {
         self.conf.set_from(path);
+        self.insert_from();
+        self.set_state(TreeState::Empty);
+        self
+    }
+
+    /// Insert the root path's chain of directories, the root a walk root.
+    pub(super) fn insert_from(&self) {
         // the root actually stored: a second from_path() keeps the first
         if let Some(from) = self.conf.from() {
             self.insert_dir(from, None);
@@ -526,8 +533,17 @@ impl DirTree {
                 node.set_walk_root();
             }
         }
-        self.set_state(TreeState::Empty);
-        self
+    }
+
+    /**
+    Drop every node and zero the counts and depth: for a tree that is
+    still empty but for its root path's chain (see [DirTree::load]).
+    */
+    pub(super) fn clear_nodes(&self) {
+        self.release_handles(&self.root);
+        self.root.children().write().clear();
+        self.conf.counts_mod(self.conf.counts(), -1);
+        self.conf.depth_reset();
     }
 
     /**
