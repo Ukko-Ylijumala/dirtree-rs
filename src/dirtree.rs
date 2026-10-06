@@ -71,6 +71,23 @@ pub(super) enum NewChild {
 }
 
 /**
+What a parallel walk resolves once, at its start, and every directory
+of it shares by reference: the hooks it calls, whether it recurses, and
+the depth of its root.
+*/
+struct Walk<'w> {
+    visitor: Option<Arc<dyn Visitor>>,
+    observer: &'w dyn TreeObserver,
+    /// Whether this walk descends into subdirectories: the per-op flag,
+    /// or the tree default.
+    recursive: bool,
+    /// Absolute path depth of the walk root (path components below `/`),
+    /// used to keep the tree's depth counter in absolute-path terms while
+    /// the walker itself tracks depth relative to the walk root.
+    base_depth: u8,
+}
+
+/**
 Lightweight state that flows down the parallel walk: the active
 scope, the current dir's interned name, and its parent's. Pure `Copy`
 so spawning into rayon costs nothing extra.
@@ -80,14 +97,6 @@ struct WalkState {
     scope: ScopeTag,
     name_idx: u32,
     parent_name_idx: Option<u32>,
-    /// Whether this walk descends into subdirectories. Resolved once at
-    /// walk start from the per-op flag (or the tree default) and carried
-    /// down so a per-op override actually takes effect in the walker.
-    recursive: bool,
-    /// Absolute path depth of the walk root (path components below `/`),
-    /// used to keep the tree's depth counter in absolute-path terms while
-    /// the walker itself tracks depth relative to the walk root.
-    base_depth: u8,
 }
 
 /**
@@ -237,8 +246,13 @@ impl DirTree {
     [TreeEvent::error]).
     */
     pub(super) fn add_error(&self, event: TreeEvent) {
+        self.add_error_to(self.conf.observer(), event);
+    }
+
+    /// [DirTree::add_error] telling `observer` (a walk's) of the fault.
+    fn add_error_to(&self, observer: &dyn TreeObserver, event: TreeEvent) {
         error!("{event:?}");
-        self.add_fault(&event);
+        self.add_fault_to(observer, &event);
         self.add_event(event);
     }
 
@@ -248,9 +262,14 @@ impl DirTree {
     reported to the observer each time, but logged only once.
     */
     pub(super) fn add_fault(&self, event: &TreeEvent) {
+        self.add_fault_to(self.conf.observer(), event);
+    }
+
+    /// [DirTree::add_fault] telling `observer` (a walk's) of the fault.
+    fn add_fault_to(&self, observer: &dyn TreeObserver, event: &TreeEvent) {
         debug_assert!(event.fault.is_some(), "an error event without a FaultKind: {event:?}");
         self.conf.errors_inc();
-        self.conf.observer().fault(&event.to_fault());
+        observer.fault(&event.to_fault());
     }
 
     /// Whether the tree's workqueue is empty.
@@ -724,10 +743,27 @@ impl DirTree {
                 }
             }
         };
-        let walk = self.initial_walk_state(path, recursive);
+        let walk: Walk = self.new_walk(path, recursive);
+        let state: WalkState = self.initial_walk_state(path);
         // the walk root is opened by path; a symlinked root is followed
         let handle: Result<DirHandle, Error> = DirHandle::new(path);
-        rayon::scope(|s| self.populate_par_inner(path, handle, walk, node, s, 0, 0));
+        rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, 0, 0));
+    }
+
+    /// The [Walk] of a walk from `path`: its hooks, recursion and root depth, resolved once.
+    fn new_walk(&self, path: &Path, recursive: Option<bool>) -> Walk<'_> {
+        // number of path components below the filesystem root
+        let base_depth: u8 = path
+            .components()
+            .count()
+            .saturating_sub(1)
+            .min(u8::MAX as usize) as u8;
+        Walk {
+            visitor: self.conf.visitor(),
+            observer: self.conf.observer(),
+            recursive: recursive.unwrap_or(self.conf.recursive()),
+            base_depth,
+        }
     }
 
     /**
@@ -735,23 +771,15 @@ impl DirTree {
     The interned name is the basename of `path`; if `path` has no
     basename (e.g. `/`) we fall back to interning the empty string.
     */
-    fn initial_walk_state(&self, path: &Path, recursive: Option<bool>) -> WalkState {
+    fn initial_walk_state(&self, path: &Path) -> WalkState {
         let name_idx = path
             .file_name()
             .map(|n| self.strings.insert(encode_os(&n).as_ref()))
             .unwrap_or_else(|| self.strings.insert(""));
-        // number of path components below the filesystem root
-        let base_depth: u8 = path
-            .components()
-            .count()
-            .saturating_sub(1)
-            .min(u8::MAX as usize) as u8;
         WalkState {
             scope: SCOPE_NONE,
             name_idx,
             parent_name_idx: None,
-            recursive: recursive.unwrap_or(self.conf.recursive()),
-            base_depth,
         }
     }
 
@@ -795,9 +823,10 @@ impl DirTree {
     #[allow(clippy::too_many_arguments)]
     fn populate_par_inner<'env>(
         &'env self,
+        walk: &'env Walk<'env>,
         path: &PathBuf,
         handle: Result<DirHandle, Error>,
-        walk: WalkState,
+        state: WalkState,
         node: Arc<Directory>,
         rs: &rayon::Scope<'env>,
         depth: usize,
@@ -809,26 +838,24 @@ impl DirTree {
             return;
         }
 
-        let visitor: Option<Arc<dyn Visitor>> = self.conf.visitor();
-
         // Per-scope visitor depth cap (separate from MAX_RECURSE_DEPTH,
         // which is about stack/spawn thresholds, not tree depth).
-        if let Some(ref v) = visitor {
-            let cap = v.max_depth(walk.scope);
+        if let Some(ref v) = walk.visitor {
+            let cap = v.max_depth(state.scope);
             if cap > 0 && depth >= cap {
                 return;
             }
         }
 
-        let op: TreeOp = TreeOp::Scan(path.into(), Some(walk.recursive));
         let mut handle: DirHandle = match handle {
             Ok(h) => h,
             Err(e) => {
-                self.add_error(
+                self.add_error_to(
+                    walk.observer,
                     TreeEvent::error(FaultKind::OpenDir, &e.to_string())
                         .path(&encode_os(path))
                         .io(&e)
-                        .op(&op),
+                        .op(&walk.op(path)),
                 );
                 debug!(target: "ERROR", "Cannot read directory: {}", e);
                 return;
@@ -869,27 +896,20 @@ impl DirTree {
         let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
         if let Some(e) = iter.error() {
-            self.add_error(
+            self.add_error_to(
+                walk.observer,
                 TreeEvent::error(FaultKind::ReadDir, &format!("readdir failed, listing incomplete: {e}"))
                     .path(&encode_os(path))
                     .errno(e as i32)
-                    .op(&op),
+                    .op(&walk.op(path)),
             );
         }
         drop(iter);
-        let mut scope_for_children: ScopeTag = walk.scope;
+        let mut scope_for_children: ScopeTag = state.scope;
         let mut skip_children: bool = false;
-        if let Some(ref v) = visitor {
-            let walk_ctx = WalkContext {
-                path: path.as_path(),
-                name_idx: walk.name_idx,
-                parent_name_idx: walk.parent_name_idx,
-                depth,
-                scope: walk.scope,
-                strings: &self.strings,
-            };
+        if let Some(ref v) = walk.visitor {
             let verdict = v.visit_dir(DirContext {
-                walk: &walk_ctx,
+                walk: &state.context(path, depth, &self.strings),
                 entries: &entries,
                 dirfd,
             });
@@ -904,7 +924,7 @@ impl DirTree {
                     skip_children = true;
                 }
                 Verdict::Tag { tag, new_scope, descend } => {
-                    self.emit_walk_event(path, tag, walk.scope, depth, !descend);
+                    self.emit_walk_event(path, tag, state.scope, depth, !descend);
                     scope_for_children = new_scope;
                     if !descend {
                         skip_children = true;
@@ -924,27 +944,15 @@ impl DirTree {
             only files are batched - one children-map lock and one round
             of counter updates per batch (see `process_par_files`).
             */
-            let visitor_ref = visitor.as_ref();
             let mut entries = entries;
             let n_dirs: usize = partition_dirs_first(&mut entries);
             let (dirs, files) = entries.split_at(n_dirs);
             node.reserve_children(entries.len());
             let each_dir = |entry: &EntryExt| {
-                self.process_par_dir(
-                    path,
-                    &walk,
-                    &node,
-                    scope_for_children,
-                    depth,
-                    frames,
-                    rs,
-                    visitor_ref,
-                    &op,
-                    entry,
-                );
+                self.process_par_dir(walk, path, &state, &node, scope_for_children, depth, frames, rs, entry);
             };
             let each_files = |chunk: &[EntryExt]| {
-                self.process_par_files(path, &walk, &node, depth, visitor_ref, &op, dirfd, chunk);
+                self.process_par_files(walk, path, &state, &node, depth, dirfd, chunk);
             };
             rayon::join(
                 || dirs.par_iter().for_each(each_dir),
@@ -980,15 +988,14 @@ impl DirTree {
     #[allow(clippy::too_many_arguments)]
     fn process_par_dir<'env>(
         &'env self,
+        walk: &'env Walk<'env>,
         parent_path: &Path,
-        parent_walk: &WalkState,
+        parent_state: &WalkState,
         parent_node: &Arc<Directory>,
         scope_for_children: ScopeTag,
         depth: usize,
         frames: usize,
         rs: &rayon::Scope<'env>,
-        visitor: Option<&Arc<dyn Visitor>>,
-        op: &TreeOp,
         entry: &EntryExt<'_>,
     ) {
         /*
@@ -999,9 +1006,6 @@ impl DirTree {
         */
         let name_os = OsStr::from_bytes(entry.name_as_bytes());
         trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
-        // children of this directory live one path component deeper
-        let depth_abs: u8 =
-            (parent_walk.base_depth as usize + depth + 1).min(u8::MAX as usize) as u8;
 
         /*
         Path-aware prune via the visitor (when set). The name is interned
@@ -1009,18 +1013,10 @@ impl DirTree {
         after the cheaper filter check has passed.
         */
         let mut child_idx: Option<u32> = None;
-        if let Some(v) = visitor {
+        if let Some(ref v) = walk.visitor {
             let idx: u32 = self.strings.insert(encode_os(name_os).as_ref());
             child_idx = Some(idx);
-            let parent_ctx = WalkContext {
-                path: parent_path,
-                name_idx: parent_walk.name_idx,
-                parent_name_idx: parent_walk.parent_name_idx,
-                depth,
-                scope: parent_walk.scope,
-                strings: &self.strings,
-            };
-            if v.prune_child(&parent_ctx, idx, true) {
+            if v.prune_child(&parent_state.context(parent_path, depth, &self.strings), idx, true) {
                 return;
             }
         }
@@ -1029,19 +1025,24 @@ impl DirTree {
         }
         let child_idx: u32 =
             child_idx.unwrap_or_else(|| self.strings.insert(encode_os(name_os).as_ref()));
-        let (child, _) =
-            self.insert_child(parent_node, child_idx, NewChild::Dir(entry.ino()), depth_abs);
-        self.conf.observer().dirs_added(1);
+        let (child, _) = self.insert_child(
+            parent_node,
+            child_idx,
+            NewChild::Dir(entry.ino()),
+            walk.child_depth_abs(depth),
+        );
+        walk.observer.dirs_added(1);
         let Child::Dir(child_node) = child else {
             // a file recorded under this name (replaced since) blocks the slot
-            self.add_error(
+            self.add_error_to(
+                walk.observer,
                 TreeEvent::error(FaultKind::Tree, "Cannot attach directory node")
                     .path(&encode_os(&parent_path.join(name_os)))
-                    .op(op),
+                    .op(&walk.op(parent_path)),
             );
             return;
         };
-        if !parent_walk.recursive {
+        if !walk.recursive {
             return;
         }
 
@@ -1049,9 +1050,7 @@ impl DirTree {
         let next = WalkState {
             scope: scope_for_children,
             name_idx: child_idx,
-            parent_name_idx: Some(parent_walk.name_idx),
-            recursive: true,
-            base_depth: parent_walk.base_depth,
+            parent_name_idx: Some(parent_state.name_idx),
         };
         // spawning is slower than direct recursion, so only spawn after
         // MAX_RECURSE_DEPTH frames to bound stack use; semantic depth
@@ -1059,6 +1058,7 @@ impl DirTree {
         if frames < MAX_RECURSE_DEPTH {
             // relative to our open handle, never following a symlink
             self.populate_par_inner(
+                walk,
                 &entry_p,
                 entry.open_dir(),
                 next,
@@ -1075,6 +1075,7 @@ impl DirTree {
             */
             rs.spawn(move |s| {
                 self.populate_par_inner(
+                    walk,
                     &entry_p,
                     open_dir_nofollow(&entry_p),
                     next,
@@ -1106,12 +1107,11 @@ impl DirTree {
     #[allow(clippy::too_many_arguments)]
     fn process_par_files(
         &self,
+        walk: &Walk<'_>,
         parent_path: &Path,
-        parent_walk: &WalkState,
+        parent_state: &WalkState,
         parent_node: &Directory,
         depth: usize,
-        visitor: Option<&Arc<dyn Visitor>>,
-        op: &TreeOp,
         dirfd: BorrowedFd<'_>,
         batch: &[EntryExt<'_>],
     ) {
@@ -1137,10 +1137,11 @@ impl DirTree {
             let Some(entry_t) = entry.file_type() else {
                 // no d_type, and the fstatat for it failed
                 let entry_p: PathBuf = parent_path.join(OsStr::from_bytes(entry.name_as_bytes()));
-                self.add_error(
+                self.add_error_to(
+                    walk.observer,
                     TreeEvent::error(FaultKind::Stat, "Unknown entry type")
                         .path(&encode_os(&entry_p))
-                        .op(op),
+                        .op(&walk.op(parent_path)),
                 );
                 debug!(target: "WARN", "Unknown entry type: {}", entry_p.display());
                 continue;
@@ -1153,18 +1154,10 @@ impl DirTree {
 
             // same prune + filter shape as for directories
             let mut child_idx: Option<u32> = None;
-            if let Some(v) = visitor {
+            if let Some(ref v) = walk.visitor {
                 let idx: u32 = self.strings.insert(encode_os(name_os).as_ref());
                 child_idx = Some(idx);
-                let parent_ctx = WalkContext {
-                    path: parent_path,
-                    name_idx: parent_walk.name_idx,
-                    parent_name_idx: parent_walk.parent_name_idx,
-                    depth,
-                    scope: parent_walk.scope,
-                    strings: &self.strings,
-                };
-                if v.prune_child(&parent_ctx, idx, false) {
+                if v.prune_child(&parent_state.context(parent_path, depth, &self.strings), idx, false) {
                     continue;
                 }
             }
@@ -1183,7 +1176,9 @@ impl DirTree {
                 continue;
             }
             let target: Option<u32> = match kind {
-                FileKind::Symlink => self.link_target_at(dirfd, parent_path, entry.file_name()),
+                FileKind::Symlink => {
+                    self.link_target_at(walk.observer, dirfd, parent_path, entry.file_name())
+                }
                 _ => None,
             };
             let file: FileEntry = FileEntry::new(entry.ino(), kind, target);
@@ -1220,15 +1215,13 @@ impl DirTree {
             self.conf.files_mod(added as i32);
             self.conf.specials_mod(added_specials as i32);
             // files live one path component below their directory
-            let depth_abs: u8 =
-                (parent_walk.base_depth as usize + depth + 1).min(u8::MAX as usize) as u8;
-            self.conf.depth_compare(depth_abs);
+            self.conf.depth_compare(walk.child_depth_abs(depth));
         }
         if seen > 0 {
-            self.conf.observer().files_added(seen, size);
+            walk.observer.files_added(seen, size);
         }
         if seen_specials > 0 {
-            self.conf.observer().specials_added(seen_specials);
+            walk.observer.specials_added(seen_specials);
         }
     }
 
@@ -1273,14 +1266,21 @@ impl DirTree {
     /**
     The interned target of the symlink `name` in the directory `dirfd`
     (at `parent`), or [None] if it cannot be read (e.g. removed since it
-    was listed), which is a [FaultKind::ReadLink].
+    was listed), which is a [FaultKind::ReadLink] told to `observer`.
     */
-    pub(super) fn link_target_at(&self, dirfd: BorrowedFd<'_>, parent: &Path, name: &CStr) -> Option<u32> {
+    pub(super) fn link_target_at(
+        &self,
+        observer: &dyn TreeObserver,
+        dirfd: BorrowedFd<'_>,
+        parent: &Path,
+        name: &CStr,
+    ) -> Option<u32> {
         match readlinkat(dirfd, name) {
             Ok(target) => Some(self.strings.insert(encode_os(&target))),
             Err(e) => {
                 let path: PathBuf = parent.join(OsStr::from_bytes(name.to_bytes()));
-                self.add_error(
+                self.add_error_to(
+                    observer,
                     TreeEvent::error(FaultKind::ReadLink, &format!("Cannot read symlink: {e}"))
                         .path(&encode_os(&path))
                         .errno(e as i32),
@@ -1930,6 +1930,34 @@ impl Display for DirTree {
             self.handles.len(),
             self.created()
         )
+    }
+}
+
+impl Walk<'_> {
+    /// The absolute depth of the entries of a directory `depth` levels below the walk root.
+    #[inline]
+    fn child_depth_abs(&self, depth: usize) -> u8 {
+        (self.base_depth as usize + depth + 1).min(u8::MAX as usize) as u8
+    }
+
+    /// The op a fault in the directory at `path` is recorded under; built only when one is.
+    fn op(&self, path: &Path) -> TreeOp {
+        TreeOp::Scan(path.into(), Some(self.recursive))
+    }
+}
+
+impl WalkState {
+    /// The [WalkContext] of the directory at `path` that this state belongs to, for the visitor.
+    #[inline]
+    fn context<'a>(&self, path: &'a Path, depth: usize, strings: &'a UniqueStrStore) -> WalkContext<'a> {
+        WalkContext {
+            path,
+            name_idx: self.name_idx,
+            parent_name_idx: self.parent_name_idx,
+            depth,
+            scope: self.scope,
+            strings,
+        }
     }
 }
 

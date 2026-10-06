@@ -390,7 +390,7 @@ impl DirTree {
             let leaf = || -> FileEntry {
                 let kind: FileKind = entry.file_type().and_then(FileKind::from_type).unwrap_or_default();
                 let target: Option<u32> = match kind {
-                    FileKind::Symlink => self.link_target_at(dirfd, path, entry.file_name()),
+                    FileKind::Symlink => self.link_target_at(self.conf.observer(), dirfd, path, entry.file_name()),
                     _ => None,
                 };
                 FileEntry::new(disk_ino, kind, target)
