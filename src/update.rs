@@ -20,7 +20,7 @@ filemode files carry no inode, so file replacement is undetectable
 there; adds and removes still work.
 */
 
-use super::dirtree::{DirTree, ENTRY_BATCH_MIN, MAX_RECURSE_DEPTH};
+use super::dirtree::{DirAt, DirTree, ENTRY_BATCH_MIN, MAX_RECURSE_DEPTH, WalkHooks};
 use super::event::{FaultKind, TreeEvent, TreeOp};
 use super::hash::DirTreeXxh3Hasher;
 use super::conf::NodeCounts;
@@ -28,7 +28,7 @@ use super::dirtree::NewChild;
 use super::node::{Child, DirTreeHashMap, Directory, FileEntry, FileKind, NodeRef, ctime_stamp};
 use super::osname::{decode_os, encode_os};
 
-use dirhandle::{DirHandle, EntryExt};
+use dirhandle::{DirHandle, EntryExt, nix::sys::stat::fstat};
 use timesince::SecondsSinceEpoch;
 use tracing::{debug, instrument, trace};
 
@@ -36,11 +36,9 @@ use std::{
     borrow::Cow,
     ffi::OsStr,
     fmt::{self, Display, Formatter},
-    fs::metadata,
     io::{Error, ErrorKind},
-    os::fd::{AsRawFd, BorrowedFd},
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
     os::unix::ffi::OsStrExt,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering::Relaxed},
@@ -194,19 +192,27 @@ impl DirTree {
         let full: PathBuf = node.path(&self.strings);
         let recursive: bool = recursive.unwrap_or(self.conf.recursive());
         let ctr: UpdateCtr = UpdateCtr::default();
-        rayon::scope(|s| self.update_inner(&full, node, recursive, &ctr, s, 0));
+        rayon::scope(|s| self.update_inner(&full, node, DirAt::Path, recursive, &ctr, s, 0));
         let stats: UpdateStats = ctr.snapshot();
         debug!(target: "UPDATE", "{}: {stats}", full.display());
         Ok(stats)
     }
 
-    /// Diff one directory and recurse. `frames` bounds direct recursion
-    /// before offloading to the rayon scope, like the parallel walker.
+    /**
+    Diff one directory, opened from `at` (see [DirAt]), and recurse.
+    `frames` bounds direct recursion before offloading to the rayon
+    scope, like the parallel walker.
+
+    The directory is held as an `O_PATH` fd throughout: the pre-check
+    stats it, the diff lists it, and its subdirectories are opened
+    relative to it, never by a path.
+    */
     #[allow(clippy::too_many_arguments)]
     fn update_inner<'env>(
         &'env self,
         path: &PathBuf,
         node: Arc<Directory>,
+        at: DirAt,
         recursive: bool,
         ctr: &'env UpdateCtr,
         rs: &rayon::Scope<'env>,
@@ -215,7 +221,21 @@ impl DirTree {
         if self.conf.is_cancelled() {
             return;
         }
-        let op: TreeOp = TreeOp::Update(path.clone());
+        let here: Arc<OwnedFd> = match at.path_fd(path) {
+            Ok(fd) => Arc::new(fd),
+            Err(e) => return self.update_open_failed(path, &node, e, ctr),
+        };
+        // a subdirectory of this one, to diff (or scan) next
+        let recurse = |child_p: PathBuf, child: Arc<Directory>, name: &OsStr| {
+            let Some(at) = DirAt::child(&here, name) else {
+                return;
+            };
+            if frames < MAX_RECURSE_DEPTH {
+                self.update_inner(&child_p, child, at, recursive, ctr, rs, frames + 1);
+            } else {
+                rs.spawn(move |s| self.update_inner(&child_p, child, at, recursive, ctr, s, 0));
+            }
+        };
 
         /*
         Fast path: a directory's ctime moves whenever its entry list
@@ -230,8 +250,8 @@ impl DirTree {
         */
         let stamp: u64 = node.scan_stamp();
         if stamp != 0
-            && let Ok(meta) = metadata(path)
-            && ctime_stamp(meta.ctime(), meta.ctime_nsec()) == stamp
+            && let Ok(st) = fstat(&*here)
+            && ctime_stamp(st.st_ctime, st.st_ctime_nsec) == stamp
         {
             trace!(target: "UPDATE_SKIP", "{} unchanged since {stamp}", path.display());
             ctr.skipped_dirs.fetch_add(1, Relaxed);
@@ -243,16 +263,8 @@ impl DirTree {
                     .filter_map(|(k, v)| v.as_dir().map(|d: &Arc<Directory>| (*k, d.clone())))
                     .collect();
                 for (name_idx, child) in subdirs {
-                    let child_p: PathBuf = path.join(decode_os(self.get_string(name_idx)));
-                    if frames < MAX_RECURSE_DEPTH {
-                        self.update_inner(
-                            &child_p, child, recursive, ctr, rs, frames + 1,
-                        );
-                    } else {
-                        rs.spawn(move |s| {
-                            self.update_inner(&child_p, child, recursive, ctr, s, 0)
-                        });
-                    }
+                    let name: Cow<OsStr> = decode_os(self.get_string(name_idx));
+                    recurse(path.join(&name), child, &name);
                 }
             }
             return;
@@ -261,30 +273,9 @@ impl DirTree {
         // the pass start, for the settle check of the new baseline below
         let pass_time: u64 = *SecondsSinceEpoch::new();
 
-        let mut handle: DirHandle = match DirHandle::new(path) {
+        let mut handle: DirHandle = match DirHandle::open_at(&*here, c".") {
             Ok(h) => h,
-            Err(e) => {
-                /*
-                The directory vanished between its parent's diff and
-                this open - detach it here since the parent pass has
-                already moved on.
-                */
-                if e.kind() == ErrorKind::NotFound
-                    && let Some(parent) = node.parent()
-                {
-                    let child: Child = Child::Dir(node.clone());
-                    ctr.removed(self.remove_child_node(&parent, node.name_idx(), &child));
-                    return;
-                }
-                ctr.errors.fetch_add(1, Relaxed);
-                self.add_error(
-                    TreeEvent::error(FaultKind::OpenDir, &e.to_string())
-                        .path(&encode_os(path))
-                        .io(&e)
-                        .op(&op),
-                );
-                return;
-            }
+            Err(e) => return self.update_open_failed(path, &node, e, ctr),
         };
         ctr.scanned_dirs.fetch_add(1, Relaxed);
         /*
@@ -325,7 +316,7 @@ impl DirTree {
                 TreeEvent::error(FaultKind::ReadDir, &format!("readdir failed, listing incomplete: {e}"))
                     .path(&encode_os(path))
                     .errno(e as i32)
-                    .op(&op),
+                    .op(&TreeOp::Update(path.clone())),
             );
             return;
         }
@@ -402,7 +393,7 @@ impl DirTree {
                     if is_dir {
                         let child_p: PathBuf = path.join(name_os);
                         self.update_add_dir(
-                            &node, name_idx, disk_ino, child_depth, &child_p, recursive,
+                            &node, name_idx, disk_ino, child_depth, &child_p, &here, recursive,
                             ctr,
                         );
                     } else {
@@ -432,7 +423,8 @@ impl DirTree {
                         if is_dir {
                             let child_p: PathBuf = path.join(name_os);
                             self.update_add_dir(
-                                &node, name_idx, disk_ino, child_depth, &child_p, recursive, ctr,
+                                &node, name_idx, disk_ino, child_depth, &child_p, &here, recursive,
+                                ctr,
                             );
                         } else {
                             self.update_add_file(&node, name_idx, leaf(), child_depth, ctr);
@@ -441,17 +433,7 @@ impl DirTree {
                         && recursive
                     {
                         // unchanged directory: recurse the diff into it
-                        let child_p: PathBuf = path.join(name_os);
-                        let child: Arc<Directory> = child.clone();
-                        if frames < MAX_RECURSE_DEPTH {
-                            self.update_inner(
-                                &child_p, child, recursive, ctr, rs, frames + 1,
-                            );
-                        } else {
-                            rs.spawn(move |s| {
-                                self.update_inner(&child_p, child, recursive, ctr, s, 0)
-                            });
-                        }
+                        recurse(path.join(name_os), child.clone(), name_os);
                     }
                 }
             }
@@ -476,6 +458,7 @@ impl DirTree {
         inode: u64,
         depth: u8,
         child_p: &Path,
+        parent_fd: &Arc<OwnedFd>,
         recursive: bool,
         ctr: &UpdateCtr,
     ) {
@@ -485,10 +468,35 @@ impl DirTree {
             ctr.added_dirs.fetch_add(1, Relaxed);
             self.conf.observer().dirs_added(1);
         }
-        if recursive && child.is_dir() {
+        if recursive
+            && child.is_dir()
+            && let Some(at) = child_p.file_name().and_then(|n: &OsStr| DirAt::child(parent_fd, n))
+        {
             // a whole new subtree: full scan instead of a diff
-            self.populate_par(child_p, Some(true));
+            self.populate_par_at(child_p, &at, Some(true), &WalkHooks::default());
         }
+    }
+
+    /**
+    The directory at `path` could not be opened for a diff. If it is gone,
+    it vanished between its parent's diff and this open: detach it here,
+    since the parent pass has already moved on. Anything else is a fault.
+    */
+    fn update_open_failed(&self, path: &PathBuf, node: &Arc<Directory>, e: Error, ctr: &UpdateCtr) {
+        if e.kind() == ErrorKind::NotFound
+            && let Some(parent) = node.parent()
+        {
+            let child: Child = Child::Dir(node.clone());
+            ctr.removed(self.remove_child_node(&parent, node.name_idx(), &child));
+            return;
+        }
+        ctr.errors.fetch_add(1, Relaxed);
+        self.add_error(
+            TreeEvent::error(FaultKind::OpenDir, &e.to_string())
+                .path(&encode_os(path))
+                .io(&e)
+                .op(&TreeOp::Update(path.clone())),
+        );
     }
 
     /// Insert a file that appeared on disk, honoring the tree's filemode.

@@ -15,6 +15,7 @@ use std::{
     mem::size_of,
     fs::{remove_file, rename, write},
     hash::{Hash, Hasher},
+    os::fd::AsRawFd,
     os::unix::{ffi::OsStrExt, fs::symlink},
     panic,
     path::{Path, PathBuf},
@@ -27,6 +28,7 @@ use std::{
 };
 use miniutils::{EntryKind, PlannedEntry, Special, TreeSpec};
 use stringstore::UniqueStrStore;
+use dirhandle::DirHandle;
 use tempfile::TempDir;
 
 const TEST_NUM: [u64; 3] = [9, 11, 7];
@@ -523,6 +525,51 @@ fn test_tree_deep_walk() {
     let root_depth: u64 = (dir.split(PATH_SEP).count() - 1) as u64;
     assert_eq!(tree.conf().dirs() as u64, root_depth + depth as u64, "dirs miscounted");
     assert_eq!(tree.conf().specials(), 1, "specials miscounted");
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_past_path_max() {
+    /*
+    Directories no path can name: 40 levels of 200-byte names. Past
+    MAX_RECURSE_DEPTH the walk spawns a task per subdirectory, and the
+    diff-rescan descends level by level; both must open each directory
+    relative to its parent's fd, as by its path the open fails with
+    ENAMETOOLONG.
+    */
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let spec: TreeSpec = TreeSpec::new()
+        .levels(40, 1, 1)
+        .dir_names(|idx| format!("{}{:02}", "d".repeat(198), idx.len()));
+    spec.create(temp.path()).unwrap();
+    let plan: Vec<PlannedEntry> = spec.plan(temp.path()).collect();
+    let bottom: PathBuf = plan.iter().rfind(|e| e.kind == EntryKind::Dir).unwrap().path.clone();
+    assert!(bottom.as_os_str().len() > libc::PATH_MAX as usize);
+
+    let obs: Arc<FaultObserver> = Arc::new(FaultObserver::default());
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_observer(obs.clone());
+    tree.walk().unwrap();
+    assert_eq!(*obs.faults.lock(), vec![], "walk faults");
+    for e in &plan {
+        assert!(tree.contains(&e.path.to_string_lossy()), "{} missing", e.path.display());
+    }
+
+    // a file added at the bottom, through the fds of the levels above it
+    let root: DirHandle = DirHandle::new(temp.path()).unwrap();
+    let at_bottom: DirHandle = DirHandle::open_beneath(&root, bottom.strip_prefix(temp.path()).unwrap()).unwrap();
+    let flags: i32 = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC;
+    let fd: i32 = unsafe { libc::openat(at_bottom.as_raw_fd(), c"new.txt".as_ptr(), flags, 0o644) };
+    assert!(fd >= 0, "create at the bottom failed");
+    unsafe { libc::close(fd) };
+
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert_eq!(*obs.faults.lock(), vec![], "update faults");
+    assert_eq!((stats.added_files, stats.errors), (1, 0), "{stats}");
+    assert!(tree.contains(&bottom.join("new.txt").to_string_lossy()));
     tree_validate_counts(&tree);
 }
 

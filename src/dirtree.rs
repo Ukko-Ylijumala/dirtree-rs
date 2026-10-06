@@ -13,7 +13,7 @@ use super::{FileMode, Filters};
 use super::utils::{PATH_SEP, panic_message, path_parts};
 
 use dirhandle::{
-    CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles,
+    CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles, path_fd_at,
     nix::{
         fcntl::{OFlag, open, readlinkat},
         sys::stat::Mode,
@@ -30,11 +30,11 @@ use tracing::{debug, error, instrument, trace, trace_span, warn};
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    ffi::{CStr, OsStr},
+    ffi::{CStr, CString, OsStr},
     fmt::{self, Display, Formatter},
     fs::{DirEntry, metadata, read_link},
     io::{Error, ErrorKind},
-    os::fd::{AsRawFd, BorrowedFd, RawFd},
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::{DirEntryExt, MetadataExt},
     path::{Component, Path, PathBuf},
@@ -112,6 +112,21 @@ struct WalkState {
     scope: ScopeTag,
     name_idx: u32,
     parent_name_idx: Option<u32>,
+}
+
+/**
+Where the walker and the diff-rescan open a directory from. A walk or
+update root is opened by its path, following symlinks as a root given
+by the caller should. Every directory below it is opened relative to
+its parent's fd, never by a path, so it is the very directory its parent
+listed however deep it lies: a symlink swapped in for it or for any
+ancestor cannot redirect the open, and paths past `PATH_MAX` work.
+*/
+pub(super) enum DirAt {
+    /// By its path: a root.
+    Path,
+    /// `name` in its parent, held open as an `O_PATH` fd shared by the parent's subdirectories.
+    In(Arc<OwnedFd>, CString),
 }
 
 /**
@@ -744,6 +759,11 @@ impl DirTree {
     tree-wide counters (and [TreeConf::errors]) still count everything.
     */
     pub fn populate_par_with(&self, path: &Path, recursive: Option<bool>, hooks: &WalkHooks) {
+        self.populate_par_at(path, &DirAt::Path, recursive, hooks);
+    }
+
+    /// [DirTree::populate_par_with] of the directory at `path`, opened from `at`.
+    pub(super) fn populate_par_at(&self, path: &Path, at: &DirAt, recursive: Option<bool>, hooks: &WalkHooks) {
         // the walker passes owned paths down; one conversion per walk root
         let path: &PathBuf = &path.to_path_buf();
         /*
@@ -774,8 +794,8 @@ impl DirTree {
         };
         let walk: Walk = self.new_walk(path, recursive, hooks);
         let state: WalkState = self.initial_walk_state(path);
-        // the walk root is opened by path; a symlinked root is followed
-        let handle: Result<DirHandle, Error> = DirHandle::new(path);
+        // a symlinked walk root is followed, see DirAt
+        let handle: Result<DirHandle, Error> = at.open(path);
         rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, 0, 0));
     }
 
@@ -836,8 +856,9 @@ impl DirTree {
     /**
     The recursive workhorse of the parallel walker.
 
-    `handle` is this directory, as opened by the caller (see
-    [open_dir_nofollow] for why descents never follow symlinks). `node`
+    `handle` is this directory, as opened by the caller: relative to its
+    parent's fd, never following a symlink (see [DirAt], and
+    [EntryExt::open_dir] for why descents never follow one). `node`
     is this directory's own node in the trie; children are attached
     directly under it. `depth` is the semantic distance from
     the walk root (drives visitor depth caps and events); `frames` is
@@ -976,9 +997,23 @@ impl DirTree {
             let n_dirs: usize = partition_dirs_first(&mut entries);
             let (dirs, files) = entries.split_at(n_dirs);
             node.reserve_children(entries.len());
+            /*
+            Past MAX_RECURSE_DEPTH frames each subdirectory is walked by a
+            task of its own (see process_par_dir), which may start after
+            this handle is gone. Rather than by its path, it opens its
+            directory relative to an O_PATH fd of this one, shared by the
+            tasks and closed with the last of them. Should that fd not be
+            had, they fall back to their paths.
+            */
+            let spawns: bool = frames >= MAX_RECURSE_DEPTH && walk.recursive && n_dirs > 0;
+            let spawn_parent: Option<Arc<OwnedFd>> = match spawns {
+                true => path_fd_at(dirfd, c".").ok().map(Arc::new),
+                false => None,
+            };
             let each_dir = |entry: &EntryExt| {
                 self.process_par_dir(
-                    walk, path, dirfd, &state, &node, scope_for_children, depth, frames, rs, entry,
+                    walk, path, dirfd, &state, &node, scope_for_children, depth, frames,
+                    spawn_parent.as_ref(), rs, entry,
                 );
             };
             let each_files = |chunk: &[EntryExt]| {
@@ -1026,6 +1061,7 @@ impl DirTree {
         scope_for_children: ScopeTag,
         depth: usize,
         frames: usize,
+        spawn_parent: Option<&Arc<OwnedFd>>,
         rs: &rayon::Scope<'env>,
         entry: &EntryExt<'_>,
     ) {
@@ -1101,21 +1137,19 @@ impl DirTree {
             );
         } else {
             /*
-            The parent's handle may be gone by the time the task runs
-            (and opening ahead would hold one fd per queued task), so
-            the task opens by path.
+            The parent's handle may be gone by the time the task runs, and
+            opening ahead would hold one fd per queued task: the task opens
+            its directory itself, relative to the parent's shared O_PATH fd.
             */
+            let at: Option<DirAt> = spawn_parent.map(|fd: &Arc<OwnedFd>| {
+                DirAt::In(fd.clone(), entry.file_name().into())
+            });
             rs.spawn(move |s| {
-                self.populate_par_inner(
-                    walk,
-                    &entry_p,
-                    open_dir_nofollow(&entry_p),
-                    next,
-                    child_node,
-                    s,
-                    depth + 1,
-                    0,
-                )
+                let handle: Result<DirHandle, Error> = match at {
+                    Some(at) => at.open(&entry_p),
+                    None => open_dir_nofollow(&entry_p),
+                };
+                self.populate_par_inner(walk, &entry_p, handle, next, child_node, s, depth + 1, 0)
             });
         }
     }
@@ -1971,6 +2005,32 @@ impl Display for DirTree {
     }
 }
 
+impl DirAt {
+    /// `name` in the directory `parent`, or [None] for a name that cannot be one (a NUL in it).
+    pub(super) fn child(parent: &Arc<OwnedFd>, name: &OsStr) -> Option<Self> {
+        CString::new(name.as_bytes()).ok().map(|name: CString| Self::In(parent.clone(), name))
+    }
+
+    /// Open the directory (at `path`) for listing.
+    pub(super) fn open(&self, path: &Path) -> Result<DirHandle, Error> {
+        match self {
+            Self::Path => DirHandle::new(path),
+            Self::In(parent, name) => DirHandle::open_at(&**parent, name.as_c_str()),
+        }
+    }
+
+    /// An `O_PATH` fd of the directory (at `path`): to stat it, and to open its entries from.
+    pub(super) fn path_fd(&self, path: &Path) -> Result<OwnedFd, Error> {
+        match self {
+            Self::Path => {
+                let flags: OFlag = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+                Ok(open(path, flags, Mode::empty())?)
+            }
+            Self::In(parent, name) => path_fd_at(&**parent, name.as_c_str()),
+        }
+    }
+}
+
 impl Walk<'_> {
     /// The absolute depth of the entries of a directory `depth` levels below the walk root.
     #[inline]
@@ -2025,8 +2085,9 @@ fn partition_dirs_first(entries: &mut [EntryExt<'_>]) -> usize {
 
 /**
 Open a directory by path for a walker descent, without following a
-symlink in the final component - the counterpart of
-[EntryExt::open_dir] for when the parent's handle is no longer at hand.
+symlink in the final component: the fallback of a spawned descent when
+no `O_PATH` fd of its parent could be had (see [DirAt]), which limits it
+to paths shorter than `PATH_MAX` and leaves the ancestors unguarded.
 The walker only descends into entries readdir reported as directories;
 should one be swapped for a symlink before the open, following it would
 walk a foreign subtree into the tree (or loop, via `link -> .`). With
