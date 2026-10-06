@@ -584,6 +584,57 @@ fn test_tree_past_path_max() {
 }
 
 #[test]
+fn test_file_opener() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    for d in ["a", "b"] {
+        std::fs::create_dir(temp.path().join(d)).unwrap();
+    }
+    for (f, content) in [("a/x.php", "xxx"), ("a/y.php", "yyyy"), ("b/z.php", "zzzzz")] {
+        write(temp.path().join(f), content).unwrap();
+    }
+    symlink("x.php", temp.path().join("a/link.php")).unwrap();
+    let fifo: CString = CString::new(temp.path().join("a/pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    let file = |p: &str| -> (Arc<Directory>, u32) {
+        match tree.get_node(&format!("{dir}/{p}")) {
+            Some(NodeRef::File { parent, name, .. }) => (parent, name),
+            other => panic!("{p}: {other:?}"),
+        }
+    };
+
+    let mut opener: FileOpener = FileOpener::new(&tree);
+    let (a, x) = file("a/x.php");
+    let (f, st) = opener.open_regular(&a, x).unwrap();
+    assert_eq!((st.st_size, f.metadata().unwrap().len()), (3, 3));
+    // the next file of the same directory reuses its fd
+    let a_fd: i32 = opener.dir_fd(&a).unwrap().as_raw_fd();
+    let (a2, y) = file("a/y.php");
+    assert_eq!(opener.open_regular(&a2, y).unwrap().1.st_size, 4);
+    assert_eq!(opener.dir_fd(&a).unwrap().as_raw_fd(), a_fd);
+
+    // never a symlink, never blocked on a FIFO
+    let (_, link) = file("a/link.php");
+    let err = opener.open_regular(&a, link).expect_err("ELOOP expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+    let (_, pipe) = file("a/pipe");
+    let err = opener.open_regular(&a, pipe).expect_err("not a regular file");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert!(opener.read_nofollow(&a, pipe).is_ok(), "O_NONBLOCK: the open returns");
+
+    let (b, z) = file("b/z.php");
+    assert_eq!(tree.open_file(&b, z).unwrap().1.st_size, 5);
+
+    // a directory swapped for a symlink: its files are not reached through it
+    rename(temp.path().join("a"), temp.path().join("a.moved")).unwrap();
+    symlink(temp.path().join("a.moved"), temp.path().join("a")).unwrap();
+    // (ENOTDIR: the symlink is the last component of what is opened as a directory)
+    let err = tree.open_file(&a, x).expect_err("ENOTDIR expected");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+}
+
+#[test]
 fn test_tree_opens_never_follow_symlinks() {
     /*
     A directory swapped for a symlink after the walk: opening it, or

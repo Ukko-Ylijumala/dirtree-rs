@@ -22,6 +22,7 @@ The crate is split into several modules for clarity:
 - `error`:    [`TreeError`] and [`TreeResult`] for the fallible API.
 - `traverse`: free traversal helpers from an `Arc<Directory>`, calling back with a `NodeView`.
 - `observer`: [`TreeObserver`] - progress reporting out of the tree.
+- `opener`:   [`FileOpener`] - opening a tree's files by their node, relative to their directory.
 - `osname`:   lossless `str` encoding of non-UTF-8 filesystem names.
 - `update`:   diff-rescan (the [`TreeOp::Update`] primitive).
 - `utils`:    small shared helpers (path splitting, weak refs, atomics).
@@ -43,6 +44,7 @@ mod filters;
 mod hash;
 mod node;
 mod observer;
+mod opener;
 mod osname;
 mod tests;
 mod traverse;
@@ -63,6 +65,7 @@ pub use filters::Filters;
 pub use hash::DirTreeXxh3Hasher;
 pub use node::{Child, Directory, FileEntry, FileKind, NodeRef, NodeView};
 pub use observer::{NoopObserver, TreeObserver};
+pub use opener::FileOpener;
 pub use osname::{decode_name, decode_os, decode_path, encode_name, encode_os, is_escaped};
 pub use traverse::{traverse_from, traverse_from_par, walk_nodes};
 pub use update::UpdateStats;

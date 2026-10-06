@@ -58,7 +58,8 @@ code. Each tag marks the tree code as it stood in that statter release.
   symlink in any component. Trees deeper than `PATH_MAX` walk, update
   and are watched, and a symlink swapped in for an ancestor cannot
   redirect them. `path_fd()` hands out such an fd of any directory in
-  the tree, to open its files from.
+  the tree, and `FileOpener` / `open_file()` open a file by its node
+  (directory and interned name) with one directory open per run of files.
 - **Observer:** progress and every fault, as a `FaultKind` with the exact
   path and errno, go to a `TreeObserver`, so a consumer can account for
   coverage.

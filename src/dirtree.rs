@@ -1804,7 +1804,8 @@ impl DirTree {
     An `O_PATH` fd of the directory `dir`: to `fstat`, and to open its
     entries from (dirhandle's `open_regular_at()`, `read_nofollow_at()`,
     `DirHandle::open_at()`), one open per directory for a whole group of
-    files.
+    files. [FileOpener](super::FileOpener) does that for files given by
+    their node.
 
     No path below a walk root is trusted. It goes up from `dir` to the
     nearest directory that is either pooled (an open handle: resident
