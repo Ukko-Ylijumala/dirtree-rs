@@ -167,7 +167,7 @@ Shaped by the scanner side's review of adopting the tree
   deeper than `PATH_MAX` walk and update, and a symlink swapped in for an
   ancestor cannot redirect them. (The watcher followed in batch 2.)
 
-### Batch 2 (0.6.0)
+### Batch 2 (0.5.1)
 
 - **No path below a walk root is trusted, anywhere:** `update()`'s root,
   `DirTree::handle()` and the watcher now open from the nearest pooled

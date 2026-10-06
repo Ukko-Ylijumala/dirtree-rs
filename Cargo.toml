@@ -1,6 +1,6 @@
 [package]
 name = "dirtree"
-version = "0.5.0"
+version = "0.5.1"
 authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
 description = "Parallel directory tree walker and in-memory filesystem trie"
 repository = "https://github.com/Ukko-Ylijumala/dirtree-rs"

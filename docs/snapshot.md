@@ -1,6 +1,6 @@
 # Tree snapshots — plan and file format
 
-Status: **implemented** in 0.6.0 (`src/snapshot.rs`), as planned here
+Status: **implemented** in 0.5.1 (`src/snapshot.rs`), as planned here
 with three changes made while building it:
 
 - A directory record has a `flags` byte: bit 0 keeps the walk-root mark
