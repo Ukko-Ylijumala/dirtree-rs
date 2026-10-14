@@ -13,11 +13,11 @@ use std::{
     collections::hash_map::DefaultHasher,
     ffi::{CStr, CString, OsStr},
     mem::size_of,
-    fs::{create_dir_all, remove_file, rename, write},
+    fs::{create_dir_all, metadata, remove_file, rename, write},
     hash::{Hash, Hasher},
     io::ErrorKind,
     os::fd::{AsFd, AsRawFd, OwnedFd},
-    os::unix::{ffi::OsStrExt, fs::symlink},
+    os::unix::{ffi::OsStrExt, fs::{MetadataExt, symlink}},
     panic,
     path::{Path, PathBuf},
     sync::{
@@ -2273,6 +2273,85 @@ fn test_tree_watcher_move_rebuilds_from_memory() {
     assert!(!tree.contains(&format!("{dir}/dst/b/sub/unseen.bin")), "the move rescanned");
     assert!(!tree.contains(&format!("{dir}/src/a")), "old place still in the tree");
     assert_eq!(tree.conf().files(), files, "files after the move");
+    watcher.stop();
+    assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_watcher_honours_the_visitor() {
+    /*
+    With a visitor, what the watcher adds is what a walk would have kept:
+    in a site, a pruned directory stays out and a new plugin is walked in
+    the site's scope, a file the visitor stores goes in although the tree
+    stores no files, and a marker created makes its directory a site. The
+    events are injected, a batch at a time, as the event loop applies them.
+    */
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |p: &str| temp.path().join(p);
+    let has = |tree: &DirTree, p: &str| tree.contains(&at(p).to_string_lossy());
+    for d in ["site/content/plugins/x", "other"] {
+        create_dir_all(at(d)).unwrap();
+    }
+    write(at("site/MARK"), b"").unwrap();
+    let (tx, rx) = crossbeam::channel::unbounded::<WalkEvent>();
+    let tree: Arc<DirTree> = Arc::new(site_tree(dir, tx));
+    assert_eq!(rx.try_iter().count(), 1);
+    let watcher: Arc<TreeWatcher> = TreeWatcher::prepare(tree.clone()).unwrap();
+    let wd = |p: &str| watcher.wd_of(&at(p)).unwrap();
+    let (content, plugins, x, other) = (wd("site/content"), wd("site/content/plugins"), wd("site/content/plugins/x"), wd("other"));
+
+    for d in ["site/content/uploads/2024", "site/content/plugins/y/inc", "site/content/plugins/x/lib", "other/content/uploads/a", "other/content/z/inc"] {
+        create_dir_all(at(d)).unwrap();
+    }
+    for f in ["site/content/plugins/y/y.php", "site/content/plugins/x/x.php", "other/content/z/z.php"] {
+        write(at(f), b"<?php").unwrap();
+    }
+    let dir_created: u32 = libc::IN_CREATE | libc::IN_ISDIR;
+    watcher.inject_batch(&[
+        (content, dir_created, 0, "uploads"),
+        (plugins, dir_created, 0, "y"),
+        (x, libc::IN_CREATE, 0, "x.php"),
+        (x, dir_created, 0, "lib"),
+        (other, dir_created, 0, "content"),
+    ]);
+    for kept in ["site/content/plugins/y/y.php", "site/content/plugins/x/x.php", "other/content/uploads/a", "other/content/z/inc"] {
+        assert!(has(&tree, kept), "{kept} missing");
+    }
+    for absent in ["site/content/uploads", "site/content/plugins/y/inc", "site/content/plugins/x/lib", "other/content/z/z.php"] {
+        assert!(!has(&tree, absent), "{absent} kept by the watcher");
+    }
+    tree_validate_counts(&tree);
+
+    // a file saved by a rename over it, in one batch: only the new one is kept
+    write(at("site/content/plugins/x/tmp.php"), b"<?php new").unwrap();
+    rename(at("site/content/plugins/x/tmp.php"), at("site/content/plugins/x/x.php")).unwrap();
+    watcher.inject_batch(&[
+        (x, libc::IN_CREATE, 0, "tmp.php"),
+        (x, libc::IN_MOVED_FROM, 5, "tmp.php"),
+        (x, libc::IN_MOVED_TO, 5, "x.php"),
+    ]);
+    assert!(!has(&tree, "site/content/plugins/x/tmp.php"));
+    let ino: u64 = metadata(at("site/content/plugins/x/x.php")).unwrap().ino();
+    let file: NodeRef = tree.get_node(&at("site/content/plugins/x/x.php").to_string_lossy()).unwrap();
+    assert!(matches!(file, NodeRef::File { file, .. } if file.inode() == ino), "{file:?}");
+
+    // a directory moved into the site's plugins is walked again there, as a plugin
+    rename(at("other/content/z"), at("site/content/plugins/z")).unwrap();
+    watcher.inject_batch(&[
+        (wd("other/content"), libc::IN_MOVED_FROM | libc::IN_ISDIR, 11, "z"),
+        (plugins, libc::IN_MOVED_TO | libc::IN_ISDIR, 11, "z"),
+    ]);
+    assert!(!has(&tree, "other/content/z"));
+    assert!(has(&tree, "site/content/plugins/z/z.php") && !has(&tree, "site/content/plugins/z/inc"));
+    tree_validate_counts(&tree);
+
+    // other becomes a site: its uploads goes, and the discovery is reported
+    write(at("other/MARK"), b"").unwrap();
+    watcher.inject(other, libc::IN_CREATE, 0, "MARK");
+    assert!(has(&tree, "other/content") && !has(&tree, "other/content/uploads"));
+    assert_eq!(rx.try_iter().map(|e: WalkEvent| e.path).collect::<Vec<_>>(), [at("other")]);
     watcher.stop();
     assert_eq!(tree.conf().errors(), 0, "watcher reported errors");
     tree_validate_counts(&tree);

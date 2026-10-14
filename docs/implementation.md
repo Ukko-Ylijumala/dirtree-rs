@@ -208,8 +208,9 @@ For that, every directory keeps the scope its entries were walked under
 (scope, names, depth from its walk root) is rebuilt from the tree. The
 diff then prunes and visits files as the walk does, walks new subtrees
 in their parent's context, and walks a subtree again in full when its
-scope changed. A watcher event still does not run the visitor. A
-`FileEntry` has spare bytes for a tag of its own, should visitors ever
+scope changed. With a visitor, the watcher leaves an entry created or
+moved in to a diff of its directory (once per batch of events), so its
+events are decided the same way. A `FileEntry` has spare bytes for a tag of its own, should visitors ever
 tag files.
 
 ## Cooperative cancellation

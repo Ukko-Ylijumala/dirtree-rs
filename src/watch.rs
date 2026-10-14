@@ -15,18 +15,21 @@ v1 caveats (deliberate, recorded for the future crate split):
 - The watcher thread is the only continuous mutator of a resident tree
   (the worker thread idles). Node-level insertion is atomic, but no
   cross-operation ordering with worker ops is guaranteed.
-- [`Filters`](super::Filters) are honored for new entries. A
-  configured [`Visitor`](super::Visitor) runs for new-directory subtree
-  scans (they go through the normal parallel walker) but is not
-  consulted for single-file events.
+- [`Filters`](super::Filters) are honored for new entries, and so is a
+  configured [`Visitor`](super::Visitor): with one, an entry created or
+  moved in is applied by a [diff](DirTree::update_node) of its directory,
+  once per batch of events read, which decides on it from the listing in
+  the context the walk gave the directory, and walks a new subdirectory
+  there. Without one, the entry is inserted as it is.
 - Renames are correlated via move cookies: a rename within one directory
   re-attaches the detached subtree in place (node identity, contents and
   kernel watches survive - no rescan). A file is re-attached the same way
   in any directory (it has no parent pointer); a directory moved to
   another one is rebuilt there from memory (the trie cannot re-parent a
   directory node), with its inodes, stamps and handles
-  ([`DirTree::graft_subtree`]), without disk reads. With a visitor, a moved directory is re-scanned instead, as
-  the visitor's verdicts depend on its ancestors. A
+  ([`DirTree::graft_subtree`]), without disk reads. With a visitor, a
+  moved directory is walked again instead (by a diff of its new parent),
+  as the visitor's verdicts depend on its ancestors. A
   `MOVED_FROM` with no matching `MOVED_TO` within [`PENDING_MOVE_TTL`]
   is a move out of the tree and drops the subtree. Events arriving for
   a subtree between its `MOVED_FROM` and `MOVED_TO` mark the move dirty,
@@ -63,7 +66,7 @@ use std::{
     borrow::Cow,
     ffi::{CString, OsStr},
     io,
-    mem::size_of,
+    mem::{self, size_of},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -139,6 +142,8 @@ pub struct TreeWatcher {
     watches: DashMap<i32, Weak<Directory>>,
     /// move cookie -> detached subtree awaiting rename correlation
     pending: DashMap<u32, PendingMove>,
+    /// with a visitor, the directories entries were created in, to diff once the batch is read
+    diffs: Mutex<Vec<Arc<Directory>>>,
     /// filesystem events applied to the tree so far
     events_seen: AtomicU64,
     /// watches that could not be established (e.g. max_user_watches)
@@ -196,6 +201,7 @@ impl TreeWatcher {
             ino_fd: unsafe { OwnedFd::from_raw_fd(fd) },
             watches: DashMap::new(),
             pending: DashMap::new(),
+            diffs: Mutex::new(Vec::new()),
             events_seen: AtomicU64::new(0),
             failed: AtomicU32::new(0),
             quit: AtomicBool::new(false),
@@ -516,6 +522,35 @@ impl TreeWatcher {
             self.handle_event(ev.wd, ev.mask, ev.cookie, OsStr::from_bytes(&name_bytes[..end]));
             off += EVENT_HDR + name_len;
         }
+        self.flush_diffs();
+    }
+
+    /**
+    Diff, without recursing, each directory the batch created entries in
+    while a visitor is set (see [TreeWatcher::handle_event]): once, however
+    many events named it. A directory removed by a later event of the
+    batch is no longer in the tree, and is left alone.
+    */
+    fn flush_diffs(&self) {
+        let mut dirs: Vec<Arc<Directory>> = mem::take(&mut *self.diffs.lock());
+        dirs.sort_unstable_by_key(|d: &Arc<Directory>| Arc::as_ptr(d));
+        dirs.dedup_by(|a: &mut Arc<Directory>, b: &mut Arc<Directory>| Arc::ptr_eq(a, b));
+        for dir in dirs {
+            self.diff_dir(&dir);
+        }
+    }
+
+    /**
+    Diff the directory `node` without recursing, for a visitor to decide
+    on the entries new to it: a new subdirectory is walked in its context,
+    and watched as the walk lists it (see [ListHook]).
+    */
+    fn diff_dir(&self, node: &Arc<Directory>) {
+        match self.tree.update_node(node, Some(false)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warn!("Diff failed for {}: {e}", node.path(self.tree.strings()).display()),
+        }
     }
 
     /// Apply a single inotify event to the tree.
@@ -636,6 +671,18 @@ impl TreeWatcher {
 
         if mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
             if !self.tree.conf.filters().passes(name, is_dir) {
+                return;
+            }
+            /*
+            With a visitor, the entry is the visitor's to decide on, as in a
+            walk: its prunes and file verdicts depend on the scope and the
+            depth the walk gave the directory, and a marker created may
+            change the directory's own verdict. A diff of the directory
+            decides from its listing in that context, so the entry is left
+            to one, run once the batch is read (see flush_diffs).
+            */
+            if self.tree.has_visitor() {
+                self.diffs.lock().push(node);
                 return;
             }
             /*
@@ -836,18 +883,12 @@ impl TreeWatcher {
             /*
             A visitor's verdicts depend on a directory's ancestors
             (scopes, depth caps, path-aware prunes), so a subtree in
-            a new place is walked again for the visitor to see it.
+            a new place is walked again for the visitor to see it: a
+            diff of the new parent walks it as new, in its context.
             */
             self.tree.release_handles(&child);
             drop(child); // release the old subtree before re-scanning
-            // scanned from the parent's fd, watched directory by directory, see scan_new_dir()
-            if let Some(here) = self.dir_fd(parent, dir_path)
-                && let Ok(st) = fstatat(&here, name, AtFlags::AT_SYMLINK_NOFOLLOW)
-            {
-                self.tree.insert_dir(&full, Some(st.st_ino));
-                self.tree.conf.observer().dirs_added(1);
-                self.scan_new_dir(here, &full, name);
-            }
+            self.diff_dir(parent);
             self.sweep_dead_watches();
         } else {
             /*
@@ -878,9 +919,17 @@ impl TreeWatcher {
 
 #[cfg(test)]
 impl TreeWatcher {
-    /// Apply one synthetic event, as the event loop would.
+    /// Apply one synthetic event, as the event loop would a batch of one.
     pub(super) fn inject(&self, wd: i32, mask: u32, cookie: u32, name: &str) {
-        self.handle_event(wd, mask, cookie, OsStr::new(name));
+        self.inject_batch(&[(wd, mask, cookie, name)]);
+    }
+
+    /// Apply synthetic events `(wd, mask, cookie, name)` as one batch, as the event loop would.
+    pub(super) fn inject_batch(&self, events: &[(i32, u32, u32, &str)]) {
+        for (wd, mask, cookie, name) in events {
+            self.handle_event(*wd, *mask, *cookie, OsStr::new(name));
+        }
+        self.flush_diffs();
     }
 
     /// The watch descriptor of the directory at `path`, if it is watched.
