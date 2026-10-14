@@ -13,16 +13,31 @@ queue-overflow recovery in [`TreeWatcher`](super::TreeWatcher), and
 a blind re-scan (which can only ever add nodes), the diff detects and
 removes stale tree entries as well.
 
-Policy matches the watcher: [`Filters`](super::Filters) are
-honored (a filtered-out entry is treated as absent from disk, so tree
-entries admitted by earlier, laxer filters get removed), the
-[`Visitor`](super::Visitor) protocol is not consulted for the diff
-itself but runs for the full scans of newly appeared subtrees. In Name
-filemode files carry no inode, so file replacement is undetectable
-there; adds and removes still work.
+Policy matches the walk: what a diff leaves is what a walk would have
+built. [`Filters`](super::Filters) are honored (a filtered-out entry is
+treated as absent from disk, so tree entries admitted by earlier, laxer
+filters get removed), and so is the tree's [`Visitor`](super::Visitor),
+in the context the walk gives it (the scope, the names, the depth from
+the walk root), rebuilt from the tree:
+
+- `visit_dir` sees the fresh listing of each directory the diff lists:
+  its verdict refreshes the tag, sets the scope its entries are diffed
+  under, and a declined directory keeps no entries;
+- `prune_child` drops entries as in the walk: a pruned entry is absent,
+  like a filtered one;
+- `visit_file` decides on each file the diff adds or replaces (with a
+  file mode that stores none, that is every file it did not have stored
+  before), `Store` keeping it as in the walk;
+- a subtree that appeared is walked in the context of the directory it
+  appeared in, and one whose scope changed is walked again in full,
+  since everything below was decided under the other scope.
+
+A directory the pre-check skips is not visited: nothing in its listing
+changed. In Name filemode files carry no inode, so file replacement is
+undetectable there; adds and removes still work.
 */
 
-use super::dirtree::{DirAt, DirTree, ENTRY_BATCH_MIN, MAX_RECURSE_DEPTH, WalkHooks};
+use super::dirtree::{DirAt, DirTree, ENTRY_BATCH_MIN, MAX_RECURSE_DEPTH, WalkState};
 use super::event::{FaultKind, TreeEvent, TreeOp};
 use super::hash::DirTreeXxh3Hasher;
 use super::conf::NodeCounts;
@@ -30,6 +45,7 @@ use super::dirtree::NewChild;
 use super::node::{Child, DirTreeHashMap, Directory, FileEntry, FileKind, NodeRef, ctime_stamp};
 use super::osname::{decode_os, encode_os};
 use super::utils::proc_fd_path;
+use super::visitor::{DirContext, FileContext, FileVerdict, ScopeTag, Visitor, WalkContext};
 
 use dirhandle::{DirHandle, EntryExt, nix::{fcntl::readlink, sys::stat::fstat}};
 use timesince::SecondsSinceEpoch;
@@ -186,6 +202,30 @@ impl UpdateCtr {
     }
 }
 
+/**
+What a diff resolves once, at its start, and every directory of it
+shares by reference: the visitor it consults, whether it recurses, and
+its counters.
+*/
+struct Diff {
+    visitor: Option<Arc<dyn Visitor>>,
+    recursive: bool,
+    ctr: UpdateCtr,
+}
+
+/**
+The pre-check baseline a complete listing leaves: its `stamp` (see
+[ctime_stamp]), or 0 when that is too recent to prove "unchanged" later
+(see [MTIME_SLACK_SECS]). `pass_time` is when the listing began, in
+seconds by the local clock. The walk and the diff both stamp this way.
+*/
+pub(super) fn settled_stamp(stamp: u64, pass_time: u64) -> u64 {
+    match stamp / 1_000_000_000 + MTIME_SLACK_SECS < pass_time {
+        true => stamp,
+        false => 0,
+    }
+}
+
 impl DirTree {
     /**
     Diff-rescan a directory that is already in the tree, applying any
@@ -234,14 +274,19 @@ impl DirTree {
                 format!("Not a scanned directory (above the tree root?): {}", full.display()),
             ));
         }
-        let recursive: bool = recursive.unwrap_or(self.conf.recursive());
-        let ctr: UpdateCtr = UpdateCtr::default();
+        let diff: Diff = Diff {
+            visitor: self.conf.visitor(),
+            recursive: recursive.unwrap_or(self.conf.recursive()),
+            ctr: UpdateCtr::default(),
+        };
+        // the context a walk reaches the directory with
+        let (state, depth): (WalkState, usize) = self.state_of(&node);
         // opened from its walk root (or a pooled ancestor), not by its path
         match self.dir_at(&node) {
-            Ok(at) => rayon::scope(|s| self.update_inner(&full, node, at, 0, recursive, &ctr, s, 0)),
-            Err(e) => self.update_open_failed(&full, &node, e, &ctr),
+            Ok(at) => rayon::scope(|s| self.update_inner(&diff, &full, node, at, state, depth, s, 0)),
+            Err(e) => self.update_open_failed(&full, &node, e, &diff.ctr),
         }
-        let stats: UpdateStats = ctr.snapshot();
+        let stats: UpdateStats = diff.ctr.snapshot();
         debug!(target: "UPDATE", "{}: {stats}", full.display());
         Ok(stats)
     }
@@ -249,8 +294,10 @@ impl DirTree {
     /**
     Diff one directory, opened from `at` (see [DirAt]), and recurse.
     `frames` bounds direct recursion before offloading to the rayon
-    scope, like the parallel walker. `dev` is the parent's device when
-    the tree stays on one filesystem and it is known, else 0.
+    scope, like the parallel walker. `state` is what a walk reaches the
+    directory with (its device: the parent's when the tree stays on one
+    filesystem and it is known, else 0), and `depth` its distance from
+    its walk root.
 
     The directory is held as an `O_PATH` fd throughout: the pre-check
     stats it, the diff lists it, and its subdirectories are opened
@@ -259,17 +306,25 @@ impl DirTree {
     #[allow(clippy::too_many_arguments)]
     fn update_inner<'env>(
         &'env self,
+        diff: &'env Diff,
         path: &PathBuf,
         node: Arc<Directory>,
         at: DirAt,
-        dev: u64,
-        recursive: bool,
-        ctr: &'env UpdateCtr,
+        state: WalkState,
+        depth: usize,
         rs: &rayon::Scope<'env>,
         frames: usize,
     ) {
         if self.conf.is_cancelled() {
             return;
+        }
+        let ctr: &UpdateCtr = &diff.ctr;
+        // the walker's per-scope depth cap: a directory past it was never listed, and is not now
+        if let Some(v) = &diff.visitor {
+            let cap: usize = v.max_depth(state.scope);
+            if cap > 0 && depth >= cap {
+                return;
+            }
         }
         let here: Arc<OwnedFd> = match at.path_fd(path) {
             Ok(fd) => Arc::new(fd),
@@ -282,26 +337,34 @@ impl DirTree {
             false => None,
         };
         // staying on one filesystem: a mount point is left unlisted, as by the walker
-        let dev: u64 = match st {
-            Some(st) if one_fs => {
-                if dev != 0 && st.st_dev != dev {
-                    debug!(target: "MOUNT_SKIP", "{}", path.display());
-                    self.conf.observer().mount_skipped(path);
-                    return;
-                }
-                st.st_dev
+        let mut state: WalkState = state;
+        if let Some(st) = st
+            && one_fs
+        {
+            if state.dev != 0 && st.st_dev != state.dev {
+                debug!(target: "MOUNT_SKIP", "{}", path.display());
+                self.conf.observer().mount_skipped(path);
+                return;
             }
-            _ => dev,
+            state.dev = st.st_dev;
+        }
+        // what a walk hands down to the subdirectory `name_idx`: the scope this directory's entries are under
+        let child_state = |name_idx: u32| WalkState {
+            scope: node.children_scope(),
+            name_idx,
+            parent_name_idx: Some(state.name_idx),
+            dev: state.dev,
         };
         // a subdirectory of this one, to diff (or scan) next
         let recurse = |child_p: PathBuf, child: Arc<Directory>, name: &OsStr| {
             let Some(at) = DirAt::child(&here, name) else {
                 return;
             };
+            let next: WalkState = child_state(child.name_idx());
             if frames < MAX_RECURSE_DEPTH {
-                self.update_inner(&child_p, child, at, dev, recursive, ctr, rs, frames + 1);
+                self.update_inner(diff, &child_p, child, at, next, depth + 1, rs, frames + 1);
             } else {
-                rs.spawn(move |s| self.update_inner(&child_p, child, at, dev, recursive, ctr, s, 0));
+                rs.spawn(move |s| self.update_inner(diff, &child_p, child, at, next, depth + 1, s, 0));
             }
         };
 
@@ -314,7 +377,8 @@ impl DirTree {
         themselves). Stamps are compared with stamps only, never with
         the local clock, so clock skew against an NFS / SMB / FUSE
         server cannot hide a change. Only nodes whose baseline was set
-        by an earlier, settled full diff qualify (see [MTIME_SLACK_SECS]).
+        by an earlier, settled full diff (or walk) qualify (see
+        [MTIME_SLACK_SECS]).
         */
         if stamp != 0
             && let Some(st) = st
@@ -322,7 +386,7 @@ impl DirTree {
         {
             trace!(target: "UPDATE_SKIP", "{} unchanged since {stamp}", path.display());
             ctr.skipped_dirs.fetch_add(1, Relaxed);
-            if recursive {
+            if diff.recursive {
                 let subdirs: Vec<(u32, Arc<Directory>)> = node
                     .children()
                     .read()
@@ -359,11 +423,6 @@ impl DirTree {
         let child_depth: u8 = path.components().count().min(u8::MAX as usize) as u8;
 
         /*
-        Disk view: interned name -> dirent. Filtered entries are treated
-        as absent. An entry whose type cannot be determined at all
-        (DT_UNKNOWN and a failed fstatat) is neither: it exists, so
-        whatever the tree has under that name is kept as-is.
-
         The diff keeps its own stamp (above), so the handle's own state
         tracking would be wasted work: iterate untracked.
         */
@@ -388,17 +447,44 @@ impl DirTree {
             return;
         }
         drop(iter);
+
         /*
+        The visitor sees the fresh listing as the walk would. A verdict
+        that declines the entries leaves the directory none. Entries
+        walked under a scope other than the one the verdict sets now
+        were all decided under the wrong one: they are removed and walked
+        again, whatever `recursive` says, as unchanged subdirectories
+        would otherwise keep what the old scope let in.
+        */
+        let ctx: WalkContext = state.context(path, dirfd, depth, &self.strings);
+        let mut descend: bool = true;
+        let mut rewalk: bool = false;
+        if let Some(v) = &diff.visitor {
+            let walked_under: ScopeTag = node.children_scope();
+            let verdict = v.visit_dir(DirContext { walk: &ctx, entries: &entries });
+            let (scope, walk_entries) = self.apply_verdict(&node, verdict, path, &state, depth);
+            descend = walk_entries;
+            rewalk = descend && scope != walked_under;
+        }
+
+        /*
+        Disk view: interned name -> dirent. Filtered entries and those
+        the visitor prunes are treated as absent. An entry whose type
+        cannot be determined at all (DT_UNKNOWN and a failed fstatat) is
+        neither: it exists, so whatever the tree has under that name is
+        kept as-is.
+
         The passing names are interned after the loop, ENTRY_BATCH_MIN at
         a time: one insert_many() takes stringstore's writer mutex once per
         batch instead of once per new name (as the walker does). Batches
         stay moderate, as every reader and writer waiting on the mutex
-        waits out the whole batch.
+        waits out the whole batch. The visitor prunes by the interned
+        name, so after that.
         */
         let mut names: Vec<Cow<str>> = Vec::with_capacity(entries.len());
         let mut passing: Vec<&EntryExt> = Vec::with_capacity(entries.len());
         let mut unknown: Vec<u32> = Vec::new();
-        for e in &entries {
+        for e in entries.iter().filter(|_| descend) {
             let name_os: &OsStr = OsStr::from_bytes(e.name_as_bytes());
             if e.file_type().is_none() {
                 // lookup only: a name the store lacks is not in the tree either
@@ -424,34 +510,61 @@ impl DirTree {
             .zip(passing.chunks(ENTRY_BATCH_MIN))
         {
             let indices: Vec<u32> = self.strings.insert_many(batch);
-            disk.extend(indices.into_iter().zip(batch_entries.iter().copied()));
+            for (idx, e) in indices.into_iter().zip(batch_entries.iter().copied()) {
+                if !diff.visitor.as_ref().is_some_and(|v| v.prune_child(&ctx, idx, e.is_dir())) {
+                    disk.insert(idx, e);
+                }
+            }
         }
 
         // tree view snapshot (file copies and directory Arc clones, one read lock hold)
-        let tree_view: DirTreeHashMap<u32, Child> = node.children().read().clone();
+        let mut tree_view: DirTreeHashMap<u32, Child> = node.children().read().clone();
 
-        // pass 1: remove what is no longer on disk
+        // pass 1: remove what is no longer on disk (or everything, to be walked again)
         for (name_idx, child) in &tree_view {
-            if disk.contains_key(name_idx) || unknown.contains(name_idx) {
+            if !rewalk && (disk.contains_key(name_idx) || unknown.contains(name_idx)) {
                 continue;
             }
             trace!(target: "UPDATE_RM", "{:?} in {}", name_idx, path.display());
             ctr.removed(self.remove_child_node(&node, *name_idx, child));
         }
+        if rewalk {
+            tree_view.clear();
+        }
+        // how a new subdirectory is walked, if it is
+        let walk_new = |name_idx: u32| -> Option<(WalkState, usize)> {
+            (diff.recursive || rewalk).then(|| (child_state(name_idx), depth + 1))
+        };
 
         // pass 2: add what is new, replace what changed, recurse into the rest
         for (name_idx, entry) in disk {
             let is_dir: bool = entry.is_dir();
             let disk_ino: u64 = entry.ino();
             let name_os: &OsStr = OsStr::from_bytes(entry.name_as_bytes());
-            // what a new or replaced non-directory is recorded as
-            let leaf = || -> FileEntry {
+            /*
+            What a new or replaced non-directory is recorded as, if it is
+            at all: the visitor's verdict decides as in the walk, else
+            the file mode.
+            */
+            let leaf = || -> Option<FileEntry> {
                 let kind: FileKind = entry.file_type().and_then(FileKind::from_type).unwrap_or_default();
+                let verdict: FileVerdict = match &diff.visitor {
+                    Some(v) => v.visit_file(&FileContext { walk: &ctx, entry, name_idx, kind, listing: &entries }),
+                    None => FileVerdict::Keep,
+                };
+                let store: bool = match verdict {
+                    FileVerdict::Keep => self.filemode().is_node(),
+                    FileVerdict::Store => true,
+                    FileVerdict::Drop => false,
+                };
+                if !store {
+                    return None;
+                }
                 let target: Option<u32> = match kind {
                     FileKind::Symlink => self.link_target_at(self.conf.observer(), dirfd, path, entry.file_name()),
                     _ => None,
                 };
-                FileEntry::new(disk_ino, kind, target)
+                Some(FileEntry::new(disk_ino, kind, target))
             };
 
             match tree_view.get(&name_idx) {
@@ -460,11 +573,11 @@ impl DirTree {
                     if is_dir {
                         let child_p: PathBuf = path.join(name_os);
                         self.update_add_dir(
-                            &node, name_idx, disk_ino, child_depth, &child_p, &here, recursive,
+                            &node, name_idx, disk_ino, child_depth, &child_p, &here, walk_new(name_idx),
                             ctr,
                         );
-                    } else {
-                        self.update_add_file(&node, name_idx, leaf(), child_depth, ctr);
+                    } else if let Some(file) = leaf() {
+                        self.update_add_file(&node, name_idx, file, child_depth, ctr);
                     }
                 }
 
@@ -490,14 +603,14 @@ impl DirTree {
                         if is_dir {
                             let child_p: PathBuf = path.join(name_os);
                             self.update_add_dir(
-                                &node, name_idx, disk_ino, child_depth, &child_p, &here, recursive,
+                                &node, name_idx, disk_ino, child_depth, &child_p, &here, walk_new(name_idx),
                                 ctr,
                             );
-                        } else {
-                            self.update_add_file(&node, name_idx, leaf(), child_depth, ctr);
+                        } else if let Some(file) = leaf() {
+                            self.update_add_file(&node, name_idx, file, child_depth, ctr);
                         }
                     } else if let Child::Dir(child) = existing
-                        && recursive
+                        && diff.recursive
                     {
                         // unchanged directory: recurse the diff into it
                         recurse(path.join(name_os), child.clone(), name_os);
@@ -511,12 +624,14 @@ impl DirTree {
         unless the stamp is too recent to be trusted (see
         [MTIME_SLACK_SECS]), which clears the baseline instead.
         */
-        let settled: bool = stamp / 1_000_000_000 + MTIME_SLACK_SECS < pass_time;
-        node.set_scan_stamp(if settled { stamp } else { 0 });
+        node.set_scan_stamp(settled_stamp(stamp, pass_time));
     }
 
-    /// Insert a directory that appeared on disk and, when `recursive`,
-    /// scan its contents in full (visitor- and resident-aware).
+    /**
+    Insert a directory that appeared on disk and, when `walk` gives the
+    state and depth to walk it with, scan its contents in full
+    (visitor- and resident-aware), as the walk of its parent would have.
+    */
     #[allow(clippy::too_many_arguments)]
     fn update_add_dir(
         &self,
@@ -526,7 +641,7 @@ impl DirTree {
         depth: u8,
         child_p: &Path,
         parent_fd: &Arc<OwnedFd>,
-        recursive: bool,
+        walk: Option<(WalkState, usize)>,
         ctr: &UpdateCtr,
     ) {
         trace!(target: "UPDATE_ADD", "dir {}", child_p.display());
@@ -535,16 +650,12 @@ impl DirTree {
             ctr.added_dirs.fetch_add(1, Relaxed);
             self.conf.observer().dirs_added(1);
         }
-        if recursive
-            && child.is_dir()
+        if let Some((state, depth)) = walk
+            && let Child::Dir(node) = child
             && let Some(at) = child_p.file_name().and_then(|n: &OsStr| DirAt::child(parent_fd, n))
         {
             // a whole new subtree: full scan instead of a diff
-            let dev: u64 = match self.conf.one_fs() {
-                true => fstat(&**parent_fd).map_or(0, |st: libc::stat| st.st_dev),
-                false => 0,
-            };
-            self.populate_par_at(child_p, &at, dev, Some(true), &WalkHooks::default());
+            self.populate_par_below(child_p, &at, node, state, depth);
         }
     }
 
@@ -570,7 +681,7 @@ impl DirTree {
         );
     }
 
-    /// Insert a file that appeared on disk, honoring the tree's filemode.
+    /// Insert a file that appeared on disk, one the visitor or the tree's filemode keeps.
     fn update_add_file(
         &self,
         parent: &Arc<Directory>,
@@ -579,16 +690,13 @@ impl DirTree {
         depth: u8,
         ctr: &UpdateCtr,
     ) {
-        if self.filemode().is_node() {
-            let (_, created) =
-                self.insert_child(parent, name_idx, NewChild::File(file), depth);
-            if created && file.kind().is_special() {
-                ctr.added_specials.fetch_add(1, Relaxed);
-                self.conf.observer().specials_added(1);
-            } else if created {
-                ctr.added_files.fetch_add(1, Relaxed);
-                self.conf.observer().files_added(1, 0);
-            }
+        let (_, created) = self.insert_child(parent, name_idx, NewChild::File(file), depth);
+        if created && file.kind().is_special() {
+            ctr.added_specials.fetch_add(1, Relaxed);
+            self.conf.observer().specials_added(1);
+        } else if created {
+            ctr.added_files.fetch_add(1, Relaxed);
+            self.conf.observer().files_added(1, 0);
         }
     }
 }

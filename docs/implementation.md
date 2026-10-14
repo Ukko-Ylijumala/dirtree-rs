@@ -198,11 +198,19 @@ The tag of every `Verdict::Tag` is also kept on the directory itself
 query the finished tree instead of (or as well as) draining the channel:
 `DirTree::tagged(tag)` iterates the directories carrying a tag. Each visit
 of a directory refreshes its tag, so a rescan of it picks up a marker that
-came or went. A diff-rescan (`update()`) or a watcher event does not re-run
-the visitor on directories it does not scan in full, so their tags stay as
-of their last walk. Re-evaluating them there would also need each
-directory's scope and walk depth stored. A `FileEntry` has spare bytes for
-a tag of its own, should visitors ever tag files.
+came or went.
+
+A diff-rescan (`update()`) visits each directory it lists, as the walk
+does, so a marker that came or went is picked up there too; one the
+pre-check skips is not visited, since nothing in its listing changed.
+For that, every directory keeps the scope its entries were walked under
+(`Directory::children_scope()`), and the walk context of a directory
+(scope, names, depth from its walk root) is rebuilt from the tree. The
+diff then prunes and visits files as the walk does, walks new subtrees
+in their parent's context, and walks a subtree again in full when its
+scope changed. A watcher event still does not run the visitor. A
+`FileEntry` has spare bytes for a tag of its own, should visitors ever
+tag files.
 
 ## Cooperative cancellation
 

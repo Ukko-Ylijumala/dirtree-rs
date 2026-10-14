@@ -198,8 +198,31 @@ Shaped by the scanner side's review of adopting the tree
 - **One filesystem (#10):** `with_one_filesystem(true)`; each mount
   point skipped reaches `TreeObserver::mount_skipped()`.
 
-Still open: a fanotify change source (the daemon's), and measuring the
-memory of a real host's tree (Scale, below).
+### 0.5.2
+
+Found while the WordPress scanner planned its incremental mode on
+snapshots: `update()` did not consult the visitor. Every directory the
+visitor had pruned looked new to the diff and was walked in full, out of
+context (the first diff after a walk took in all of `uploads`), and with
+a file mode that stores none, a file the visitor selected was never
+stored when it came new or replaced.
+
+- **`update()` honours the visitor:** each directory keeps the scope its
+  entries were walked under (`Directory::children_scope()`, saved in
+  snapshot format version 2). The diff rebuilds a directory's walk
+  context from the tree, runs `visit_dir` on the fresh listing (its tag
+  and scope refreshed, a declined directory keeping no entries), prunes
+  and visits the files it adds or replaces as the walk does, walks new
+  subtrees in their parent's context, and walks a subtree again in full
+  when its scope changed. Depth caps hold as in the walk.
+- **The walk stamps what it lists:** one `fstat` per directory, on the
+  handle it holds, so a snapshot saved straight after a walk is a warm
+  start. A node that held entries before the walk listed it keeps its
+  stamp, since a walk adds but never removes.
+
+Still open: a fanotify change source (the daemon's), measuring the
+memory of a real host's tree (Scale, below), and the watcher's event
+handling, which still does not consult the visitor.
 
 ## Scale
 

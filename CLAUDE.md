@@ -26,7 +26,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `NodeRef` (owned) is handed out by lookups and iterators. `NodeView` (borrowed) is passed to traversal callbacks while the visited directory's read lock is held: a callback must not modify that directory.
 - Names: every name is interned through `osname::encode_name`, so non-UTF-8 bytes become U+F780..U+F7FF escapes. Every `&str` path in the API is that encoded form, and paths are decoded on their way to the kernel. Never intern through `to_string_lossy()` or stringstore's `store_path` (which also strips control characters and drops `...`).
 - Errors: build every error event with `TreeEvent::error(kind, msg)` (plus `.path()`, `.io()` / `.errno()`, `.op()`) and record it with `add_error()`. That counts it in `TreeConf::errors` and tells the observer (`TreeObserver::fault`). Use `add_fault()` for faults that repeat en masse. Don't record an error any other way, or a consumer that accounts for coverage misses it.
-- Visitors run in the parallel walker only. A configured visitor forces the parallel walker. Markers are evaluated at the directory they tag, before its subdirectories are walked, so `descend(false)` claims the whole subtree.
+- Visitors run in the parallel walker and in `update()`'s diff (in the walk's context, rebuilt from each directory's stored scope), not in the sync walker or the watcher's event handling. A configured visitor forces the parallel walker. Markers are evaluated at the directory they tag, before its subdirectories are walked, so `descend(false)` claims the whole subtree.
 
 ## Conventions
 

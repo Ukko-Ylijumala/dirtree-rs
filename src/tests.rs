@@ -642,6 +642,7 @@ struct SavedNode {
     target: Option<PathBuf>,
     stamp: u64,
     tag: Option<ScopeTag>,
+    scope: ScopeTag,
     walk_root: bool,
 }
 
@@ -658,6 +659,7 @@ fn tree_entries(tree: &DirTree) -> Vec<SavedNode> {
                 target: tree.symlink_target(&n),
                 stamp: dir.map_or(0, |d| d.scan_stamp()),
                 tag: dir.and_then(|d| d.tag()),
+                scope: dir.map_or(SCOPE_NONE, |d| d.children_scope()),
                 walk_root: dir.is_some_and(|d| d.is_walk_root()),
             }
         })
@@ -681,10 +683,10 @@ fn test_snapshot_round_trip() {
     let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
         .from_path(dir)
         .with_recursive(true);
-    let marker: Marker = Marker::file_named("MARK").tag(TAG);
+    let marker: Marker = Marker::file_named("MARK").tag(TAG).enter_scope(TAG);
     let tree: DirTree = tree.with_visitor(Arc::new(MarkerVisitor::new().marker(marker)));
     tree.walk().unwrap();
-    // stamps are set by a settled diff only (see test_tree_update_mtime_precheck)
+    // stamps are set by settled listings only (see test_tree_update_mtime_precheck)
     std::thread::sleep(Duration::from_millis(3500));
     tree.update(dir, Some(true)).unwrap();
 
@@ -697,6 +699,8 @@ fn test_snapshot_round_trip() {
     assert_eq!(loaded.conf().counts(), tree.conf().counts());
     assert_eq!(loaded.conf().depth(), tree.conf().depth());
     assert_eq!(loaded.tagged(TAG).count(), 1);
+    // the scope the tagged directory's entries were walked under, for a diff of them
+    assert!(loaded.tagged(TAG).all(|d: Arc<Directory>| d.children_scope() == TAG));
     tree_validate_counts(&loaded);
 
     // the warm start: every directory skipped on its stamp, nothing listed
@@ -750,6 +754,8 @@ fn test_snapshot_rejected() {
     long.push(0);
     assert!(reason(empty().load(long.as_slice())).starts_with("no end marker"));
     assert!(reason(empty().load(&b"DIRTREE\0\x09\0"[..])).starts_with("version"));
+    // version 1 kept no scopes: a diff of its tree could not consult a visitor
+    assert_eq!(reason(empty().load(&b"DIRTREE\0\x01\0"[..])), "version 1");
     let other: TempDir = TempDir::new().unwrap();
     let elsewhere: DirTree = DirTree::new(FileMode::NODE, Filters::default())
         .from_path(other.path().to_str().unwrap());
@@ -1060,6 +1066,225 @@ fn test_tree_update_mtime_precheck() {
     tree_validate_counts(&tree);
 }
 
+/// The tag of a [SiteVisitor] site, and the scope below it.
+const SITE: ScopeTag = 4;
+
+/**
+A WordPress-like visitor whose prunes depend on the scope, as a real
+consumer's do: a directory holding `MARK` is a site, tagged and scoped;
+inside a site, `uploads` and every directory in a child of `plugins` are
+pruned. The `.php` files in a child of `plugins` are stored, in or out of
+a site, which in a mode that stores no files is all the tree keeps.
+*/
+#[derive(Debug)]
+struct SiteVisitor {
+    uploads: u32,
+    plugins: u32,
+}
+
+impl SiteVisitor {
+    fn new(strings: &UniqueStrStore) -> Self {
+        Self { uploads: strings.insert("uploads"), plugins: strings.insert("plugins") }
+    }
+}
+
+impl Visitor for SiteVisitor {
+    fn visit_dir(&self, ctx: DirContext<'_>) -> Verdict {
+        match ctx.entry(b"MARK") {
+            Some(_) => Verdict::tag(SITE).enter_scope(SITE),
+            None => Verdict::Continue,
+        }
+    }
+
+    fn prune_child(&self, parent: &WalkContext<'_>, child: u32, is_dir: bool) -> bool {
+        is_dir && parent.scope == SITE && (child == self.uploads || parent.parent_name_idx == Some(self.plugins))
+    }
+
+    fn visit_file(&self, ctx: &FileContext<'_>) -> FileVerdict {
+        match ctx.walk.parent_name_idx == Some(self.plugins) && ctx.entry.name_as_bytes().ends_with(b".php") {
+            true => FileVerdict::Store,
+            false => FileVerdict::Keep,
+        }
+    }
+}
+
+/// A directory skeleton of `dir` walked with a [SiteVisitor], its discoveries going to `tx`.
+fn site_tree(dir: &str, tx: crossbeam::channel::Sender<WalkEvent>) -> DirTree {
+    let tree: DirTree = DirTree::new(FileMode::UNSET, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_discovery_sink(tx);
+    let visitor: SiteVisitor = SiteVisitor::new(tree.strings());
+    let tree: DirTree = tree.with_visitor(Arc::new(visitor));
+    tree.walk().unwrap();
+    tree
+}
+
+/// The paths of every node of `tree`, sorted.
+fn tree_paths(tree: &DirTree) -> Vec<PathBuf> {
+    tree_entries(tree).into_iter().map(|n: SavedNode| n.path).collect()
+}
+
+#[test]
+fn test_tree_update_honours_the_visitor() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |p: &str| temp.path().join(p);
+    let has = |tree: &DirTree, p: &str| tree.contains(&at(p).to_string_lossy());
+    for d in ["site/content/uploads/2024/01", "site/content/plugins/x/lib/deep", "site/sub", "other/uploads/a"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    for f in ["site/MARK", "site/content/plugins/x/x.php", "site/content/plugins/x/readme.txt"] {
+        write(at(f), b"<?php").unwrap();
+    }
+    let (tx, rx) = crossbeam::channel::unbounded::<WalkEvent>();
+    let tree: DirTree = site_tree(dir, tx);
+    assert!(has(&tree, "site/content/plugins/x/x.php"));
+    for absent in ["site/content/uploads", "site/content/plugins/x/lib", "site/content/plugins/x/readme.txt"] {
+        assert!(!has(&tree, absent), "{absent} kept by the walk");
+    }
+    assert!(has(&tree, "other/uploads/a"), "outside a site nothing is pruned");
+    assert_eq!(rx.try_iter().count(), 1);
+    let walked: Vec<PathBuf> = tree_paths(&tree);
+
+    // a diff of the unchanged tree changes nothing: what the walk pruned stays out
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert!(!stats.changed(), "{stats}");
+    assert_eq!(tree_paths(&tree), walked);
+    // the site was listed again, so the visitor saw it again
+    assert_eq!(rx.try_iter().map(|e: WalkEvent| e.path).collect::<Vec<_>>(), [at("site")]);
+
+    // a new plugin, a new and a replaced plugin file, and what a site prunes
+    for d in ["site/content/plugins/y/inc", "site/sub/uploads/q", "other/uploads/b"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    for f in ["site/content/plugins/y/y.php", "site/content/plugins/y/inc/z.php", "site/content/plugins/x/x2.php", "other/new.php"] {
+        write(at(f), b"<?php").unwrap();
+    }
+    write(at("site/content/plugins/x/tmp"), b"<?php new").unwrap();
+    rename(at("site/content/plugins/x/tmp"), at("site/content/plugins/x/x.php")).unwrap();
+
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    for stored in ["site/content/plugins/y/y.php", "site/content/plugins/x/x2.php", "site/content/plugins/x/x.php", "other/uploads/b"] {
+        assert!(has(&tree, stored), "{stored} missing");
+    }
+    for absent in ["site/content/plugins/y/inc", "site/sub/uploads", "site/content/plugins/x/tmp", "other/new.php"] {
+        assert!(!has(&tree, absent), "{absent} kept by the diff");
+    }
+    // y and other/uploads/b directly (y.php came with y's walk), x2.php and the new x.php
+    assert_eq!((stats.added_dirs, stats.added_files), (2, 2), "{stats}");
+    assert_eq!((stats.replaced, stats.removed_files, stats.errors), (1, 1, 0), "{stats}");
+    tree_validate_counts(&tree);
+
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert!(!stats.changed(), "{stats}");
+}
+
+#[test]
+fn test_tree_update_rewalks_a_changed_scope() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |p: &str| temp.path().join(p);
+    let has = |tree: &DirTree, p: &str| tree.contains(&at(p).to_string_lossy());
+    for d in ["a/content/uploads/1", "a/content/plugins/p/deep"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    write(at("a/content/plugins/p/p.php"), b"<?php").unwrap();
+    let (tx, _rx) = crossbeam::channel::unbounded::<WalkEvent>();
+    let tree: DirTree = site_tree(dir, tx);
+    let tagged = |tree: &DirTree| tree.tagged(SITE).map(|d: Arc<Directory>| d.path(tree.strings())).collect::<Vec<_>>();
+    assert!(has(&tree, "a/content/uploads/1") && has(&tree, "a/content/plugins/p/deep"));
+
+    // a becomes a site: everything below it was walked under no scope, and is walked again
+    write(at("a/MARK"), b"").unwrap();
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert_eq!(tagged(&tree), [at("a")], "{stats}");
+    assert!(!has(&tree, "a/content/uploads") && !has(&tree, "a/content/plugins/p/deep"), "{stats}");
+    assert!(has(&tree, "a/content/plugins/p/p.php"), "{stats}");
+    tree_validate_counts(&tree);
+
+    // and back, from a diff that does not recurse: the subtree is walked again all the same
+    remove_file(at("a/MARK")).unwrap();
+    let stats: UpdateStats = tree.update(&at("a").to_string_lossy(), Some(false)).unwrap();
+    assert!(tagged(&tree).is_empty(), "{stats}");
+    assert!(has(&tree, "a/content/uploads/1") && has(&tree, "a/content/plugins/p/deep"), "{stats}");
+    assert!(has(&tree, "a/content/plugins/p/p.php"), "{stats}");
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_update_keeps_declined_and_capped_directories() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |p: &str| temp.path().join(p);
+    let has = |tree: &DirTree, p: &str| tree.contains(&at(p).to_string_lossy());
+    for d in ["mail/cur", "mail/new", "mail/tmp", "deep/1/2/3"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    // a claimed maildir, and nothing listed three levels down
+    let maildir = Marker::dir_named("cur").and_dir("new").and_dir("tmp").tag(9).descend(false);
+    let visitor = CompositeVisitor::new()
+        .add(MarkerVisitor::new().marker(maildir))
+        .add(MaxDepthVisitor::new(3));
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_visitor(Arc::new(visitor));
+    tree.walk().unwrap();
+    assert!(has(&tree, "mail") && !has(&tree, "mail/new"));
+    assert!(has(&tree, "deep/1/2") && !has(&tree, "deep/1/2/3"));
+
+    for f in ["mail/x.txt", "mail/new/msg", "deep/1/2/f.bin"] {
+        write(at(f), b"").unwrap();
+    }
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert!(!stats.changed(), "{stats}");
+    for absent in ["mail/x.txt", "mail/new", "deep/1/2/f.bin", "deep/1/2/3"] {
+        assert!(!has(&tree, absent), "{absent} kept by the diff");
+    }
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_walk_stamps() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(2).level(2, 2).level(2, 1).create(temp.path()).unwrap();
+    // only a ctime clearly older than the listing makes a baseline (see test_tree_update_mtime_precheck)
+    std::thread::sleep(Duration::from_millis(3500));
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    let listed: u32 = tree.dirs().filter(|d: &Arc<Directory>| d.inode() != 0).count() as u32;
+
+    // the walk stamped every directory it listed: the diff skips them all
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert_eq!((stats.scanned_dirs, stats.skipped_dirs), (0, listed), "{stats}");
+
+    // and a snapshot saved straight after the walk starts warm
+    let mut buf: Vec<u8> = Vec::new();
+    tree.save(&mut buf).unwrap();
+    let loaded: DirTree = DirTree::new(FileMode::NODE, Filters::default()).from_path(dir);
+    loaded.load(buf.as_slice()).unwrap();
+    let stats: UpdateStats = loaded.update(dir, Some(true)).unwrap();
+    assert_eq!((stats.scanned_dirs, stats.skipped_dirs), (0, listed), "{stats}");
+
+    /*
+    A walk over a directory the tree already holds adds what it lists but
+    removes nothing, so it must not vouch for the listing: the stamp stays,
+    and the diff still finds the file gone.
+    */
+    let root: Arc<Directory> = tree.get_dir(dir).unwrap();
+    let before: u64 = root.scan_stamp();
+    assert_ne!(before, 0);
+    remove_file(temp.path().join("file-0.bin")).unwrap();
+    std::thread::sleep(Duration::from_millis(3500));
+    tree.populate_par(temp.path(), Some(false));
+    assert_eq!(root.scan_stamp(), before);
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert_eq!((stats.scanned_dirs, stats.removed_files), (1, 1), "{stats}");
+    assert!(!tree.contains(&format!("{dir}/file-0.bin")));
+    tree_validate_counts(&tree);
+}
+
 #[test]
 fn test_tree_watcher_renames() {
     let temp: TempDir = TempDir::new().unwrap();
@@ -1144,6 +1369,8 @@ fn test_node_sizes() {
     assert_eq!(size_of::<FileEntry>(), 16, "FileEntry");
     assert_eq!(size_of::<Child>(), 16, "Child (FileKind's spare values tag the Dir variant)");
     assert_eq!(size_of::<(u32, Child)>(), 24, "children map slot");
+    // the walk-root mark and the children's scope sit in padding
+    assert_eq!(size_of::<Directory>(), 80, "Directory");
 }
 
 #[test]

@@ -10,6 +10,11 @@ with three changes made while building it:
 - A tree with no root path writes an empty one, with `root_dev` and
   `root_ino` 0, and its load skips the root check.
 
+Format version 2 (0.5.2) adds each directory's scope, the one its
+entries were walked under, so that `update()` can consult the visitor in
+the context the walk gave it. A version 1 file is rejected: a diff of its
+tree could not.
+
 ## Purpose
 
 A snapshot saves a `DirTree` to a file so that a later process can
@@ -37,9 +42,11 @@ Stored:
 - **Per directory:**
   - name;
   - inode;
-  - scan stamp (the directory's own ctime as of its last settled full
-    diff, 0 = none; see `MTIME_SLACK_SECS`);
+  - scan stamp (the directory's own ctime as of its last settled
+    listing, by a walk or a full diff, 0 = none; see `MTIME_SLACK_SECS`);
   - visitor tag;
+  - the scope its entries were walked under (`SCOPE_NONE` without a
+    visitor);
   - whether it is a walk root.
 - **Per file entry:** name, inode, `FileKind` and symlink target index.
 - **The counts and the depth.** These are checked against what was
@@ -54,16 +61,19 @@ Not stored:
 - **The filters and the visitor.** The caller configures these again on
   the new tree. The filters cannot be compared reliably (regexes), so
   they are the caller's responsibility.
-  - A visitor's tags come back as saved, with the same limits as
-    stored tags anyway: they are refreshed by walks only (see
-    "Stored tags" in `implementation.md`).
+  - A visitor's tags and scopes come back as saved, and the `update()`
+    after loading refreshes them for the directories it lists (see
+    "Stored tags" in `implementation.md`). The visitor configured on the
+    new tree should be the one the saved tree was walked with: the diff
+    judges the saved entries by it.
 
-A tree that has only been walked has no stamps yet; only `update()`
-sets them. Saving such a tree is valid, but the first `update()` after
-loading it diffs every directory in full. For a fast warm start, save
-after an `update()`.
+The walk stamps each directory it lists, once its ctime is settled, so a
+snapshot saved straight after a walk is a warm start: the first
+`update()` after loading it lists only what changed since. A directory
+that changed within `MTIME_SLACK_SECS` of its listing has no stamp, and
+that diff lists it in full.
 
-## Format (version 1)
+## Format (version 2)
 
 The file is a stream, written and read through buffered I/O and never
 memory-mapped. All integers are little-endian with no padding. Strings
@@ -74,7 +84,7 @@ and paths are a `u32` length plus that many bytes.
 | Field         | Type     | Notes                                           |
 |---------------|----------|-------------------------------------------------|
 | magic         | `[u8;8]` | `b"DIRTREE\0"`                                  |
-| version       | `u16`    | `1`; a reader rejects any version it does not know |
+| version       | `u16`    | `2`; a reader rejects any version it does not know |
 | flags         | `u16`    | reserved, `0`                                   |
 | filemode      | `u8`     | `FileMode` bits                                 |
 | string_base   | `u32`    | first user string index (stringstore's `LATIN1_NUM`, 256) |
@@ -114,7 +124,7 @@ files and subdirectories after it. The counts in each record give the
 structure, so no parent links are stored. A reader rebuilds them with
 a stack of `(Arc<Directory>, subdirectories left)`.
 
-Directory record (31 bytes):
+Directory record (33 bytes):
 
 | Field   | Type  | Notes                                  |
 |---------|-------|----------------------------------------|
@@ -122,6 +132,7 @@ Directory record (31 bytes):
 | inode   | `u64` |                                        |
 | stamp   | `u64` | scan stamp, `0` = no baseline          |
 | tag     | `u16` | `SCOPE_NONE` (0) = untagged            |
+| scope   | `u16` | the scope its entries were walked under |
 | flags   | `u8`  | bit 0: a walk root                     |
 | n_files | `u32` | file records that follow directly      |
 | n_dirs  | `u32` | subdirectory records after those       |

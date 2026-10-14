@@ -95,9 +95,17 @@ pub struct Directory {
     /**
     The tag of the last [`Verdict::Tag`](super::Verdict::Tag) a visitor
     gave this directory; [`SCOPE_NONE`] if none did (or no visitor is
-    set). Refreshed each time the walker visits the directory.
+    set). Refreshed each time the walker visits the directory, and each
+    time a diff-rescan lists it.
     */
     tag: AtomicU16,
+    /**
+    The scope this directory's entries were walked under: the one its
+    visitor verdict set, else the one it was entered with. A diff-rescan
+    hands it to the visitor as its children's scope, as the walk did.
+    Sits in what was padding.
+    */
+    children_scope: AtomicU16,
     /**
     Whether a caller named this directory as a walk root (or as the
     tree's root path): it may be opened by its path, symlinks included,
@@ -127,6 +135,7 @@ impl Directory {
             stamp: AtomicU64::new(0),
             name: AtomicU32::new(name_idx),
             tag: AtomicU16::new(SCOPE_NONE),
+            children_scope: AtomicU16::new(SCOPE_NONE),
             walk_root: AtomicBool::new(false),
             fd: DirFd::default(),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
@@ -204,6 +213,18 @@ impl Directory {
     #[inline]
     pub(super) fn set_tag(&self, tag: ScopeTag) {
         self.tag.store(tag, Relaxed);
+    }
+
+    /// The scope this directory's entries were walked under (see the field); [`SCOPE_NONE`] if none.
+    #[inline]
+    pub fn children_scope(&self) -> ScopeTag {
+        self.children_scope.load(Relaxed)
+    }
+
+    /// Record the scope this directory's entries are walked under.
+    #[inline]
+    pub(super) fn set_children_scope(&self, scope: ScopeTag) {
+        self.children_scope.store(scope, Relaxed);
     }
 
     /// Whether a caller named this directory as a walk root (see the field).

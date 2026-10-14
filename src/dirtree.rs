@@ -3,10 +3,11 @@
 use super::conf::{NodeCounts, TreeConf};
 use super::error::{TreeError, TreeResult};
 use super::event::{FaultKind, TreeEvent, TreeOp, TreeState};
-use super::node::{Child, Directory, FileEntry, FileKind, NodeIter, NodeRef, NodeView};
+use super::node::{Child, Directory, FileEntry, FileKind, NodeIter, NodeRef, NodeView, ctime_stamp};
 use super::observer::TreeObserver;
 use super::osname::{decode_os, decode_path, encode_os};
 use super::traverse::{traverse_from, traverse_from_par, walk_nodes};
+use super::update::settled_stamp;
 use super::visitor::*;
 use super::worker::tree_worker;
 use super::{FileMode, Filters};
@@ -107,20 +108,21 @@ struct Walk<'w> {
 /**
 Lightweight state that flows down the parallel walk: the active
 scope, the current dir's interned name, and its parent's. Pure `Copy`
-so spawning into rayon costs nothing extra.
+so spawning into rayon costs nothing extra. The diff-rescan carries
+the same state down, rebuilt from the tree ([DirTree::state_of]).
 */
 #[derive(Clone, Copy, Default)]
-struct WalkState {
-    scope: ScopeTag,
-    name_idx: u32,
-    parent_name_idx: Option<u32>,
+pub(super) struct WalkState {
+    pub(super) scope: ScopeTag,
+    pub(super) name_idx: u32,
+    pub(super) parent_name_idx: Option<u32>,
     /**
     The device (`st_dev`) of the filesystem the walk is on, when it stays
     on one: the parent's on entry to a directory, which a directory on
     another one does not match, and then the directory's own. 0 when
     unknown (a walk root), or when the walk crosses filesystems.
     */
-    dev: u64,
+    pub(super) dev: u64,
 }
 
 /**
@@ -849,20 +851,52 @@ impl DirTree {
         if matches!(at, DirAt::Path) {
             node.set_walk_root();
         }
-        let walk: Walk = self.new_walk(path, recursive, hooks);
+        let walk: Walk = self.new_walk(path, 0, recursive, hooks);
         let state: WalkState = self.initial_walk_state(path, dev);
         // a symlinked walk root is followed, see DirAt
         let handle: Result<DirHandle, Error> = at.open(path);
         rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, 0, 0));
     }
 
-    /// The [Walk] of a walk from `path`: its hooks, recursion and root depth, resolved once.
-    fn new_walk<'w>(&'w self, path: &Path, recursive: Option<bool>, hooks: &'w WalkHooks) -> Walk<'w> {
-        // number of path components below the filesystem root
+    /**
+    Walk the directory `node` (at `path`, opened from `at`), recursively,
+    as the walk of its parent would have: `state` is what the parent hands
+    down to it and `depth` its distance from its walk root. The diff-rescan
+    walks a subtree that appeared under a directory this way, so the
+    visitor sees it in the context a full walk gives it.
+    */
+    pub(super) fn populate_par_below(
+        &self,
+        path: &Path,
+        at: &DirAt,
+        node: Arc<Directory>,
+        state: WalkState,
+        depth: usize,
+    ) {
+        let path: &PathBuf = &path.to_path_buf();
+        let hooks: WalkHooks = WalkHooks::default();
+        let walk: Walk = self.new_walk(path, depth, Some(true), &hooks);
+        let handle: Result<DirHandle, Error> = at.open(path);
+        rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, depth, 0));
+    }
+
+    /**
+    The [Walk] of a walk from `path`, `depth` levels below its walk root
+    (0 for a walk root itself): its hooks, recursion and root depth,
+    resolved once.
+    */
+    fn new_walk<'w>(
+        &'w self,
+        path: &Path,
+        depth: usize,
+        recursive: Option<bool>,
+        hooks: &'w WalkHooks,
+    ) -> Walk<'w> {
+        // number of path components below the filesystem root, at the walk root
         let base_depth: u8 = path
             .components()
             .count()
-            .saturating_sub(1)
+            .saturating_sub(1 + depth)
             .min(u8::MAX as usize) as u8;
         Walk {
             visitor: hooks.visitor.clone().or_else(|| self.conf.visitor()),
@@ -890,6 +924,75 @@ impl DirTree {
             parent_name_idx: None,
             dev,
         }
+    }
+
+    /**
+    The [WalkState] a walk reaches the directory `dir` with, and its
+    distance from its walk root, rebuilt from the tree: the scope its
+    parent's entries were walked under, its name and its parent's. A
+    walk root starts afresh, as a walk from it does. The device is not
+    known (0).
+    */
+    pub(super) fn state_of(&self, dir: &Directory) -> (WalkState, usize) {
+        let name_idx: u32 = dir.name_idx();
+        let fresh: WalkState = WalkState { name_idx, ..WalkState::default() };
+        if dir.is_walk_root() {
+            return (fresh, 0);
+        }
+        let Some(parent) = dir.parent() else {
+            return (fresh, 0);
+        };
+        // up to the walk root, or to the topmost directory a walk listed (inode 0 above it)
+        let mut depth: usize = 1;
+        let mut up: Arc<Directory> = parent.clone();
+        while !up.is_walk_root() {
+            match up.parent() {
+                Some(next) if next.inode() != 0 => {
+                    up = next;
+                    depth += 1;
+                }
+                _ => break,
+            }
+        }
+        let state: WalkState = WalkState {
+            scope: parent.children_scope(),
+            name_idx,
+            parent_name_idx: Some(parent.name_idx()),
+            dev: 0,
+        };
+        (state, depth)
+    }
+
+    /**
+    Apply the visitor's `verdict` for the directory `node` (at `path`,
+    reached with `state`, `depth` below its walk root): store its tag and
+    the scope its entries are walked under, and emit a tag's event.
+    Returns that scope, and whether the entries are walked at all. The
+    walk and the diff-rescan both apply verdicts here, so they agree.
+    */
+    pub(super) fn apply_verdict(
+        &self,
+        node: &Directory,
+        verdict: Verdict,
+        path: &Path,
+        state: &WalkState,
+        depth: usize,
+    ) -> (ScopeTag, bool) {
+        // a rescan refreshes the tag: a marker may have come or gone
+        node.set_tag(match verdict {
+            Verdict::Tag { tag, .. } => tag,
+            _ => SCOPE_NONE,
+        });
+        let (scope, descend): (ScopeTag, bool) = match verdict {
+            Verdict::Continue => (state.scope, true),
+            Verdict::SkipChildren => (state.scope, false),
+            Verdict::Tag { tag, new_scope, descend } => {
+                self.emit_walk_event(path, tag, state.scope, depth, !descend);
+                (new_scope, descend)
+            }
+        };
+        node.set_children_scope(scope);
+        (scope, descend)
     }
 
     /// Emit a [`WalkEvent`] on the discovery channel, if one is configured.
@@ -973,8 +1076,19 @@ impl DirTree {
         };
         trace!(target: "iter_dir", "{:?} ::: {handle:?}", path.display());
         let mut state: WalkState = state;
+        /*
+        The directory's own stat, taken before it is listed: its device
+        when the walk stays on one filesystem, and the change stamp a
+        diff-rescan skips it on while its ctime stays the same (see
+        `update.rs`). Only a node the walk fills from empty is stamped: a
+        walk adds entries but removes none, so a node that held entries
+        before may hold some that are gone, and only a diff may vouch for it.
+        */
+        let pass_time: u64 = *SecondsSinceEpoch::new();
+        let st: Option<libc::stat> = handle.stat().ok();
+        let fresh: bool = node.children().read().is_empty();
         if walk.one_fs
-            && let Ok(st) = handle.stat()
+            && let Some(st) = st
         {
             if state.dev != 0 && st.st_dev != state.dev {
                 debug!(target: "MOUNT_SKIP", "{}", path.display());
@@ -1016,15 +1130,19 @@ impl DirTree {
         self.conf.before_listing(&node, dirfd);
         let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
-        if let Some(e) = iter.error() {
-            self.add_error_to(
-                walk.observer,
-                TreeEvent::error(FaultKind::ReadDir, &format!("readdir failed, listing incomplete: {e}"))
-                    .path(&encode_os(path))
-                    .errno(e as i32)
-                    .op(&walk.op(path)),
-            );
-        }
+        let listed: bool = match iter.error() {
+            Some(e) => {
+                self.add_error_to(
+                    walk.observer,
+                    TreeEvent::error(FaultKind::ReadDir, &format!("readdir failed, listing incomplete: {e}"))
+                        .path(&encode_os(path))
+                        .errno(e as i32)
+                        .op(&walk.op(path)),
+                );
+                false
+            }
+            None => true,
+        };
         drop(iter);
         let mut scope_for_children: ScopeTag = state.scope;
         let mut skip_children: bool = false;
@@ -1033,24 +1151,9 @@ impl DirTree {
                 walk: &state.context(path, dirfd, depth, &self.strings),
                 entries: &entries,
             });
-            // a rescan refreshes the tag: a marker may have come or gone
-            node.set_tag(match verdict {
-                Verdict::Tag { tag, .. } => tag,
-                _ => SCOPE_NONE,
-            });
-            match verdict {
-                Verdict::Continue => {}
-                Verdict::SkipChildren => {
-                    skip_children = true;
-                }
-                Verdict::Tag { tag, new_scope, descend } => {
-                    self.emit_walk_event(path, tag, state.scope, depth, !descend);
-                    scope_for_children = new_scope;
-                    if !descend {
-                        skip_children = true;
-                    }
-                }
-            }
+            let descend: bool;
+            (scope_for_children, descend) = self.apply_verdict(&node, verdict, path, &state, depth);
+            skip_children = !descend;
         }
         if !skip_children {
             /*
@@ -1094,6 +1197,13 @@ impl DirTree {
                 || dirs.par_iter().for_each(each_dir),
                 || files.par_chunks(ENTRY_BATCH_MIN).for_each(each_files),
             );
+        }
+        // every entry of the listing is in (subdirectories as nodes, if not walked yet)
+        if fresh
+            && listed
+            && let Some(st) = st
+        {
+            node.set_scan_stamp(settled_stamp(ctime_stamp(st.st_ctime, st.st_ctime_nsec), pass_time));
         }
 
         // shall we keep the directory handle (file descriptor) open?
@@ -2174,7 +2284,7 @@ impl Walk<'_> {
 impl WalkState {
     /// The [WalkContext] of the directory at `path` (open as `dirfd`) that this state belongs to.
     #[inline]
-    fn context<'a>(
+    pub(super) fn context<'a>(
         &self,
         path: &'a Path,
         dirfd: BorrowedFd<'a>,
@@ -2238,14 +2348,15 @@ fn open_dir_nofollow(path: &Path) -> Result<DirHandle, Error> {
 /**
 Carry the per-directory state that a [DirTree::graft_subtree] copy would
 otherwise lose from the old directory node to its new one: the scan
-stamp (so the diff pre-check still skips it), the visitor's tag, and the
-pooled handle's fd
+stamp (so the diff pre-check still skips it), the visitor's tag and the
+scope its entries were walked under, and the pooled handle's fd
 (the handle stays pooled; only the old node, being dropped, stops
 pointing at it).
 */
 fn carry_dir_state(from: &Directory, to: &Directory) {
     to.set_scan_stamp(from.scan_stamp());
     to.set_tag(from.tag().unwrap_or(SCOPE_NONE));
+    to.set_children_scope(from.children_scope());
     if from.fd().is_open() {
         to.fd_set(from.fd().fd()).ok();
     }

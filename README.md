@@ -42,7 +42,8 @@ code. Each tag marks the tree code as it stood in that statter release.
 - **Resident mode:** directory handles can be kept open to pin the
   dentries. The inotify `TreeWatcher` follows changes, and `update()`
   diff-rescans a subtree, skipping unchanged directories on one `stat`
-  each.
+  each and consulting the visitor as the walk does, so the tree it leaves
+  is the one a walk would build.
 - **Visitor protocol:** markers, including nested paths such as
   `wp-includes/version.php`, tag and claim subtrees. Prunes (by name,
   or by path-component globs such as `wp-content/uploads`) and depth
@@ -67,7 +68,8 @@ code. Each tag marks the tree code as it stood in that statter release.
   path and errno, go to a `TreeObserver`, so a consumer can account for
   coverage.
 - **Snapshots:** `save_to()` / `load_from()` (or in the background), then
-  `update()` of the root lists only the directories changed since the save.
+  `update()` of the root lists only the directories changed since the save,
+  also when the snapshot was saved straight after a walk.
 - **Optional memory accounting** via the `size_of` cargo feature.
 
 ## Usage

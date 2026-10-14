@@ -33,7 +33,7 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"DIRTREE\0";
 const END: &[u8; 8] = b"DTREEEND";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 /// The first user string index: stringstore's built-in Latin-1 entries come before it.
 const STRING_BASE: u32 = 256;
 /// Directory record flag: a walk root named by the caller (see [Directory::is_walk_root]).
@@ -166,6 +166,7 @@ impl DirTree {
                 out.u64(dir.inode())?;
                 out.u64(dir.scan_stamp())?;
                 out.u16(dir.tag().unwrap_or(SCOPE_NONE))?;
+                out.u16(dir.children_scope())?;
                 out.u8(if dir.is_walk_root() { DIR_WALK_ROOT } else { 0 })?;
                 out.u32(files.len() as u32)?;
                 out.u32(subdirs.len() as u32)?;
@@ -317,6 +318,7 @@ struct DirRecord {
     inode: u64,
     stamp: u64,
     tag: u16,
+    scope: u16,
     flags: u8,
     n_files: u32,
     n_dirs: u32,
@@ -512,6 +514,7 @@ fn read_dir_record<R: Read>(inp: &mut SnapReader<R>) -> TreeResult<DirRecord> {
         inode: inp.u64()?,
         stamp: inp.u64()?,
         tag: inp.u16()?,
+        scope: inp.u16()?,
         flags: inp.u8()?,
         n_files: inp.u32()?,
         n_dirs: inp.u32()?,
@@ -522,6 +525,7 @@ fn read_dir_record<R: Read>(inp: &mut SnapReader<R>) -> TreeResult<DirRecord> {
 fn apply_dir_record(dir: &Directory, rec: &DirRecord) {
     dir.set_scan_stamp(rec.stamp);
     dir.set_tag(rec.tag);
+    dir.set_children_scope(rec.scope);
     if rec.flags & DIR_WALK_ROOT != 0 {
         dir.set_walk_root();
     }
