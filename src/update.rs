@@ -48,6 +48,7 @@ use super::utils::proc_fd_path;
 use super::visitor::{DirContext, FileContext, FileVerdict, ScopeTag, Visitor, WalkContext};
 
 use dirhandle::{DirHandle, EntryExt, nix::{fcntl::readlink, sys::stat::fstat}};
+use rayon::prelude::*;
 use timesince::SecondsSinceEpoch;
 use tracing::{debug, instrument, trace};
 
@@ -292,7 +293,8 @@ impl DirTree {
     }
 
     /**
-    Diff one directory, opened from `at` (see [DirAt]), and recurse.
+    Diff one directory, opened from `at` (see [DirAt]), and recurse: its
+    subdirectories are diffed in parallel, as the walk's are, and
     `frames` bounds direct recursion before offloading to the rayon
     scope, like the parallel walker. `state` is what a walk reaches the
     directory with (its device: the parent's when the tree stays on one
@@ -367,6 +369,18 @@ impl DirTree {
                 rs.spawn(move |s| self.update_inner(diff, &child_p, child, at, next, depth + 1, s, 0));
             }
         };
+        /*
+        The subdirectories to diff next, fanned out over the pool as the
+        walk fans out its own: one after another, a whole tree's diff
+        would run on one thread, as spawning starts only past
+        MAX_RECURSE_DEPTH frames.
+        */
+        let diff_subdirs = |subdirs: Vec<(u32, Arc<Directory>)>| {
+            subdirs.par_iter().for_each(|(name_idx, child)| {
+                let name: Cow<OsStr> = decode_os(self.get_string(*name_idx));
+                recurse(path.join(&name), child.clone(), &name);
+            });
+        };
 
         /*
         Fast path: a directory's ctime moves whenever its entry list
@@ -393,10 +407,7 @@ impl DirTree {
                     .iter()
                     .filter_map(|(k, v)| v.as_dir().map(|d: &Arc<Directory>| (*k, d.clone())))
                     .collect();
-                for (name_idx, child) in subdirs {
-                    let name: Cow<OsStr> = decode_os(self.get_string(name_idx));
-                    recurse(path.join(&name), child, &name);
-                }
+                diff_subdirs(subdirs);
             }
             return;
         }
@@ -536,7 +547,8 @@ impl DirTree {
             (diff.recursive || rewalk).then(|| (child_state(name_idx), depth + 1))
         };
 
-        // pass 2: add what is new, replace what changed, recurse into the rest
+        // pass 2: add what is new, replace what changed, and note the rest to recurse into
+        let mut unchanged: Vec<(u32, Arc<Directory>)> = Vec::new();
         for (name_idx, entry) in disk {
             let is_dir: bool = entry.is_dir();
             let disk_ino: u64 = entry.ino();
@@ -612,12 +624,16 @@ impl DirTree {
                     } else if let Child::Dir(child) = existing
                         && diff.recursive
                     {
-                        // unchanged directory: recurse the diff into it
-                        recurse(path.join(name_os), child.clone(), name_os);
+                        unchanged.push((name_idx, child.clone()));
                     }
                 }
             }
         }
+
+        // the listing is done with: its fd is not held while the subtrees below are diffed
+        drop(entries);
+        drop(handle);
+        diff_subdirs(unchanged);
 
         /*
         A completed full diff establishes a fresh pre-check baseline -

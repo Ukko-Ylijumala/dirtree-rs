@@ -239,6 +239,21 @@ trusted on the way):
   dirhandle) turned out not to be needed: nix's `unlinkat`, re-exported
   through dirhandle, takes the `O_PATH` fds the tree hands out.
 
+### 0.5.4
+
+Found while the WordPress scanner measured its incremental mode on
+`/usr` (37,858 directories, warm cache): `update()` went through each
+directory's subdirectories one after another and spawned tasks only past
+`MAX_RECURSE_DEPTH` frames, so a whole tree's diff ran on one thread. An
+update that skipped every directory took as long as the walk.
+
+- **`update()` fans out like the walk:** the subdirectories to diff
+  next, below a directory the pre-check skips and below one that is
+  diffed, go to the pool with `par_iter`. A diff no longer holds a
+  directory's listing handle while the subtrees below it are diffed.
+  On `/usr`, an update skipping everything went from 145 ms to 27 ms,
+  and a full diff from 1,206 ms to 69 ms.
+
 Still open: a fanotify change source (the daemon's), measuring the
 memory of a real host's tree (Scale, below), and the watcher's event
 handling, which still does not consult the visitor.

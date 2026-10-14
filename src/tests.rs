@@ -13,7 +13,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     ffi::{CStr, CString, OsStr},
     mem::size_of,
-    fs::{remove_file, rename, write},
+    fs::{create_dir_all, remove_file, rename, write},
     hash::{Hash, Hasher},
     io::ErrorKind,
     os::fd::{AsFd, AsRawFd, OwnedFd},
@@ -1284,6 +1284,77 @@ fn test_tree_walk_stamps() {
     let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
     assert_eq!((stats.scanned_dirs, stats.removed_files), (1, 1), "{stats}");
     assert!(!tree.contains(&format!("{dir}/file-0.bin")));
+    tree_validate_counts(&tree);
+}
+
+/// A visitor noting the pool thread each directory is listed on, and listing a little slowly.
+#[derive(Debug, Default)]
+struct ThreadVisitor {
+    threads: Mutex<HashSet<Option<usize>>>,
+    visits: AtomicU32,
+}
+
+impl ThreadVisitor {
+    /// The threads seen and the directories listed since the last call.
+    fn take(&self) -> (usize, u32) {
+        (std::mem::take(&mut *self.threads.lock()).len(), self.visits.swap(0, Relaxed))
+    }
+}
+
+impl Visitor for ThreadVisitor {
+    fn visit_dir(&self, _ctx: DirContext<'_>) -> Verdict {
+        self.threads.lock().insert(rayon::current_thread_index());
+        self.visits.fetch_add(1, Relaxed);
+        // long enough for idle workers to take the subtrees still queued
+        thread::sleep(Duration::from_millis(5));
+        Verdict::Continue
+    }
+}
+
+#[test]
+fn test_tree_update_fans_out() {
+    /*
+    Sixteen subtrees with only their leaves changed: a diff going through
+    the subdirectories one after another lists every leaf on one thread,
+    as it spawns only past MAX_RECURSE_DEPTH frames. Fanned out, the
+    pool shares them, first below a directory the pre-check skips, then
+    below one that is diffed itself.
+    */
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    for n in 0..16 {
+        create_dir_all(temp.path().join(format!("d{n}/x"))).unwrap();
+    }
+    // only a ctime clearly older than the listing makes a baseline (see test_tree_update_mtime_precheck)
+    std::thread::sleep(Duration::from_millis(3500));
+    let visitor: Arc<ThreadVisitor> = Arc::new(ThreadVisitor::default());
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_visitor(visitor.clone());
+    tree.walk().unwrap();
+    visitor.take();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let change_leaves = |name: &str| {
+        for n in 0..16 {
+            write(temp.path().join(format!("d{n}/x/{name}")), b"").unwrap();
+        }
+    };
+
+    change_leaves("a");
+    let stats: UpdateStats = pool.install(|| tree.update(dir, Some(true))).unwrap();
+    assert_eq!((stats.scanned_dirs, stats.skipped_dirs), (16, 17), "{stats}");
+    let (threads, visits) = visitor.take();
+    assert_eq!(visits, 16);
+    assert!(threads > 1, "16 leaves below a skipped root listed on {threads} thread(s)");
+
+    change_leaves("b");
+    write(temp.path().join("top"), b"").unwrap();
+    let stats: UpdateStats = pool.install(|| tree.update(dir, Some(true))).unwrap();
+    assert_eq!((stats.scanned_dirs, stats.skipped_dirs), (17, 16), "{stats}");
+    let (threads, visits) = visitor.take();
+    assert_eq!(visits, 17);
+    assert!(threads > 1, "16 leaves below a diffed root listed on {threads} thread(s)");
     tree_validate_counts(&tree);
 }
 
