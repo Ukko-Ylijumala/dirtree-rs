@@ -1340,7 +1340,7 @@ impl DirTree {
         if let Some(ref v) = walk.visitor {
             let idx: u32 = self.strings.insert(encode_os(name_os).as_ref());
             child_idx = Some(idx);
-            let ctx: WalkContext = parent_state.context(parent_path, parent_fd, depth, &self.strings);
+            let ctx: WalkContext = parent_state.entries_context(parent_path, parent_fd, depth, &self.strings, parent_node);
             if v.prune_child(&ctx, idx, true) {
                 return;
             }
@@ -1489,7 +1489,7 @@ impl DirTree {
             false => Vec::new(),
         };
 
-        let ctx: WalkContext = parent_state.context(parent_path, dirfd, depth, &self.strings);
+        let ctx: WalkContext = parent_state.entries_context(parent_path, dirfd, depth, &self.strings, parent_node);
         let mut children: Vec<(u32, Child)> = Vec::with_capacity(if store { kept.len() } else { 0 });
         // specials go in apart from the files, to be counted apart
         let mut specials: Vec<(u32, Child)> = Vec::new();
@@ -2383,8 +2383,30 @@ impl WalkState {
             parent_name_idx: self.parent_name_idx,
             depth,
             scope: self.scope,
+            tag: SCOPE_NONE,
             strings,
             dirfd,
+        }
+    }
+
+    /**
+    The [WalkContext] the entries of that directory, `node`, are decided
+    with once its verdict is applied: under the scope and with the tag the
+    verdict set (see [WalkContext::scope]).
+    */
+    #[inline]
+    pub(super) fn entries_context<'a>(
+        &self,
+        path: &'a Path,
+        dirfd: BorrowedFd<'a>,
+        depth: usize,
+        strings: &'a UniqueStrStore,
+        node: &Directory,
+    ) -> WalkContext<'a> {
+        WalkContext {
+            scope: node.children_scope(),
+            tag: node.tag().unwrap_or(SCOPE_NONE),
+            ..self.context(path, dirfd, depth, strings)
         }
     }
 }

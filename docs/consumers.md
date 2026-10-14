@@ -285,6 +285,24 @@ where the docs said one thing and the code did another:
   did (`docs/implementation.md` had it right). They now say so, and that
   `Verdict::tag()` starts its subtree under no scope.
 
+### 0.5.6
+
+The WordPress scanner's plan item E:
+
+- **A directory's entries are decided under its verdict:**
+  `prune_child` and `visit_file` used to get the scope the directory
+  was reached with, so a rule like "prune `wp-includes` inside a
+  WordPress scope" missed the one directly in a root, which the
+  scanner made up for with a set of recognised roots it looked paths
+  up in. The context for a directory's entries now carries the scope
+  its verdict set, as its subdirectories already walked under and as
+  `children_scope` is documented, and `WalkContext::tag`, the tag the
+  verdict gave the directory, so a visitor can tell a tagged
+  directory's entries from those of the directories below it. The walk
+  and the diff agree, and a diff walks a directory's entries again when
+  its tag changed, as when its scope did. `visit_dir` sees what it saw
+  before, with `tag` always `SCOPE_NONE`.
+
 Still open: a fanotify change source (the daemon's), and measuring the
 memory of a real host's tree (Scale, below).
 

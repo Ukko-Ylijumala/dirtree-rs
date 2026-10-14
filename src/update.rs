@@ -465,21 +465,25 @@ impl DirTree {
         /*
         The visitor sees the fresh listing as the walk would. A verdict
         that declines the entries leaves the directory none. Entries
-        walked under a scope other than the one the verdict sets now
-        were all decided under the wrong one: they are removed and walked
-        again, whatever `recursive` says, as unchanged subdirectories
-        would otherwise keep what the old scope let in.
+        decided under a scope or a tag other than the ones the verdict
+        sets now were all decided under the wrong ones: they are removed
+        and walked again, whatever `recursive` says, as unchanged
+        subdirectories would otherwise keep what the old scope let in.
         */
-        let ctx: WalkContext = state.context(path, dirfd, depth, &self.strings);
         let mut descend: bool = true;
         let mut rewalk: bool = false;
         if let Some(v) = &diff.visitor {
-            let walked_under: ScopeTag = node.children_scope();
-            let verdict = v.visit_dir(DirContext { walk: &ctx, entries: &entries });
+            let walked_under: (ScopeTag, Option<ScopeTag>) = (node.children_scope(), node.tag());
+            let verdict = v.visit_dir(DirContext {
+                walk: &state.context(path, dirfd, depth, &self.strings),
+                entries: &entries,
+            });
             let (scope, walk_entries) = self.apply_verdict(&node, verdict, path, &state, depth);
             descend = walk_entries;
-            rewalk = descend && scope != walked_under;
+            rewalk = descend && (scope, node.tag()) != walked_under;
         }
+        // the entries are decided under the scope and the tag the verdict set, as in the walk
+        let ctx: WalkContext = state.entries_context(path, dirfd, depth, &self.strings, &node);
 
         /*
         Disk view: interned name -> dirent. Filtered entries and those

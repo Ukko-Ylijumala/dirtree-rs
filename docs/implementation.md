@@ -92,7 +92,8 @@ pub struct WalkContext<'a> {
     pub name_idx: u32,
     pub parent_name_idx: Option<u32>,
     pub depth: usize,
-    pub scope: ScopeTag,
+    pub scope: ScopeTag,  // visit_dir: as reached; its entries: as its verdict set
+    pub tag: ScopeTag,    // its entries: the tag its verdict set; visit_dir: SCOPE_NONE
     pub strings: &'a UniqueStrStore,
     pub dirfd: BorrowedFd<'a>,  // the directory, open: for *at() calls
 }
@@ -150,7 +151,10 @@ following extra steps per directory:
       under the (possibly new) scope.
 7. For each child entry, before insertion / recursion, call
    `visitor.prune_child(&ctx, child_name_idx, is_dir)`. If it returns
-   `true`, the child is dropped.
+   `true`, the child is dropped. From here on `ctx` carries the scope
+   and the tag the verdict set: a directory's entries are decided under
+   the scope its subdirectories walk under, and the tag tells the
+   entries of a tagged directory from those below it.
 8. For each non-directory entry that survived, call
    `visitor.visit_file(&FileContext)`, before the entry is counted and
    stored, whatever the file mode:

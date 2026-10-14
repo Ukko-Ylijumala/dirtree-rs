@@ -57,8 +57,10 @@ pub const SCOPE_NONE: ScopeTag = 0;
 /**
 Per-directory information passed to a [`Visitor`].
 
-Constructed once per directory entered. Field access is `O(1)`; all
-pre-interned ids are looked up by the walker in advance.
+Constructed per directory: once for its [`Visitor::visit_dir`], and
+once for the hooks that decide on its entries, which see the scope and
+the tag its verdict set. Field access is `O(1)`; all pre-interned ids
+are looked up by the walker in advance.
 */
 #[derive(Clone, Copy)]
 pub struct WalkContext<'a> {
@@ -70,9 +72,21 @@ pub struct WalkContext<'a> {
     pub parent_name_idx: Option<u32>,
     /// Distance from the walk root (root is at depth `0`).
     pub depth: usize,
-    /// Active scope flowing from a recognized ancestor. [`SCOPE_NONE`] when
-    /// no ancestor has set one.
+    /**
+    The scope in force. In [`Visitor::visit_dir`], the one the directory
+    was reached with ([`SCOPE_NONE`] when no ancestor set one). For the
+    directory's entries ([`Visitor::prune_child`], [`Visitor::visit_file`]),
+    the one its verdict set, which its subdirectories walk under too.
+    */
     pub scope: ScopeTag,
+    /**
+    The tag the directory's verdict gave it, for the hooks that decide on
+    its entries: it tells the entries of a tagged directory from those of
+    the directories below it, which are under the same scope.
+    [`SCOPE_NONE`] when it has none, and always in [`Visitor::visit_dir`],
+    which makes the verdict.
+    */
+    pub tag: ScopeTag,
     /// Reference to the tree's string interner. Visitors that need to
     /// resolve a `u32` back to a `&str` (rare) can use this.
     pub strings: &'a UniqueStrStore,
@@ -302,8 +316,9 @@ pub trait Visitor: Send + Sync + std::fmt::Debug {
     /**
     Called for each child entry before insertion or recursion. Return
     `true` to drop the entry (it will not be recorded in the tree, nor
-    recursed into). The child's name is given as a pre-interned `u32`.
-    Default: keep everything.
+    recursed into). The child's name is given as a pre-interned `u32`,
+    and `parent` is the context of the directory it is in, with the scope
+    and the tag that directory's verdict set. Default: keep everything.
     */
     fn prune_child(
         &self,

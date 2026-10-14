@@ -9,7 +9,7 @@ use ctor::dtor;
 use parking_lot::Mutex;
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     collections::hash_map::DefaultHasher,
     ffi::{CStr, CString, OsStr},
     mem::size_of,
@@ -1209,6 +1209,95 @@ fn test_tree_update_honours_the_visitor() {
 
     let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
     assert!(!stats.changed(), "{stats}");
+}
+
+/// The tag of a [ContextVisitor] site of the other kind, under the [SITE] scope.
+const SITE2: ScopeTag = 5;
+
+/// What a [ContextVisitor] noted: the scope and the tag, by entry (or directory) name.
+type SeenContexts = Mutex<HashMap<String, (ScopeTag, ScopeTag)>>;
+
+/**
+A visitor making a directory holding `MARK` a site ([SITE], scoped) and
+one holding `MARK2` a site of another kind ([SITE2], under the same
+scope), noting the context each directory is visited with and each
+entry is decided with.
+*/
+#[derive(Debug, Default)]
+struct ContextVisitor {
+    dirs: SeenContexts,
+    pruned: SeenContexts,
+    files: SeenContexts,
+}
+
+impl ContextVisitor {
+    fn note(seen: &SeenContexts, ctx: &WalkContext<'_>, name: &str) {
+        seen.lock().insert(name.to_owned(), (ctx.scope, ctx.tag));
+    }
+
+    fn seen(seen: &SeenContexts, name: &str) -> Option<(ScopeTag, ScopeTag)> {
+        seen.lock().get(name).copied()
+    }
+}
+
+impl Visitor for ContextVisitor {
+    fn visit_dir(&self, ctx: DirContext<'_>) -> Verdict {
+        let name = ctx.walk.path.file_name().unwrap().to_string_lossy();
+        Self::note(&self.dirs, ctx.walk, &name);
+        match (ctx.entry(b"MARK"), ctx.entry(b"MARK2")) {
+            (Some(_), _) => Verdict::tag(SITE).enter_scope(SITE),
+            (None, Some(_)) => Verdict::tag(SITE2).enter_scope(SITE),
+            (None, None) => Verdict::Continue,
+        }
+    }
+
+    fn prune_child(&self, parent: &WalkContext<'_>, child: u32, _is_dir: bool) -> bool {
+        Self::note(&self.pruned, parent, parent.strings.get(child).unwrap());
+        false
+    }
+
+    fn visit_file(&self, ctx: &FileContext<'_>) -> FileVerdict {
+        Self::note(&self.files, ctx.walk, ctx.walk.strings.get(ctx.name_idx).unwrap());
+        FileVerdict::Keep
+    }
+}
+
+#[test]
+fn test_tree_entries_are_decided_under_the_verdict() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |p: &str| temp.path().join(p);
+    for d in ["plain/a", "site/b", "site/sub/c"] {
+        create_dir_all(at(d)).unwrap();
+    }
+    for f in ["site/MARK", "site/f.txt"] {
+        write(at(f), b"").unwrap();
+    }
+    let visitor: Arc<ContextVisitor> = Arc::new(ContextVisitor::default());
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_visitor(visitor.clone());
+    tree.walk().unwrap();
+    let (dirs, pruned, files) = (&visitor.dirs, &visitor.pruned, &visitor.files);
+
+    // the site's verdict is made under the scope it was reached with, its entries under the one it set
+    assert_eq!(ContextVisitor::seen(dirs, "site"), Some((SCOPE_NONE, SCOPE_NONE)));
+    assert_eq!(ContextVisitor::seen(pruned, "a"), Some((SCOPE_NONE, SCOPE_NONE)));
+    for name in ["b", "sub", "MARK", "f.txt"] {
+        assert_eq!(ContextVisitor::seen(pruned, name), Some((SITE, SITE)), "{name}");
+    }
+    assert_eq!(ContextVisitor::seen(files, "f.txt"), Some((SITE, SITE)));
+    // below the site: its scope, but not its tag
+    assert_eq!(ContextVisitor::seen(pruned, "c"), Some((SITE, SCOPE_NONE)));
+
+    // the diff decides the same way, and a tag changed under the same scope decides every entry again
+    remove_file(at("site/MARK")).unwrap();
+    write(at("site/MARK2"), b"").unwrap();
+    let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
+    assert_eq!(ContextVisitor::seen(files, "MARK2"), Some((SITE, SITE2)), "{stats}");
+    assert_eq!(ContextVisitor::seen(files, "f.txt"), Some((SITE, SITE2)), "{stats}");
+    tree_validate_counts(&tree);
 }
 
 #[test]
