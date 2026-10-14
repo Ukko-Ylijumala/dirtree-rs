@@ -1289,6 +1289,14 @@ fn test_tree_walk_stamps() {
     // the walk stamped every directory it listed: the diff skips them all
     let stats: UpdateStats = tree.update(dir, Some(true)).unwrap();
     assert_eq!((stats.scanned_dirs, stats.skipped_dirs), (0, listed), "{stats}");
+    // and so does the sync walk
+    let synced: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_sync(true);
+    synced.walk().unwrap();
+    let stats: UpdateStats = synced.update(dir, Some(true)).unwrap();
+    assert_eq!((stats.scanned_dirs, stats.skipped_dirs), (0, listed), "{stats}");
 
     // and a snapshot saved straight after the walk starts warm
     let mut buf: Vec<u8> = Vec::new();

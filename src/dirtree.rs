@@ -33,7 +33,7 @@ use std::{
     collections::VecDeque,
     ffi::{CStr, CString, OsStr},
     fmt::{self, Display, Formatter},
-    fs::{DirEntry, metadata, read_link},
+    fs::{DirEntry, Metadata, metadata, read_link},
     io::{Error, ErrorKind},
     os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
@@ -688,12 +688,23 @@ impl DirTree {
     #[instrument(level = "debug", skip_all, fields(p = self.rel_path(path).to_str()))]
     pub fn populate(&self, path: &Path, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
+        /*
+        Stamped as the parallel walk stamps (see populate_par_inner): from
+        the directory's stat taken before it is listed, and only a node the
+        listing fills from empty, missing no entry to an error.
+        */
+        let pass_time: u64 = *SecondsSinceEpoch::new();
+        let st: Option<Metadata> = metadata(path).ok();
+        let node: Option<Arc<Directory>> = self.get_dir(encode_os(path).as_ref());
+        let fresh: bool = node.as_ref().is_some_and(|n: &Arc<Directory>| n.children().read().is_empty());
+        let mut complete: bool = true;
         match path.read_dir() {
             Ok(entries) => {
                 entries.for_each(|entry: Result<DirEntry, Error>| {
                     let entry: DirEntry = match entry {
                         Ok(entry) => entry,
                         Err(e) => {
+                            complete = false;
                             self.add_error(
                                 TreeEvent::error(FaultKind::ReadDir, &format!("readdir failed: {e}"))
                                     .path(&encode_os(path))
@@ -734,6 +745,7 @@ impl DirTree {
                                         }
                                         // likely deleted between readdir and stat
                                         Err(e) => {
+                                            complete = false;
                                             self.add_error(
                                                 TreeEvent::error(FaultKind::Stat, &e.to_string())
                                                     .path(&encode_os(&path))
@@ -758,6 +770,7 @@ impl DirTree {
                             }
                         }
                         Err(e) => {
+                            complete = false;
                             self.add_error(
                                 TreeEvent::error(FaultKind::Stat, &e.to_string())
                                     .path(&encode_os(&path))
@@ -767,7 +780,13 @@ impl DirTree {
                             debug!("Error with {}: {e}", path.display());
                         }
                     }
-                })
+                });
+                if complete
+                    && fresh
+                    && let (Some(node), Some(st)) = (node, st)
+                {
+                    node.set_scan_stamp(settled_stamp(ctime_stamp(st.ctime(), st.ctime_nsec()), pass_time));
+                }
             }
             Err(e) => {
                 self.add_error(
