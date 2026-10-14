@@ -254,9 +254,39 @@ update that skipped every directory took as long as the walk.
   On `/usr`, an update skipping everything went from 145 ms to 27 ms,
   and a full diff from 1,206 ms to 69 ms.
 
-Still open: a fanotify change source (the daemon's), measuring the
-memory of a real host's tree (Scale, below), and the watcher's event
-handling, which still does not consult the visitor.
+### 0.5.5
+
+Gaps found while the WordPress scanner's incremental mode was built,
+where the docs said one thing and the code did another:
+
+- **A diff walks a new subdirectory as the walk would:** in a tree that
+  walks recursively, a diff that does not recurse (`update(path,
+  Some(false))`, a `TreeChange::Dir`) now walks a subdirectory that
+  appeared, as its docs said, instead of only inserting it. A directory
+  moved in from outside shows only as an entry of its parent, so nothing
+  else would list what it holds. A tree that walks one level still only
+  inserts it.
+- **The watcher consults the visitor:** with a visitor set, an entry
+  created or moved in is left to a non-recursive diff of its directory,
+  once per batch of events read. The visitor decides on it from the
+  listing, in the scope and at the depth the walk gave the directory: a
+  pruned directory stays out, a file it stores goes in whatever the file
+  mode, a new subdirectory is walked in that context, and a marker
+  created changes the directory's own verdict. A directory moved to
+  another parent is walked again by a diff of that parent. The cost is a
+  listing of each directory a batch created entries in, where the
+  watcher inserted each entry on its own; without a visitor it still
+  does.
+- **The sync walk stamps:** `populate` stamps each directory it fills
+  from empty with a complete listing, as the parallel walk does since
+  0.5.2, so a diff after a sync walk skips what did not change.
+- **`SCOPE_NONE` in a `Tag` leaves every scope:** the docs of
+  `Verdict::Tag` said it kept the current one, which the walker never
+  did (`docs/implementation.md` had it right). They now say so, and that
+  `Verdict::tag()` starts its subtree under no scope.
+
+Still open: a fanotify change source (the daemon's), and measuring the
+memory of a real host's tree (Scale, below).
 
 ## Scale
 
