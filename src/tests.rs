@@ -15,6 +15,7 @@ use std::{
     mem::size_of,
     fs::{remove_file, rename, write},
     hash::{Hash, Hasher},
+    io::ErrorKind,
     os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::{ffi::OsStrExt, fs::symlink},
     panic,
@@ -29,6 +30,7 @@ use std::{
 use miniutils::{EntryKind, PlannedEntry, Special, TreeSpec};
 use stringstore::UniqueStrStore;
 use dirhandle::{DirHandle, open_regular_at};
+use dirhandle::nix::{fcntl::{OFlag, open}, sys::stat::{Mode, fstat}};
 use tempfile::TempDir;
 
 const TEST_NUM: [u64; 3] = [9, 11, 7];
@@ -2548,6 +2550,78 @@ fn wait_for<F: Fn() -> bool>(cond: F, msg: &str) {
 /* --------------------------------- */
 
 /// A tree of `dir` in `filemode`, walked recursively (parallel walker).
+/// A walk below an fd the caller holds: the subtree is reached with no
+/// symlink in any component, its node is known by the name the caller
+/// gives, and every later open below it resolves beneath the same fd --
+/// so a symlink swapped in for an ancestor after the walk is refused,
+/// where the same path still opens by name.
+#[test]
+fn test_populate_par_beneath() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let home: PathBuf = temp.path().join("home/acct");
+    let rel: &Path = Path::new("public_html/wp-content/plugins/fake");
+    let plugin: PathBuf = home.join(rel);
+    std::fs::create_dir_all(plugin.join("sub")).unwrap();
+    write(plugin.join("a.php"), "aaa").unwrap();
+    write(plugin.join("sub/b.php"), "bbbb").unwrap();
+    symlink("a.php", plugin.join("link.php")).unwrap();
+    let anchor: OwnedFd = open(&home, OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+    let plugin_s: &str = plugin.to_str().unwrap();
+    let sub_s: String = format!("{plugin_s}/sub");
+
+    // a tree with no root path of its own: the walked directory is what it knows
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default()).with_recursive(true);
+    let node: Arc<Directory> = tree
+        .populate_par_beneath(&plugin, &anchor, rel, Some(true), &WalkHooks::default())
+        .expect("walked beneath the anchor");
+    assert!(tree.contains(plugin_s) && tree.contains(&sub_s));
+    assert_eq!(tree.files().count(), 3, "a.php, sub/b.php and the link");
+    assert!(!node.is_walk_root(), "not opened by its path, so not a walk root");
+    assert!(node.fd().is_open(), "the walked directory stays pooled");
+    assert!(tree.handle(plugin_s).is_some());
+    tree_validate_counts(&tree);
+
+    // opens below it go beneath the pooled directory
+    let sub: Arc<Directory> = tree.get_dir(&sub_s).unwrap();
+    let sub_fd: OwnedFd = tree.path_fd(&sub).expect("O_PATH fd beneath the walked root");
+    assert!(fstat(&sub_fd).is_ok());
+    let (b_dir, b) = match tree.get_node(&format!("{sub_s}/b.php")) {
+        Some(NodeRef::File { parent, name, .. }) => (parent, name),
+        other => panic!("{other:?}"),
+    };
+    let mut opener: FileOpener = FileOpener::new(&tree);
+    assert_eq!(opener.open_regular(&b_dir, b).unwrap().1.st_size, 4);
+    drop(opener);
+
+    // what the resolution refuses: a `..`, an absolute path
+    for bad in ["../fake", "/etc"] {
+        let err = tree
+            .populate_par_beneath(&plugin, &anchor, Path::new(bad), Some(true), &WalkHooks::default())
+            .expect_err(bad);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad}: {err}");
+    }
+
+    // an ancestor swapped for a symlink after the walk: the path still
+    // opens by name, and nothing of the tree's goes through it
+    let plugins: PathBuf = plugin.parent().unwrap().to_path_buf();
+    let moved: PathBuf = plugins.with_file_name("plugins.moved");
+    rename(&plugins, &moved).unwrap();
+    symlink(&moved, &plugins).unwrap();
+    assert!(std::fs::metadata(plugin.join("sub")).is_ok(), "by name the symlink is followed");
+    // the pooled handle still holds the directory itself: its fd is what it was
+    assert!(fstat(tree.path_fd(&node).unwrap()).is_ok());
+    // a fresh walk beneath the anchor is refused at the symlink
+    let err = tree
+        .populate_par_beneath(&plugin, &anchor, rel, Some(true), &WalkHooks::default())
+        .expect_err("a symlink in the way");
+    assert!(matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)), "{err}");
+    // ...and so is a directory below it once the pooled handle is closed
+    tree.handle_close(plugin_s);
+    assert!(!node.fd().is_open());
+    let err = tree.path_fd(&sub).expect_err("without the pooled handle, nothing anchors the walk root");
+    assert!(err.kind() == ErrorKind::NotFound || matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)), "{err}");
+}
+
 fn walked_tree(dir: &str, filemode: FileMode, resident: bool) -> DirTree {
     let tree: DirTree = DirTree::new(filemode, Filters::default())
         .from_path(dir)

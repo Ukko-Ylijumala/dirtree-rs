@@ -64,6 +64,9 @@ code. Each tag marks the tree code as it stood in that statter release.
   redirect them. `path_fd()` hands out such an fd of any directory in
   the tree, and `FileOpener` / `open_file()` open a file by its node
   (directory and interned name) with one directory open per run of files.
+  A walk can start below an fd the caller holds (`populate_par_beneath`):
+  the walked directory is reached with no symlink in any component, stays
+  pooled, and every later open below it resolves beneath that same fd.
 - **Observer:** progress and every fault, as a `FaultKind` with the exact
   path and errno, go to a `TreeObserver`, so a consumer can account for
   coverage.

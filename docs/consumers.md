@@ -220,6 +220,25 @@ stored when it came new or replaced.
   start. A node that held entries before the walk listed it keeps its
   stamp, since a walk adds but never removes.
 
+### 0.5.3
+
+Asked for by the quarantine tool beside the scanner (`zoner-quarantine`,
+its design doc's §11: a convicted plugin directory is walked, packed and
+unlinked entry by entry, and no path below the customer's home may be
+trusted on the way):
+
+- **A walk below an fd (#11):** `populate_par_beneath(path, &anchor,
+  rel, recursive, &hooks)`. The walked directory is opened beneath an
+  `O_PATH` fd the caller holds, with no symlink in any component
+  (`DirHandle::open_beneath`), known to the tree by the name the caller
+  gives and never opened by it. It stays pooled under its node, so
+  `path_fd()`, `FileOpener`, `handle()` and `update()` below it resolve
+  beneath the same open directory. The node comes back, for
+  `traverse_from`.
+- Removal primitives (#12 in that doc, `unlink_at` / `rmdir_at` on
+  dirhandle) turned out not to be needed: nix's `unlinkat`, re-exported
+  through dirhandle, takes the `O_PATH` fds the tree hands out.
+
 Still open: a fanotify change source (the daemon's), measuring the
 memory of a real host's tree (Scale, below), and the watcher's event
 handling, which still does not consult the visitor.

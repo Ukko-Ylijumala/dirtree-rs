@@ -809,6 +809,58 @@ impl DirTree {
     }
 
     /**
+    [DirTree::populate_par_with] of the directory `rel` below `anchor`,
+    an `O_PATH` fd of a directory the caller holds and trusts, resolved
+    with no symlink in any component ([DirHandle::open_beneath]: `rel`
+    is relative, holds no `..`, and may be longer than `PATH_MAX`). The
+    directory is known to the tree as `path` -- its node, and what the
+    visitor, the observer and the events see -- but nothing is opened by
+    that path: it is a name, and the caller says what it is.
+
+    The walked directory stays pooled under its node ([DirTree::handle]
+    finds it), so every later open below it -- [DirTree::path_fd],
+    [FileOpener](super::FileOpener), [DirTree::handle], `update()` --
+    resolves beneath that same open directory and never by a path. A
+    consumer that must not trust any path below a root it holds open (a
+    quarantine removing a convicted subtree from a customer's home) walks
+    the subtree this way and then reads, packs and unlinks every entry
+    relative to a directory fd the tree reached without a path.
+
+    Returns the directory's node. Fails when the directory cannot be
+    opened beneath `anchor` (`ELOOP` or `ENOTDIR` for a symlink in the
+    way, `ENOENT`, `EACCES`), or when a file occupies `path` in the tree.
+    */
+    pub fn populate_par_beneath(
+        &self,
+        path: &Path,
+        anchor: &OwnedFd,
+        rel: &Path,
+        recursive: Option<bool>,
+        hooks: &WalkHooks,
+    ) -> Result<Arc<Directory>, Error> {
+        let path: &PathBuf = &path.to_path_buf();
+        let pooled: DirHandle = DirHandle::open_beneath(anchor, rel)?;
+        let inode: u64 = pooled.stat()?.st_ino;
+        let node: Arc<Directory> = self
+            .walk_root_node(path, Some(inode), recursive)
+            .ok_or_else(|| Error::new(ErrorKind::NotADirectory, "a file occupies the walk root's path"))?;
+        // the walk lists through a handle of its own; the pooled one anchors later opens
+        let handle: Result<DirHandle, Error> = DirHandle::open_at(&pooled, c".");
+        node.set_anchored();
+        if !node.fd().is_open() {
+            let checked_out: CheckedOutHandle = self.handles.adopt(pooled);
+            if node.fd_set(checked_out.as_raw_fd()).is_err() {
+                // lost a race to another opener: keep theirs, close ours
+                checked_out.close();
+            }
+        }
+        let walk: Walk = self.new_walk(path, 0, recursive, hooks);
+        let state: WalkState = self.initial_walk_state(path, 0);
+        rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node.clone(), s, 0, 0));
+        Ok(node)
+    }
+
+    /**
     [DirTree::populate_par_with] of the directory at `path`, opened from
     `at`; `dev` is its parent's device if known, else 0 (see [WalkState::dev]).
     */
@@ -822,31 +874,8 @@ impl DirTree {
     ) {
         // the walker passes owned paths down; one conversion per walk root
         let path: &PathBuf = &path.to_path_buf();
-        /*
-        Resolve the walk root's node up front - children are attached
-        directly to their parent's node during the walk (one intern and
-        one lock per entry), instead of a full root-to-leaf trie walk
-        per entry through [DirTree::insert].
-        */
-        let path_str = encode_os(&path);
-        let node: Arc<Directory> = match self.get_dir(path_str.as_ref()) {
-            Some(n) => n,
-            None => {
-                // an unknown walk root (e.g. a worker Scan op) is created first
-                self.insert_dir(path, None);
-                match self.get_dir(path_str.as_ref()) {
-                    Some(n) => n,
-                    // also when a file occupies the path
-                    None => {
-                        self.add_error(
-                            TreeEvent::error(FaultKind::Tree, "Cannot resolve walk root as a directory")
-                                .path(&path_str)
-                                .op(&TreeOp::Scan(path.clone(), recursive)),
-                        );
-                        return;
-                    }
-                }
-            }
+        let Some(node) = self.walk_root_node(path, None, recursive) else {
+            return;
         };
         if matches!(at, DirAt::Path) {
             node.set_walk_root();
@@ -856,6 +885,34 @@ impl DirTree {
         // a symlinked walk root is followed, see DirAt
         let handle: Result<DirHandle, Error> = at.open(path);
         rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, 0, 0));
+    }
+
+    /**
+    The node of a walk root, resolved up front - children are attached
+    directly to their parent's node during the walk (one intern and one
+    lock per entry), instead of a full root-to-leaf trie walk per entry
+    through [DirTree::insert]. An unknown walk root (e.g. a worker Scan
+    op) is created first, with `inode` when the caller has it (from an fd
+    it holds), else from a stat by path. [None], with a fault recorded,
+    when a file occupies the path.
+    */
+    fn walk_root_node(&self, path: &PathBuf, inode: Option<u64>, recursive: Option<bool>) -> Option<Arc<Directory>> {
+        let path_str = encode_os(&path);
+        if let Some(n) = self.get_dir(path_str.as_ref()) {
+            return Some(n);
+        }
+        self.insert_dir(path, inode);
+        match self.get_dir(path_str.as_ref()) {
+            Some(n) => Some(n),
+            None => {
+                self.add_error(
+                    TreeEvent::error(FaultKind::Tree, "Cannot resolve walk root as a directory")
+                        .path(&path_str)
+                        .op(&TreeOp::Scan(path.clone(), recursive)),
+                );
+                None
+            }
+        }
     }
 
     /**
@@ -1988,7 +2045,10 @@ impl DirTree {
     component, however deep `dir` lies. So a directory swapped for a
     symlink fails with `ELOOP` instead of leading elsewhere. A directory
     with neither above it lies above every walk root, outside what was
-    walked: it is opened by its path.
+    walked: it is opened by its path -- unless what is above it was
+    walked beneath a caller's fd ([DirTree::populate_par_beneath]) and
+    that handle has since been closed, which fails with `NotFound`:
+    such a subtree is never opened by a path.
 
     Fails when the directory or its anchor cannot be opened, or when
     `dir` is no longer attached to the tree.
@@ -2009,6 +2069,13 @@ impl DirTree {
             }
             if current.is_walk_root() {
                 break path_fd_by_path(&current.path(&self.strings))?;
+            }
+            if current.is_anchored() {
+                // walked beneath a caller's fd: by its path is never an option
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    "the directory this subtree was walked beneath is no longer open",
+                ));
             }
             if current.is_root() {
                 return Ok(DirAt::Path);

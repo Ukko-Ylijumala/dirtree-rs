@@ -113,6 +113,13 @@ pub struct Directory {
     See `DirTree::dir_at`. Sits in what was padding.
     */
     walk_root: AtomicBool,
+    /**
+    Whether this directory was walked beneath an fd the caller holds
+    (`DirTree::populate_par_beneath`): it is never opened by its path,
+    and once its pooled handle is closed nothing below it can be opened
+    at all. See `DirTree::dir_at`. Sits in what was padding.
+    */
+    anchored: AtomicBool,
     fd: DirFd,
     children: Children,
 }
@@ -137,6 +144,7 @@ impl Directory {
             tag: AtomicU16::new(SCOPE_NONE),
             children_scope: AtomicU16::new(SCOPE_NONE),
             walk_root: AtomicBool::new(false),
+            anchored: AtomicBool::new(false),
             fd: DirFd::default(),
             children: HashMap::with_hasher(DirTreeXxh3Hasher).into(),
         }
@@ -236,6 +244,17 @@ impl Directory {
     /// Mark this directory as a walk root named by a caller.
     pub(super) fn set_walk_root(&self) {
         self.walk_root.store(true, Relaxed);
+    }
+
+    /// Whether this directory was walked beneath an fd the caller holds (see the field).
+    #[inline]
+    pub fn is_anchored(&self) -> bool {
+        self.anchored.load(Relaxed)
+    }
+
+    /// Mark this directory as walked beneath an fd the caller holds.
+    pub(super) fn set_anchored(&self) {
+        self.anchored.store(true, Relaxed);
     }
 
     /// Returns the [[DirFd]] for this [[Directory]].
