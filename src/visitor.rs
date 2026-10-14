@@ -166,10 +166,10 @@ pub enum Verdict {
     SkipChildren,
     /**
     Tag this directory with the given `tag` and emit a [`WalkEvent`].
-    Descendants walk under `new_scope` (pass [`SCOPE_NONE`] or the
-    current scope to leave it unchanged). If `descend == false` the
-    children of this directory are not walked - the visitor claims
-    the subtree.
+    Descendants walk under `new_scope`: pass the current scope
+    ([`WalkContext::scope`]) to keep it, [`SCOPE_NONE`] to leave every
+    scope. If `descend == false` the children of this directory are not
+    walked - the visitor claims the subtree.
     */
     Tag {
         tag: ScopeTag,
@@ -179,7 +179,11 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// Convenience: `Tag { tag, new_scope: SCOPE_NONE, descend: true }`.
+    /**
+    Convenience: `Tag { tag, new_scope: SCOPE_NONE, descend: true }`. The
+    descendants walk under no scope, whatever the current one; chain
+    [`enter_scope`](Self::enter_scope) to give them one.
+    */
     #[inline]
     pub fn tag(tag: ScopeTag) -> Self {
         Self::Tag { tag, new_scope: SCOPE_NONE, descend: true }

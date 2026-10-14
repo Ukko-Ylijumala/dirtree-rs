@@ -303,6 +303,7 @@ pub struct Marker {
     /// All required, in order (cheap ones first saves stats).
     pub entries: Vec<MarkerEntry>,
     pub tag: ScopeTag,
+    /// The scope below the tagged directory: [`SCOPE_NONE`], the default, leaves every scope (see [`Verdict::Tag`]).
     pub new_scope: ScopeTag,
     pub descend: bool,
     pub target: MarkerTarget,
