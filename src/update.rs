@@ -29,8 +29,9 @@ the walk root), rebuilt from the tree:
   file mode that stores none, that is every file it did not have stored
   before), `Store` keeping it as in the walk;
 - a subtree that appeared is walked in the context of the directory it
-  appeared in, and one whose scope changed is walked again in full,
-  since everything below was decided under the other scope.
+  appeared in (in a tree that walks recursively, even by a diff that
+  does not recurse), and one whose scope changed is walked again in
+  full, since everything below was decided under the other scope.
 
 A directory the pre-check skips is not visited: nothing in its listing
 changed. In Name filemode files carry no inode, so file replacement is
@@ -232,8 +233,10 @@ impl DirTree {
     Diff-rescan a directory that is already in the tree, applying any
     differences found on disk (see the module docs for the semantics).
     With `recursive` (or the tree default when [None]) the diff also
-    descends into subdirectories that exist on both sides; newly
-    appeared subdirectories are always scanned in full.
+    descends into subdirectories that exist on both sides. A subdirectory
+    that appeared is walked in full when the diff recurses or the tree
+    walks recursively, as the walk would have; in a tree that walks one
+    level, a diff that does not recurse only inserts it.
 
     Blocking; runs the per-directory diffs in parallel on the rayon
     pool. For the queued (non-blocking) form, see [DirTree::rescan].
@@ -542,9 +545,14 @@ impl DirTree {
         if rewalk {
             tree_view.clear();
         }
-        // how a new subdirectory is walked, if it is
+        /*
+        How a new subdirectory is walked, if it is: as the walk would have,
+        so in a tree that walks recursively even when this diff does not
+        recurse. A directory moved in from elsewhere shows only as an entry
+        of its parent, and nothing else would list what it holds.
+        */
         let walk_new = |name_idx: u32| -> Option<(WalkState, usize)> {
-            (diff.recursive || rewalk).then(|| (child_state(name_idx), depth + 1))
+            (diff.recursive || rewalk || self.conf.recursive()).then(|| (child_state(name_idx), depth + 1))
         };
 
         // pass 2: add what is new, replace what changed, and note the rest to recurse into

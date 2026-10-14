@@ -842,6 +842,35 @@ fn test_apply_changes() {
 }
 
 #[test]
+fn test_tree_update_walks_new_subdirectories() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let at = |p: &str| temp.path().join(p);
+    for d in ["tree/a", "outside/moved/deep"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    write(at("outside/moved/deep/f.bin"), b"").unwrap();
+    let dir: String = at("tree").to_string_lossy().into_owned();
+    let tree: DirTree = walked_tree(&dir, FileMode::NODE, false);
+
+    // moved in from outside the tree: only a's listing shows it, and a diff of a alone walks it
+    rename(at("outside/moved"), at("tree/a/moved")).unwrap();
+    let stats: UpdateStats = tree.update(&format!("{dir}/a"), Some(false)).unwrap();
+    assert_eq!((stats.added_dirs, stats.errors), (1, 0), "{stats}");
+    assert!(tree.contains(&format!("{dir}/a/moved/deep/f.bin")), "{stats}");
+    tree_validate_counts(&tree);
+
+    // a tree that walks one level keeps a new subdirectory as an entry, as its walk would
+    let shallow: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(&dir)
+        .with_recursive(false);
+    shallow.walk().unwrap();
+    std::fs::create_dir_all(at("tree/b/c")).unwrap();
+    let stats: UpdateStats = shallow.update(&dir, None).unwrap();
+    assert_eq!(stats.added_dirs, 1, "{stats}");
+    assert!(shallow.contains(&format!("{dir}/b")) && !shallow.contains(&format!("{dir}/b/c")));
+}
+
+#[test]
 fn test_dir_by_fd() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
