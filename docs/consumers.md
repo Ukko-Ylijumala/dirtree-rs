@@ -303,6 +303,18 @@ The WordPress scanner's plan item E:
   its tag changed, as when its scope did. `visit_dir` sees what it saw
   before, with `tag` always `SCOPE_NONE`.
 
+### 0.5.7
+
+For the WordPress scanner's timestamps plan (install dates, backdating):
+
+- **`statx` through the opener:** `FileOpener::open_regular_statx`
+  (the open and the `statx` in one, as `open_regular` is with `fstat`),
+  `FileOpener::statx` (an entry by name, never through a symlink),
+  `FileOpener::statx_dir` (the directory itself, through its `O_PATH`
+  fd) and `DirTree::open_file_statx`; all ask for the `stat` fields
+  plus the birth time, which dirhandle 0.6.5's `birth_time()` reads
+  only when the filesystem reported one. Nothing existing changed.
+
 Still open: a fanotify change source (the daemon's), and measuring the
 memory of a real host's tree (Scale, below).
 

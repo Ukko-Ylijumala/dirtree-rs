@@ -29,7 +29,7 @@ use std::{
 };
 use miniutils::{EntryKind, PlannedEntry, Special, TreeSpec};
 use stringstore::UniqueStrStore;
-use dirhandle::{DirHandle, open_regular_at};
+use dirhandle::{DirHandle, birth_time, open_regular_at};
 use dirhandle::nix::{fcntl::{OFlag, open}, sys::stat::{Mode, fstat}};
 use tempfile::TempDir;
 
@@ -934,6 +934,23 @@ fn test_file_opener() {
 
     let (b, z) = file("b/z.php");
     assert_eq!(tree.open_file(&b, z).unwrap().1.st_size, 5);
+
+    // the statx forms: the same file, the same checks, and the birth time std sees
+    let (f, stx) = opener.open_regular_statx(&a, x).unwrap();
+    assert_eq!((stx.stx_size, f.metadata().unwrap().len()), (3, 3));
+    let created: Option<i64> = f
+        .metadata()
+        .unwrap()
+        .created()
+        .ok()
+        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64);
+    assert_eq!(birth_time(&stx).map(|(secs, _)| secs), created);
+    assert_eq!(opener.statx(&a, x).unwrap().stx_ino, stx.stx_ino);
+    assert_eq!(libc::mode_t::from(opener.statx(&a, link).unwrap().stx_mode) & libc::S_IFMT, libc::S_IFLNK);
+    assert_eq!(libc::mode_t::from(opener.statx_dir(&a).unwrap().stx_mode) & libc::S_IFMT, libc::S_IFDIR);
+    let err = opener.open_regular_statx(&a, pipe).expect_err("not a regular file");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert_eq!(tree.open_file_statx(&b, z).unwrap().1.stx_size, 5);
 
     // a directory swapped for a symlink: its files are not reached through it
     rename(temp.path().join("a"), temp.path().join("a.moved")).unwrap();

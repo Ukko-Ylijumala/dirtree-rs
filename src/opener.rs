@@ -10,7 +10,7 @@ use super::dirtree::DirTree;
 use super::node::Directory;
 use super::osname::decode_os;
 
-use dirhandle::{open_regular_at, read_nofollow_at};
+use dirhandle::{STATX_WITH_BTIME, fstatx, open_regular_at, open_regular_statx_at, read_nofollow_at, statx_at};
 
 use std::{
     borrow::Cow,
@@ -75,6 +75,33 @@ impl<'t> FileOpener<'t> {
         read_nofollow_at(self.dir_fd(dir)?, &*name)
     }
 
+    /**
+    [Self::open_regular], with a `statx` of what was opened in place of
+    the `fstat`: dirhandle's `open_regular_statx_at()`, asked for the
+    `stat` fields and the birth time (`STATX_WITH_BTIME`). The birth
+    time is read with dirhandle's `birth_time()`, which checks that
+    the filesystem gave one.
+    */
+    pub fn open_regular_statx(&mut self, dir: &Arc<Directory>, name: u32) -> io::Result<(File, libc::statx)> {
+        let name: Cow<OsStr> = self.name(name);
+        open_regular_statx_at(self.dir_fd(dir)?, &*name, STATX_WITH_BTIME)
+    }
+
+    /**
+    `statx` of the entry `name` (interned) of `dir`, whatever it is and
+    without opening it, never through a symlink (the link itself is
+    described): dirhandle's `statx_at()`, with `STATX_WITH_BTIME`.
+    */
+    pub fn statx(&mut self, dir: &Arc<Directory>, name: u32) -> io::Result<libc::statx> {
+        let name: Cow<OsStr> = self.name(name);
+        statx_at(self.dir_fd(dir)?, &*name, STATX_WITH_BTIME)
+    }
+
+    /// `statx` of `dir` itself, through its `O_PATH` fd: dirhandle's `fstatx()`, with `STATX_WITH_BTIME`.
+    pub fn statx_dir(&mut self, dir: &Arc<Directory>) -> io::Result<libc::statx> {
+        fstatx(self.dir_fd(dir)?, STATX_WITH_BTIME)
+    }
+
     /// The name `idx` decoded to its on-disk bytes.
     fn name(&self, idx: u32) -> Cow<'t, OsStr> {
         decode_os(self.tree.get_string(idx))
@@ -89,5 +116,10 @@ impl DirTree {
     */
     pub fn open_file(&self, dir: &Arc<Directory>, name: u32) -> io::Result<(File, libc::stat)> {
         FileOpener::new(self).open_regular(dir, name)
+    }
+
+    /// As [Self::open_file], with a `statx` of what was opened: see [FileOpener::open_regular_statx].
+    pub fn open_file_statx(&self, dir: &Arc<Directory>, name: u32) -> io::Result<(File, libc::statx)> {
+        FileOpener::new(self).open_regular_statx(dir, name)
     }
 }
