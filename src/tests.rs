@@ -2050,6 +2050,8 @@ struct CountingObserver {
     dirs: AtomicU64,
     files: AtomicU64,
     bytes: AtomicU64,
+    removed_dirs: AtomicU64,
+    removed_files: AtomicU64,
 }
 
 impl TreeObserver for CountingObserver {
@@ -2060,6 +2062,11 @@ impl TreeObserver for CountingObserver {
     fn files_added(&self, n: u64, bytes: u64) {
         self.files.fetch_add(n, Relaxed);
         self.bytes.fetch_add(bytes, Relaxed);
+    }
+
+    fn nodes_removed(&self, counts: NodeCounts) {
+        self.removed_dirs.fetch_add(counts.dirs as u64, Relaxed);
+        self.removed_files.fetch_add(counts.files as u64, Relaxed);
     }
 }
 
@@ -2085,6 +2092,20 @@ fn test_tree_observer() {
         assert_eq!(obs.files.load(Relaxed), 3, "files, sync={sync}");
         assert_eq!(obs.bytes.load(Relaxed), 10, "bytes, sync={sync}");
     }
+
+    // what goes: a file removed by hand, and a subtree a diff finds gone (a/b with its file)
+    let obs: Arc<CountingObserver> = Arc::new(CountingObserver::default());
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_observer(obs.clone());
+    tree.walk().unwrap();
+    tree.remove(&format!("{dir}/top.bin")).unwrap();
+    assert_eq!((obs.removed_dirs.load(Relaxed), obs.removed_files.load(Relaxed)), (0, 1));
+    std::fs::remove_dir_all(temp.path().join("a/b")).unwrap();
+    tree.update(dir, Some(true)).unwrap();
+    assert_eq!((obs.removed_dirs.load(Relaxed), obs.removed_files.load(Relaxed)), (1, 2));
+    assert_eq!((obs.dirs.load(Relaxed), obs.files.load(Relaxed)), (3, 4), "only top.bin, still on disk, came back");
 }
 
 /// Collects the faults a [TreeObserver] is told of, for [test_tree_faults].

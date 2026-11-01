@@ -327,10 +327,6 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
 
 ## Future work (not in this PR)
 
-- Removal hooks on `TreeObserver` (`dirs_removed` / `files_removed`,
-  default no-ops), so an observer can track the live tree size through
-  `update()` and the watcher. `UpdateStats` already carries the removal
-  counts of an update.
 - A lighter "discover-only" walk mode that does not retain the trie at
   all — the visitor-recognized paths are streamed and the tree itself
   is not built. Useful when the discovery is the only output.

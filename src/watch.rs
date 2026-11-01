@@ -457,6 +457,7 @@ impl TreeWatcher {
             if let Child::Dir(ref node) = p.node {
                 self.tree.release_handles(node);
             }
+            self.tree.conf.observer().nodes_removed(p.counts);
             sweep |= p.is_dir;
             false // dropping the Arc cascades the subtree teardown
         });
@@ -840,6 +841,7 @@ impl TreeWatcher {
             if let Child::Dir(ref node) = pending.node {
                 self.tree.release_handles(node);
             }
+            self.tree.conf.observer().nodes_removed(pending.counts);
             let was_dir: bool = pending.is_dir;
             // drop the subtree first, or the sweep still sees its watches alive
             drop(pending);
@@ -893,6 +895,8 @@ impl TreeWatcher {
             */
             self.tree.release_handles(&child);
             drop(child); // release the old subtree before re-scanning
+            // gone as far as the observer knows: the diff reports what it walks anew
+            self.tree.conf.observer().nodes_removed(pending.counts);
             self.diff_dir(parent);
             self.sweep_dead_watches();
         } else {

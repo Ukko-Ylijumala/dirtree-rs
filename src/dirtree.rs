@@ -1864,7 +1864,8 @@ impl DirTree {
     subtree's counts a second time.
 
     The open directory handles (resident mode) of the removed subtree
-    are closed. To detach a subtree that will be re-attached, use
+    are closed, and the observer is told ([TreeObserver::nodes_removed]).
+    To detach a subtree that will be re-attached, use
     [DirTree::detach_child_node] instead.
     */
     pub(super) fn remove_child_node(
@@ -1874,11 +1875,13 @@ impl DirTree {
         child: &Child,
     ) -> NodeCounts {
         let counts: NodeCounts = self.detach_child_node(parent, name_idx, child);
-        if !counts.is_empty()
-            && let Child::Dir(dir) = child
-        {
+        if counts.is_empty() {
+            return counts;
+        }
+        if let Child::Dir(dir) = child {
             self.release_handles(dir);
         }
+        self.conf.observer().nodes_removed(counts);
         counts
     }
 

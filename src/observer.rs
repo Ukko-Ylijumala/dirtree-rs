@@ -5,6 +5,7 @@
 without the tree knowing who listens (a progress bar, a log, nothing).
 */
 
+use super::conf::NodeCounts;
 use super::event::TreeFault;
 use std::{fmt::Debug, path::Path};
 
@@ -29,6 +30,17 @@ pub trait TreeObserver: Send + Sync + Debug {
 
     /// `n` special files (symlinks, FIFOs, sockets, devices) were attached.
     fn specials_added(&self, _n: u64) {}
+
+    /**
+    `counts` were taken off the tree: a subtree removed by a diff, the
+    watcher or [`DirTree::remove`](super::DirTree::remove), with
+    everything below it, or one the watcher saw moved out of the tree.
+    With the `*_added` calls, this keeps a resident tree's size known
+    to its consumer. Not called for a directory renamed or moved within
+    the tree (its nodes stay, or are rebuilt from memory), nor when a
+    snapshot load empties a tree.
+    */
+    fn nodes_removed(&self, _counts: NodeCounts) {}
 
     /**
     Something could not be seen or done (see [FaultKind](super::FaultKind)).
