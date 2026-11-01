@@ -2355,6 +2355,49 @@ fn test_tree_relative_paths() {
 }
 
 #[test]
+fn test_directory_children() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(3).level(2, 1).with(Special::SymlinkFile, 1).create(temp.path()).unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    let root: Arc<Directory> = tree.get_dir(dir).unwrap();
+
+    // the walk root's subdirectories and files, as on disk
+    let (mut disk_dirs, mut disk_files): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for e in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
+        let name: String = e.file_name().to_string_lossy().into_owned();
+        match e.file_type().unwrap().is_dir() {
+            true => disk_dirs.push(name),
+            false => disk_files.push(name),
+        }
+    }
+    disk_dirs.sort();
+    disk_files.sort();
+    assert_eq!((root.len(), root.is_empty()), (disk_dirs.len() + disk_files.len(), false));
+    let mut subdirs: Vec<String> = root.subdirs().iter().map(|d: &Arc<Directory>| d.name(tree.strings()).to_owned()).collect();
+    subdirs.sort();
+    assert_eq!(subdirs, disk_dirs);
+    let files: Vec<(u32, FileEntry)> = root.files();
+    let mut names: Vec<String> = files.iter().map(|(n, _)| tree.get_string(*n).to_owned()).collect();
+    names.sort();
+    assert_eq!(names, disk_files);
+    assert!(tree.conf().specials() >= 1, "the symlinks are somewhere in the tree");
+
+    // grouped as an opener likes them: one directory open, one openat per regular file
+    let mut opener: FileOpener = FileOpener::new(&tree);
+    for (name, file) in &files {
+        match file.kind() {
+            FileKind::File => assert!(opener.open_regular(&root, *name).is_ok(), "{}", tree.get_string(*name)),
+            _ => assert!(opener.open_regular(&root, *name).is_err(), "a symlink is not a regular file"),
+        }
+    }
+    // a leaf directory: files only
+    let leaf: Arc<Directory> = tree.get_dir(&format!("{dir}/level_1_0")).unwrap();
+    assert!(!leaf.is_empty() && leaf.subdirs().is_empty());
+    assert_eq!(leaf.len(), leaf.files().len());
+}
+
+#[test]
 fn test_tree_rescan_via_worker() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();

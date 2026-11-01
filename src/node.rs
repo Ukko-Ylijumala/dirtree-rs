@@ -307,6 +307,39 @@ impl Directory {
         &self.children
     }
 
+    /// The number of children: subdirectories and the files stored.
+    pub fn len(&self) -> usize {
+        self.children.read().len()
+    }
+
+    /// Whether the directory has no children (none listed, or none stored).
+    pub fn is_empty(&self) -> bool {
+        self.children.read().is_empty()
+    }
+
+    /**
+    The subdirectories, as they are at the moment: a snapshot taken
+    under one read lock hold, in no particular order.
+    */
+    pub fn subdirs(&self) -> Vec<Arc<Directory>> {
+        self.children.read().values().filter_map(Child::as_dir).cloned().collect()
+    }
+
+    /**
+    The files stored (every non-directory entry, see [FileKind]) with
+    their interned names, as they are at the moment: a snapshot taken
+    under one read lock hold, in no particular order. The candidates of
+    one directory, grouped as a [FileOpener](super::FileOpener) likes
+    them: one directory open for the lot.
+    */
+    pub fn files(&self) -> Vec<(u32, FileEntry)> {
+        self.children
+            .read()
+            .iter()
+            .filter_map(|(idx, c): (&u32, &Child)| c.as_file().map(|f: &FileEntry| (*idx, *f)))
+            .collect()
+    }
+
     /// Whether we have a child with the given name.
     #[inline]
     pub fn has_child(&self, name_idx: &u32) -> bool {
