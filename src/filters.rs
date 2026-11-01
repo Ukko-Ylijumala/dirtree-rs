@@ -37,29 +37,24 @@ impl Filters {
 
     /// Returns `true` if the entry should be processed.
     pub fn passes(&self, name: &OsStr, is_dir: bool) -> bool {
+        let (exclude, include): (&Option<Regex>, &Option<Regex>) = match is_dir {
+            true => (&self.exclude_dirs, &self.include_dirs),
+            false => (&self.exclude_files, &self.include_files),
+        };
+        // the usual case, no filters: the name is not even looked at
+        if exclude.is_none() && include.is_none() {
+            return true;
+        }
         let name = encode_os(&name);
-        if is_dir {
-            if let Some(ref re) = self.exclude_dirs
-                && re.is_match(&name)
-            {
-                return false;
-            }
-            if let Some(ref re) = self.include_dirs
-                && !re.is_match(&name)
-            {
-                return false;
-            }
-        } else {
-            if let Some(ref re) = self.exclude_files
-                && re.is_match(&name)
-            {
-                return false;
-            }
-            if let Some(ref re) = self.include_files
-                && !re.is_match(&name)
-            {
-                return false;
-            }
+        if let Some(re) = exclude
+            && re.is_match(&name)
+        {
+            return false;
+        }
+        if let Some(re) = include
+            && !re.is_match(&name)
+        {
+            return false;
         }
         true
     }
