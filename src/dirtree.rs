@@ -14,7 +14,8 @@ use super::{FileMode, Filters};
 use super::utils::{PATH_SEP, abs_path, panic_message, path_parts};
 
 use dirhandle::{
-    CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles, path_fd_at, path_fd_beneath,
+    CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles, partition_dirs_first, path_fd_at,
+    path_fd_beneath,
     nix::{
         fcntl::{OFlag, open, readlinkat},
         sys::stat::Mode,
@@ -1319,9 +1320,10 @@ impl DirTree {
         so the error must be recorded rather than silently accepted.
 
         iter_untracked() (dirhandle 0.6.1): the walker never reads the
-        handle's DirectoryState, and partitions the entries itself, so
-        skip the state pass (a directory fstat and a digest per entry)
-        and the dir-first lookahead.
+        handle's DirectoryState, and partitions the entries itself (with
+        partition_dirs_first(), public since dirhandle 0.7.0), so skip
+        the state pass (a directory fstat and a digest per entry) and the
+        dir-first lookahead.
         */
         /*
         For readlinkat() on the symlinks listed here. Taken before the
@@ -2567,23 +2569,6 @@ impl WalkState {
             ..self.context(path, dirfd, depth, strings)
         }
     }
-}
-
-/**
-Move the directory entries to the front of `entries` (unstable, in
-place) and return how many there are, so that subdirectories and other
-entries can be scheduled differently. Entries of undeterminable type
-count as non-directories, like everywhere else.
-*/
-fn partition_dirs_first(entries: &mut [EntryExt<'_>]) -> usize {
-    let mut n_dirs: usize = 0;
-    for i in 0..entries.len() {
-        if entries[i].is_dir() {
-            entries.swap(n_dirs, i);
-            n_dirs += 1;
-        }
-    }
-    n_dirs
 }
 
 /// An `O_PATH` fd of the directory at `path`, symlinks followed: a root's, see [DirAt::Path].
