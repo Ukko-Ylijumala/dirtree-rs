@@ -315,6 +315,32 @@ For the WordPress scanner's timestamps plan (install dates, backdating):
   plus the birth time, which dirhandle 0.6.5's `birth_time()` reads
   only when the filesystem reported one. Nothing existing changed.
 
+### 0.5.8
+
+A bugfinding and performance pass, nothing asked for by a consumer:
+
+- **A detached directory is not in the tree:** `is_attached()` only
+  followed the parent chain, which a removed directory keeps, so
+  `update_node()` diffed detached nodes and counted their entries on
+  the tree. Now each node must sit in its parent's map, up to the root.
+- **A diff detaches on the kernel's `ENOENT` only:** a `NotFound` of
+  the tree's own (an anchored subtree whose pooled handle was closed)
+  removed the subtree; it is an `OpenDir` fault now.
+- **`TreeChange::Lost` reaches anchored roots** (`walk_roots()`).
+- **`TreeConf::clear_cancel()`:** nothing lowered the flag, so one
+  `cancel()` stopped every later walk and diff at its first directory.
+- **A directory skeleton reserves no file slots:** with a mode that
+  stores no files, every directory's map still had room for all its
+  entries (24 MB of empty slots on `/usr`, ~150 MB on a 6M-file host).
+- **A sync walk blocks with a worker running,** instead of queueing its
+  subdirectories onto the worker and returning with an error logged;
+  and `stop_worker()` no longer joins while holding the lock a sync
+  walk on the worker takes.
+- **The watcher stays on one filesystem** when scanning a directory
+  that appeared.
+- **`Filters::passes()` skips the name when no filter is set** (3.6%
+  fewer instructions on a `/usr` walk).
+
 Still open: a fanotify change source (the daemon's), and measuring the
 memory of a real host's tree (Scale, below).
 
