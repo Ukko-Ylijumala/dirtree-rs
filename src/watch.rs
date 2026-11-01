@@ -56,7 +56,7 @@ use super::utils::proc_fd_path;
 
 use dashmap::DashMap;
 use dirhandle::{
-    nix::{fcntl::AtFlags, sys::stat::fstatat},
+    nix::{fcntl::AtFlags, sys::stat::{fstat, fstatat}},
     path_fd_at,
 };
 use parking_lot::Mutex;
@@ -372,8 +372,13 @@ impl TreeWatcher {
     reaches, the new one included, before reading it.
     */
     fn scan_new_dir(&self, parent: OwnedFd, full: &Path, name: &OsStr) {
+        // on one filesystem, the parent's device: a mount point that appeared is left unlisted, as by the walk
+        let dev: u64 = match self.tree.conf.one_fs() {
+            true => fstat(&parent).map(|st: libc::stat| st.st_dev).unwrap_or(0),
+            false => 0,
+        };
         if let Some(at) = DirAt::child(&Arc::new(parent), name) {
-            self.tree.populate_par_at(full, &at, 0, Some(true), &WalkHooks::default());
+            self.tree.populate_par_at(full, &at, dev, Some(true), &WalkHooks::default());
         }
     }
 
