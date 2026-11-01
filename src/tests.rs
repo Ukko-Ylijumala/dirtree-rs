@@ -3027,6 +3027,36 @@ fn test_tree_sync_walk_blocks_with_worker() {
     tree_validate_counts(&tree);
 }
 
+#[test]
+fn test_tree_events() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    create_dir_all(temp.path().join("locked")).unwrap();
+    write(temp.path().join("a.bin"), b"x").unwrap();
+    chmod(&temp.path().join("locked"), 0o000);
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    chmod(&temp.path().join("locked"), 0o755);
+
+    // the walk's start and end, and the directory it could not open
+    let events: Vec<TreeEvent> = tree.events();
+    let build = |e: &TreeEvent| matches!(e.oper, Some(TreeOp::Build(_)));
+    assert!(events.iter().any(|e: &TreeEvent| build(e) && e.info == EventInfo::Begin), "{events:?}");
+    assert!(events.iter().any(|e: &TreeEvent| build(e) && e.info == EventInfo::End), "{events:?}");
+    let err: TreeEvent = tree.last_error().expect("the unreadable directory");
+    assert_eq!((err.fault, err.errno), (Some(FaultKind::OpenDir), Some(libc::EACCES)));
+    assert_eq!(err.path.as_deref(), Some(format!("{dir}/locked").as_str()));
+    assert!(events.contains(&err));
+
+    // a copy: the log keeps them, until drained
+    assert_eq!(tree.events(), events);
+    assert_eq!(tree.drain_events(), events);
+    assert!(tree.events().is_empty() && tree.last_error().is_none());
+    tree.remove(&format!("{dir}/a.bin")).unwrap();
+    assert!(tree.events().is_empty(), "a blocking remove logs nothing");
+    let _ = tree.update(dir, Some(false));
+    assert!(tree.events().is_empty(), "nor does a blocking update");
+}
+
 fn walked_tree(dir: &str, filemode: FileMode, resident: bool) -> DirTree {
     let tree: DirTree = DirTree::new(filemode, Filters::default())
         .from_path(dir)

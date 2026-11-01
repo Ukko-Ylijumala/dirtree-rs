@@ -285,6 +285,27 @@ impl DirTree {
     }
 
     /**
+    The event log, oldest event first: the starts and ends of operations,
+    errors, and notices (a removal, a rename, a snapshot done), the
+    latest few thousand of them. A copy; the log keeps them. For the
+    complete record of faults, see [TreeObserver::fault]: the log is
+    bounded, and a fault repeated en masse is logged once.
+    */
+    pub fn events(&self) -> Vec<TreeEvent> {
+        self.events.read().iter().cloned().collect()
+    }
+
+    /// [DirTree::events], taken out of the log, which is left empty: for a consumer that forwards them.
+    pub fn drain_events(&self) -> Vec<TreeEvent> {
+        self.events.write().drain(..).collect()
+    }
+
+    /// The latest error logged, if any (see [DirTree::events]).
+    pub fn last_error(&self) -> Option<TreeEvent> {
+        self.events.read().iter().rev().find(|e: &&TreeEvent| e.fault.is_some()).cloned()
+    }
+
+    /**
     Add an error event to the event log, increase the error count and
     tell the observer of the fault. Every error has a [FaultKind] (see
     [TreeEvent::error]).
