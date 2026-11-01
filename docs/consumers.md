@@ -341,6 +341,34 @@ A bugfinding and performance pass, nothing asked for by a consumer:
 - **`Filters::passes()` skips the name when no filter is set** (3.6%
   fewer instructions on a `/usr` walk).
 
+### Next
+
+Additions for the consumers, from the same pass:
+
+- **The event log can be read:** `DirTree::events()`, `drain_events()`
+  and `last_error()`. It was write-only from outside the crate.
+- **`TreeObserver::nodes_removed(NodeCounts)`:** what a diff, the
+  watcher or `remove()` took off the tree, so a resident tree's size is
+  known from the observer alone. Not for a rename or a move within the
+  tree.
+- **`WalkHooks::cancel`:** a cancellation flag per walk, for several
+  walks into one tree at once (one per account); the tree's flag stops
+  them all. (`WalkHooks` gained a field: struct literals need
+  `..Default::default()`.)
+- **`DirTree::with_pool(Arc<rayon::ThreadPool>)`:** every walk and diff
+  on a pool of the tree's own, apart from whatever else the process
+  runs on the global one.
+- **Relative paths are made absolute once, where they are given:**
+  `from_path`, `scan`, `rescan` and the `populate*` walks; `.`
+  components and repeated or trailing separators are dropped. The
+  lookup API still takes absolute paths.
+- **`Directory::files()`, `subdirs()`, `len()`, `is_empty()`:** a
+  directory's entries as snapshots under one lock hold; `files()` is
+  the candidate group a `FileOpener` opens with one directory open.
+- **`with_discover_only(true)`:** a walk that runs the visitor, streams
+  `WalkEvent`s and reports progress, but attaches nothing below a walk
+  root (`docs/implementation.md`, "Discover-only walks").
+
 Still open: a fanotify change source (the daemon's), and measuring the
 memory of a real host's tree (Scale, below).
 
