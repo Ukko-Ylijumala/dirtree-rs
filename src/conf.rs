@@ -269,9 +269,19 @@ impl TreeConf {
         self.cancelled.load(Relaxed)
     }
 
-    /// Raise the cancellation flag. Subsequent calls into the parallel walker return early.
+    /**
+    Raise the cancellation flag. Subsequent calls into the parallel
+    walker and the diff-rescan return early, until [TreeConf::clear_cancel]
+    lowers it: the flag stays raised on its own, so that a walk fanned
+    out over the pool winds down whole.
+    */
     pub fn cancel(&self) {
         self.cancelled.store(true, Relaxed);
+    }
+
+    /// Lower the cancellation flag, so that the tree walks again (see [TreeConf::cancel]).
+    pub fn clear_cancel(&self) {
+        self.cancelled.store(false, Relaxed);
     }
 
     /// Increment or decrement the node counter.

@@ -2948,6 +2948,30 @@ fn test_tree_update_rejects_detached() {
     tree_validate_counts(&tree);
 }
 
+#[test]
+fn test_tree_cancel_and_clear() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(1).level(2, 1).create(temp.path()).unwrap();
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true);
+    let p: String = format!("{dir}/file-0.bin");
+
+    tree.conf().cancel();
+    tree.walk().unwrap();
+    assert!(!tree.contains(&p), "a cancelled walk lists nothing");
+    assert_eq!(tree.update(dir, Some(true)).unwrap().scanned_dirs, 0, "nor does a cancelled diff");
+
+    // the flag stays raised until lowered
+    tree.walk().unwrap();
+    assert!(!tree.contains(&p));
+    tree.conf().clear_cancel();
+    tree.walk().unwrap();
+    assert!(tree.contains(&p));
+    tree_validate_counts(&tree);
+}
+
 fn walked_tree(dir: &str, filemode: FileMode, resident: bool) -> DirTree {
     let tree: DirTree = DirTree::new(filemode, Filters::default())
         .from_path(dir)
