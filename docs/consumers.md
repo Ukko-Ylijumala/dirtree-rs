@@ -341,7 +341,7 @@ A bugfinding and performance pass, nothing asked for by a consumer:
 - **`Filters::passes()` skips the name when no filter is set** (3.6%
   fewer instructions on a `/usr` walk).
 
-### Next
+### 0.5.9
 
 Additions for the consumers, from the same pass:
 
