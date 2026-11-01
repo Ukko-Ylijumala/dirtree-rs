@@ -259,6 +259,9 @@ impl DirTree {
 
     /// [DirTree::update] of the directory `node`, for a caller that holds it already.
     pub fn update_node(&self, node: &Arc<Directory>, recursive: Option<bool>) -> Result<UpdateStats, Error> {
+        if self.conf.discover_only() {
+            return Err(Error::new(ErrorKind::InvalidInput, "A discover-only tree holds nothing to diff"));
+        }
         if !node.is_attached() {
             return Err(Error::new(ErrorKind::NotFound, "Directory no longer in the tree"));
         }

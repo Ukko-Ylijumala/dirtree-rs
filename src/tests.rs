@@ -2398,6 +2398,58 @@ fn test_directory_children() {
 }
 
 #[test]
+fn test_tree_discover_only() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    for d in ["site/sub", "mail/cur", "mail/new", "mail/tmp"] {
+        create_dir_all(at(d)).unwrap();
+    }
+    for f in ["site/index.php", "site/sub/deep.php", "mail/new/msg.php"] {
+        write(at(f), b"<?php").unwrap();
+    }
+    write(at("site/readme.txt"), b"r").unwrap();
+    let (tx, rx) = crossbeam::channel::unbounded::<WalkEvent>();
+
+    // the sync setting is overridden: the visitor needs the parallel walker
+    for (sync, resident) in [(false, false), (true, true)] {
+        let obs: Arc<CountingObserver> = Arc::new(CountingObserver::default());
+        let selector: Arc<PhpSelector> = Arc::new(PhpSelector::default());
+        let maildir = Marker::dir_named("cur").and_dir("new").and_dir("tmp").tag(9).descend(false);
+        let visitor = CompositeVisitor::new().add(selector.clone()).add(MarkerVisitor::new().marker(maildir));
+        let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+            .from_path(dir)
+            .with_recursive(true)
+            .with_sync(sync)
+            .with_resident(resident)
+            .with_discover_only(true)
+            .with_visitor(Arc::new(visitor))
+            .with_discovery_sink(tx.clone())
+            .with_observer(obs.clone());
+        assert!(tree.is_discover_only());
+        let before: NodeCounts = tree.conf().counts();
+        tree.walk().unwrap();
+
+        // found: the maildir, the .php files outside it, and the progress of it all
+        let events: Vec<WalkEvent> = rx.try_iter().collect();
+        assert_eq!(events.len(), 1, "sync={sync}: {events:?}");
+        assert_eq!((events[0].path.clone(), events[0].tag, events[0].claimed), (at("mail"), 9, true));
+        let mut names: Vec<String> = selector.seen.lock().iter().map(|s: &PhpSeen| s.0.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["deep.php", "index.php"], "sync={sync}");
+        assert_eq!((obs.dirs.load(Relaxed), obs.files.load(Relaxed)), (4, 3), "root, site, sub, mail; sync={sync}");
+
+        // kept: nothing below the walk root, whatever the file mode, the verdicts or resident mode
+        assert_eq!(tree.conf().counts(), before, "sync={sync}");
+        assert!(tree.get_dir(dir).is_some_and(|d: Arc<Directory>| d.is_empty()));
+        assert!(!tree.contains(&at("site").to_string_lossy()));
+        assert_eq!(tree.handles_len(), 0, "resident={resident}");
+        assert_eq!(tree.update(dir, Some(true)).unwrap_err().kind(), ErrorKind::InvalidInput);
+        tree_validate_counts(&tree);
+    }
+}
+
+#[test]
 fn test_tree_rescan_via_worker() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();

@@ -133,6 +133,8 @@ pub struct TreeConf {
     sync: AtomicBool,
     /// Stay on the filesystem of each walk root (see `DirTree::with_one_filesystem`).
     one_fs: AtomicBool,
+    /// Walk without building the trie (see `DirTree::with_discover_only`).
+    discover_only: AtomicBool,
 }
 
 impl TreeConf {
@@ -203,6 +205,9 @@ impl TreeConf {
     pub(super) fn one_fs(&self) -> bool {
         self.one_fs.load(Relaxed)
     }
+    pub(super) fn discover_only(&self) -> bool {
+        self.discover_only.load(Relaxed)
+    }
 
     pub(super) fn set_recursive(&self, val: bool) {
         self.recursive.store(val, Relaxed);
@@ -215,6 +220,9 @@ impl TreeConf {
     }
     pub(super) fn set_one_fs(&self, val: bool) {
         self.one_fs.store(val, Relaxed);
+    }
+    pub(super) fn set_discover_only(&self, val: bool) {
+        self.discover_only.store(val, Relaxed);
     }
 
     /// A snapshot of the configured visitor, if any.

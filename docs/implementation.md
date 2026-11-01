@@ -331,8 +331,18 @@ the first 8 KB of each candidate `.php` / `style.css`, and assembles a
   the same entry list regardless.
 - Memory accounting under the `size_of` feature.
 
-## Future work (not in this PR)
+## Discover-only walks
 
-- A lighter "discover-only" walk mode that does not retain the trie at
-  all — the visitor-recognized paths are streamed and the tree itself
-  is not built. Useful when the discovery is the only output.
+`with_discover_only(true)` walks without building the trie: the visitor
+runs on every directory and file as usual, `WalkEvent`s stream out and
+the observer reports progress, but nothing is attached below a walk
+root: no node, no count, no stamp, no pooled handle, and
+`FileVerdict::Store` stores nothing. Each directory gets a node of the
+walk's own (its tag and scope hold the visitor's context for the
+entries below it), dropped once its subtree is walked, so the memory is
+the walk's width, not the tree's size. For a one-shot discovery (which
+installs are where) that needs no tree afterwards; `update()` refuses
+such a tree, which holds nothing to diff, and a watcher on it would see
+nothing. Forces the parallel walker, as a visitor does.
+
+## Future work (not in this PR)

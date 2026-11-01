@@ -110,6 +110,8 @@ struct Walk<'w> {
     recursive: bool,
     /// Whether this walk stays on one filesystem (see [WalkState::dev]).
     one_fs: bool,
+    /// Whether this walk builds no trie (see [DirTree::with_discover_only]).
+    discover_only: bool,
     /// Absolute path depth of the walk root (path components below `/`),
     /// used to keep the tree's depth counter in absolute-path terms while
     /// the walker itself tracks depth relative to the walk root.
@@ -657,7 +659,30 @@ impl DirTree {
         self
     }
 
-    /// Builder: walk with the synchronous walker (ignored when a visitor is set, or with one filesystem).
+    /**
+    Builder: walk without building the trie. The visitor runs on every
+    directory and file as usual, [`WalkEvent`]s stream out and the
+    observer reports progress, but nothing is attached below a walk
+    root: no node, no count, no stamp, no pooled handle, and
+    [`FileVerdict::Store`] stores nothing. Each directory gets a node of
+    the walk's own, holding the visitor's context for the entries below
+    it, dropped once its subtree is walked: the memory is the walk's
+    width, not the tree's size. For a one-shot discovery (which
+    installs are where) that needs no tree afterwards. [`DirTree::update`]
+    refuses such a tree, which holds nothing to diff, and a watcher on
+    it would see nothing. Like a visitor, forces the parallel walker.
+    */
+    pub fn with_discover_only(self, val: bool) -> Self {
+        self.conf.set_discover_only(val);
+        self
+    }
+
+    /// Whether this tree walks without building the trie (see [DirTree::with_discover_only]).
+    pub fn is_discover_only(&self) -> bool {
+        self.conf.discover_only()
+    }
+
+    /// Builder: walk with the synchronous walker (ignored when a visitor is set, with one filesystem, or discover-only).
     pub fn with_sync(self, val: bool) -> Self {
         self.conf.set_sync(val);
         self
@@ -753,7 +778,7 @@ impl DirTree {
     NOTE: If `recursive` is [None], the tree's default is used.
     */
     pub fn populate_auto(&self, path: &Path, recursive: Option<bool>) {
-        match !self.conf.sync() || self.has_visitor() || self.conf.one_fs() {
+        match !self.conf.sync() || self.has_visitor() || self.conf.one_fs() || self.conf.discover_only() {
             true => self.populate_par(path, recursive),
             false => self.populate(path, recursive),
         }
@@ -1079,6 +1104,7 @@ impl DirTree {
             cancel: hooks.cancel.as_deref(),
             recursive: recursive.unwrap_or(self.conf.recursive()),
             one_fs: self.conf.one_fs(),
+            discover_only: self.conf.discover_only(),
             base_depth,
         }
     }
@@ -1353,9 +1379,11 @@ impl DirTree {
             file it never stored (24 MB of empty slots on /usr). The files
             a visitor has stored anyway grow the map as they come.
             */
-            node.reserve_children(match self.filemode().is_node() {
-                true => entries.len(),
-                false => n_dirs,
+            // (a discover-only walk stores nothing, so it reserves nothing)
+            node.reserve_children(match (walk.discover_only, self.filemode().is_node()) {
+                (true, _) => 0,
+                (false, true) => entries.len(),
+                (false, false) => n_dirs,
             });
             /*
             Past MAX_RECURSE_DEPTH frames each subdirectory is walked by a
@@ -1387,13 +1415,14 @@ impl DirTree {
         // every entry of the listing is in (subdirectories as nodes, if not walked yet)
         if fresh
             && listed
+            && !walk.discover_only
             && let Some(st) = st
         {
             node.set_scan_stamp(settled_stamp(ctime_stamp(st.st_ctime, st.st_ctime_nsec), pass_time));
         }
 
-        // shall we keep the directory handle (file descriptor) open?
-        if self.conf.resident() {
+        // shall we keep the directory handle (file descriptor) open? (not for a node the walk drops)
+        if self.conf.resident() && !walk.discover_only {
             /*
             We already hold this directory's node - no path lookup needed.
             Pool the handle only if the node takes its fd: a re-populated
@@ -1460,22 +1489,29 @@ impl DirTree {
         }
         let child_idx: u32 =
             child_idx.unwrap_or_else(|| self.strings.insert(encode_os(name_os).as_ref()));
-        let (child, _) = self.insert_child(
-            parent_node,
-            child_idx,
-            NewChild::Dir(entry.ino()),
-            walk.child_depth_abs(depth),
-        );
         walk.observer.dirs_added(1);
-        let Child::Dir(child_node) = child else {
-            // a file recorded under this name (replaced since) blocks the slot
-            self.add_error_to(
-                walk.observer,
-                TreeEvent::error(FaultKind::Tree, "Cannot attach directory node")
-                    .path(&encode_os(&parent_path.join(name_os)))
-                    .op(&walk.op(parent_path)),
-            );
-            return;
+        let child_node: Arc<Directory> = match walk.discover_only {
+            // a node of the walk's own, the visitor's context for what is below; dropped with the walk
+            true => Arc::new(Directory::new(parent_node, child_idx, entry.ino())),
+            false => {
+                let (child, _) = self.insert_child(
+                    parent_node,
+                    child_idx,
+                    NewChild::Dir(entry.ino()),
+                    walk.child_depth_abs(depth),
+                );
+                let Child::Dir(child_node) = child else {
+                    // a file recorded under this name (replaced since) blocks the slot
+                    self.add_error_to(
+                        walk.observer,
+                        TreeEvent::error(FaultKind::Tree, "Cannot attach directory node")
+                            .path(&encode_os(&parent_path.join(name_os)))
+                            .op(&walk.op(parent_path)),
+                    );
+                    return;
+                };
+                child_node
+            }
         };
         if !walk.recursive {
             return;
@@ -1558,7 +1594,8 @@ impl DirTree {
         listing: &[EntryExt<'_>],
         batch: &[EntryExt<'_>],
     ) {
-        let store: bool = self.filemode().is_node();
+        // a discover-only walk stores nothing, whatever the mode or the verdict
+        let store: bool = self.filemode().is_node() && !walk.discover_only;
         let with_size: bool = self.filemode().is_with_size();
         let intern: bool = store || walk.visitor.is_some();
 
@@ -1626,7 +1663,8 @@ impl DirTree {
                     size += entry.len();
                 }
             }
-            let (true, Some(idx)) = (store || verdict == FileVerdict::Store, idx) else {
+            let stored: bool = store || (verdict == FileVerdict::Store && !walk.discover_only);
+            let (true, Some(idx)) = (stored, idx) else {
                 continue;
             };
             let target: Option<u32> = match kind {
