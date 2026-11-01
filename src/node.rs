@@ -35,6 +35,7 @@ use std::{
     os::fd::RawFd,
     os::unix::fs::FileTypeExt,
     path::PathBuf,
+    ptr,
     sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed},
     sync::{Arc, Weak},
 };
@@ -156,18 +157,36 @@ impl Directory {
         self.parent.is_none()
     }
 
-    /// Whether this directory is still in its tree: every ancestor up to the root is.
+    /**
+    Whether this directory is still in its tree: it sits in its parent's
+    children map under its name, as the very node it is, and so does
+    every ancestor up to the root. The chain of parents alone does not
+    tell: a directory removed from the tree (or waiting out a move)
+    keeps its parent reference while the parent lives on in the tree.
+    */
     pub fn is_attached(&self) -> bool {
-        let Some(mut current) = self.parent() else {
+        let Some(parent) = self.parent() else {
             return self.is_root();
         };
+        if !parent.holds(self.name_idx(), self) {
+            return false;
+        }
+        let mut current: Arc<Directory> = parent;
         while !current.is_root() {
             match current.parent() {
-                Some(parent) => current = parent,
-                None => return false,
+                Some(next) if next.holds(current.name_idx(), &current) => current = next,
+                _ => return false,
             }
         }
         true
+    }
+
+    /// Whether `dir` is this directory's child under `name_idx`, as that very node.
+    fn holds(&self, name_idx: u32, dir: &Directory) -> bool {
+        match self.children.read().get(&name_idx) {
+            Some(Child::Dir(d)) => ptr::eq(&**d, dir),
+            _ => false,
+        }
     }
 
     /// The parent directory; [None] for the root, or for a directory

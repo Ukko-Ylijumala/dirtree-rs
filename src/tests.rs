@@ -2915,6 +2915,31 @@ fn test_populate_par_beneath() {
     assert!(err.kind() == ErrorKind::NotFound || matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)), "{err}");
 }
 
+#[test]
+fn test_tree_update_rejects_detached() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    create_dir_all(temp.path().join("a/b")).unwrap();
+    write(temp.path().join("a/x.bin"), b"x").unwrap();
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    let a: Arc<Directory> = tree.get_dir(&format!("{dir}/a")).unwrap();
+    let b: Arc<Directory> = tree.get_dir(&format!("{dir}/a/b")).unwrap();
+    assert!(a.is_attached() && b.is_attached());
+
+    // removed from the tree but still on disk, its parent alive in the tree
+    tree.remove(&format!("{dir}/a")).unwrap();
+    let counts: NodeCounts = tree.conf().counts();
+    assert!(!a.is_attached(), "a removed directory keeps its parent reference");
+    assert!(!b.is_attached(), "...and so does everything below it");
+    write(temp.path().join("a/y.bin"), b"y").unwrap();
+    for node in [&a, &b] {
+        let err = tree.update_node(node, Some(true)).expect_err("a diff of a detached node");
+        assert_eq!(err.kind(), ErrorKind::NotFound, "{err}");
+    }
+    assert_eq!(tree.conf().counts(), counts, "a detached node's diff must not touch the counters");
+    tree_validate_counts(&tree);
+}
+
 fn walked_tree(dir: &str, filemode: FileMode, resident: bool) -> DirTree {
     let tree: DirTree = DirTree::new(filemode, Filters::default())
         .from_path(dir)
