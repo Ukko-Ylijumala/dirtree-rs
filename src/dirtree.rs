@@ -39,6 +39,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::{DirEntryExt, MetadataExt},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering::Relaxed},
     sync::{Arc, Weak},
     thread,
 };
@@ -47,7 +48,7 @@ use std::{
 use {
     size_of::{Context, SizeOf},
     std::mem::size_of,
-    std::sync::atomic::{AtomicU64, Ordering::Relaxed},
+    std::sync::atomic::AtomicU64,
     timesince::TimeSinceEpoch,
 };
 
@@ -84,6 +85,14 @@ shared.
 pub struct WalkHooks {
     pub visitor: Option<Arc<dyn Visitor>>,
     pub observer: Option<Arc<dyn TreeObserver>>,
+    /**
+    A cancellation flag of this walk's own, checked where the tree's
+    ([TreeConf::cancel]) is: raised, this walk winds down at each
+    directory it would list next, and the other walks go on. The
+    caller keeps the `Arc` to raise it (from a visitor of the walk, a
+    timer, a signal), and may reuse or lower it as it likes.
+    */
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 /**
@@ -94,6 +103,8 @@ the depth of its root.
 struct Walk<'w> {
     visitor: Option<Arc<dyn Visitor>>,
     observer: &'w dyn TreeObserver,
+    /// This walk's own cancellation flag, if it has one (see [WalkHooks::cancel]).
+    cancel: Option<&'w AtomicBool>,
     /// Whether this walk descends into subdirectories: the per-op flag,
     /// or the tree default.
     recursive: bool,
@@ -1024,6 +1035,7 @@ impl DirTree {
         Walk {
             visitor: hooks.visitor.clone().or_else(|| self.conf.visitor()),
             observer: hooks.observer.as_deref().unwrap_or(self.conf.observer()),
+            cancel: hooks.cancel.as_deref(),
             recursive: recursive.unwrap_or(self.conf.recursive()),
             one_fs: self.conf.one_fs(),
             base_depth,
@@ -1168,9 +1180,10 @@ impl DirTree {
         depth: usize,
         frames: usize,
     ) {
-        // Cooperative cancellation - checked at the top of every directory
-        // entry so an in-flight walk can wind down promptly once raised.
-        if self.conf.is_cancelled() {
+        // Cooperative cancellation (the tree's flag, or this walk's own) - checked
+        // at the top of every directory entry so an in-flight walk can wind down
+        // promptly once raised.
+        if self.conf.is_cancelled() || walk.cancelled() {
             return;
         }
 
@@ -2415,6 +2428,12 @@ impl DirAt {
 }
 
 impl Walk<'_> {
+    /// Whether this walk's own cancellation flag is raised (see [WalkHooks::cancel]).
+    #[inline]
+    fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c: &AtomicBool| c.load(Relaxed))
+    }
+
     /// The absolute depth of the entries of a directory `depth` levels below the walk root.
     #[inline]
     fn child_depth_abs(&self, depth: usize) -> u8 {

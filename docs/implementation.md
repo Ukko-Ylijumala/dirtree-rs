@@ -229,7 +229,13 @@ tree.conf().cancel();
 To raise it from inside a visitor: the visitor holds an `Arc<AtomicBool>`
 or similar shared state and flips it directly. The framework does not own
 the cancel signal beyond the flag check; the visitor owns the *policy*
-("cancel after N matches", "cancel on first match", etc.).
+("cancel after N matches", "cancel on first match", etc.). The flag stays
+raised until `clear_cancel()` lowers it.
+
+The tree's flag stops every walk and diff. A walk with hooks of its own
+(`populate_par_with`) may carry a flag of its own instead,
+`WalkHooks::cancel`, checked at the same place: raised, that walk winds
+down and the others (one per account, say) go on.
 
 ## Built-in visitors
 

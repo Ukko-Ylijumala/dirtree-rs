@@ -2218,7 +2218,7 @@ fn test_tree_walk_hooks() {
     chmod(&at("a/locked"), 0o000);
     thread::scope(|s| {
         for (path, obs, sel) in &units {
-            let hooks = WalkHooks { visitor: Some(sel.clone()), observer: Some(obs.clone()) };
+            let hooks = WalkHooks { visitor: Some(sel.clone()), observer: Some(obs.clone()), ..Default::default() };
             let tree: &DirTree = &tree;
             s.spawn(move || tree.populate_par_with(path, Some(true), &hooks));
         }
@@ -2245,6 +2245,46 @@ fn test_tree_walk_hooks() {
     assert_eq!(tree.conf().files(), 3);
     assert_eq!(tree.conf().errors(), 1);
     assert!(tree.contains(&at("b/y/three.php").to_string_lossy()));
+    tree_validate_counts(&tree);
+}
+
+#[test]
+fn test_tree_walk_cancel() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let at = |name: &str| -> PathBuf { temp.path().join(name) };
+    for d in ["a/x", "b/y"] {
+        std::fs::create_dir_all(at(d)).unwrap();
+    }
+    for f in ["a/x/one.php", "b/two.php", "b/y/three.php"] {
+        write(at(f), b"<?php").unwrap();
+    }
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true);
+
+    // a's walk cancelled on its own flag, b's goes on; the tree's flag stays down
+    let units: Vec<(PathBuf, Arc<UnitObserver>, Arc<AtomicBool>)> = ["a", "b"]
+        .map(|u| (at(u), Arc::default(), Arc::new(AtomicBool::new(u == "a"))))
+        .into();
+    thread::scope(|s| {
+        for (path, obs, cancel) in &units {
+            let hooks = WalkHooks { observer: Some(obs.clone()), cancel: Some(cancel.clone()), ..Default::default() };
+            let tree: &DirTree = &tree;
+            s.spawn(move || tree.populate_par_with(path, Some(true), &hooks));
+        }
+    });
+    let (a, b) = (&units[0], &units[1]);
+    assert_eq!((a.1.counts.dirs.load(Relaxed), a.1.counts.files.load(Relaxed)), (0, 0));
+    assert_eq!((b.1.counts.dirs.load(Relaxed), b.1.counts.files.load(Relaxed)), (1, 2));
+    assert!(!tree.contains(&at("a/x").to_string_lossy()) && tree.contains(&at("b/y/three.php").to_string_lossy()));
+    assert!(!tree.conf().is_cancelled());
+
+    // lowered, the same flag lets a's walk through
+    a.2.store(false, Relaxed);
+    let hooks = WalkHooks { cancel: Some(a.2.clone()), ..Default::default() };
+    tree.populate_par_with(&a.0, Some(true), &hooks);
+    assert!(tree.contains(&at("a/x/one.php").to_string_lossy()));
     tree_validate_counts(&tree);
 }
 
