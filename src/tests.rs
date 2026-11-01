@@ -2989,6 +2989,44 @@ fn test_tree_skeleton_reserves_no_file_slots() {
     assert!(capacity(&tree) >= 102, "{} slots for 102 entries", capacity(&tree));
 }
 
+#[test]
+fn test_tree_sync_walk_blocks_with_worker() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    let made = TreeSpec::new().root_files(1).level(2, 1).level(2, 2).create(temp.path()).unwrap();
+    let tree: Arc<DirTree> = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_sync(true)
+        .build()
+        .unwrap();
+    // what the walk root holds, below itself
+    let below = |tree: &DirTree| -> (u64, u64) {
+        let c: NodeCounts = tree.count_from(&tree.get_dir(dir).unwrap());
+        (c.dirs as u64 - 1, c.files as u64)
+    };
+
+    // blocking, as promised: nothing is left to the worker, and no error about it is logged
+    tree.walk().unwrap();
+    assert!(tree.is_ready(), "{:?}", tree.state());
+    assert_eq!(below(&tree), (made.dirs, made.files));
+    assert_eq!(tree.conf().errors(), 0, "the walk left work queued");
+
+    // a queued scan runs on the worker, one scan per subdirectory, and ends Ready
+    let new: String = format!("{dir}/level_1_0/new.bin");
+    write(&new, b"n").unwrap();
+    tree.scan(dir, Some(true)).unwrap();
+    wait_for(|| tree.contains(&new), "the queued sync scan should reach level_1_0");
+    wait_for(|| tree.is_ready(), "the queued sync scan should finish");
+    assert_eq!(below(&tree), (made.dirs, made.files + 1));
+    assert_eq!(tree.conf().errors(), 0);
+
+    // stopping the worker mid-scan must not deadlock on the worker handle's lock
+    tree.scan(dir, Some(true)).unwrap();
+    tree.stop_worker().unwrap();
+    tree_validate_counts(&tree);
+}
+
 fn walked_tree(dir: &str, filemode: FileMode, resident: bool) -> DirTree {
     let tree: DirTree = DirTree::new(filemode, Filters::default())
         .from_path(dir)

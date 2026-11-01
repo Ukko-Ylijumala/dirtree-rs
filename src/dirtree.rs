@@ -411,12 +411,29 @@ impl DirTree {
     */
     pub(super) fn quit_worker(&self, block: bool) -> TreeResult<()> {
         self.queue_op_prio(TreeOp::Quit);
-        if block && let Some(worker) = self.worker.lock().take() {
+        if !block {
+            return Ok(());
+        }
+        /*
+        Taken out before the join, which must not hold the lock: the
+        worker takes it too (a sync walk asking whose thread it is on),
+        and would wait for it while we wait for the worker.
+        */
+        let worker: Option<thread::JoinHandle<()>> = self.worker.lock().take();
+        if let Some(worker) = worker {
             worker
                 .join()
                 .map_err(|payload| TreeError::WorkerPanicked(panic_message(payload)))?;
         }
         Ok(())
+    }
+
+    /// Whether this is the background worker thread (see [DirTree::build]).
+    fn on_worker_thread(&self) -> bool {
+        self.worker
+            .lock()
+            .as_ref()
+            .is_some_and(|w: &thread::JoinHandle<()>| w.thread().id() == thread::current().id())
     }
 
     /**
@@ -685,6 +702,8 @@ impl DirTree {
     /// NOTE: If `recursive` is [None], the tree's default is used.
     ///
     /// NOTE: single threaded, potentially slow with large directory trees.
+    /// Blocking, except on the worker thread (a queued [TreeOp::Scan]),
+    /// where each subdirectory is queued as a scan of its own.
     #[instrument(level = "debug", skip_all, fields(p = self.rel_path(path).to_str()))]
     pub fn populate(&self, path: &Path, recursive: Option<bool>) {
         trace!(target: "get_entries", "{}", path.display());
@@ -727,7 +746,14 @@ impl DirTree {
                                 self.conf.observer().dirs_added(1);
                                 // an explicit per-op flag overrides the tree default
                                 if recursive.unwrap_or(self.conf.recursive()) {
-                                    if self.is_worker_running() {
+                                    /*
+                                    A queued scan running on the worker queues each
+                                    subdirectory as a scan of its own. Called from any
+                                    other thread (walk(), the caller), this recurses
+                                    and so blocks as promised; it used to queue onto a
+                                    running worker and return with the walk pending.
+                                    */
+                                    if self.on_worker_thread() {
                                         self.queue_op(TreeOp::Scan(path, recursive));
                                     } else {
                                         self.populate(&path, recursive);
