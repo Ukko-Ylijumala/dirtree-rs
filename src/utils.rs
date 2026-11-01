@@ -6,7 +6,9 @@
 
 use std::{
     any::Any,
+    env,
     os::fd::{AsRawFd, BorrowedFd},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU32, Ordering::Relaxed},
         Arc, Weak,
@@ -21,6 +23,24 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 /// The `/proc/self/fd` link of `fd`: a path that names what `fd` holds open, for calls that take only a path.
 pub(crate) fn proc_fd_path(fd: BorrowedFd<'_>) -> String {
     format!("{PROC_SELF_FD}/{}", fd.as_raw_fd())
+}
+
+/**
+`path` made absolute and normalized: a relative one is taken relative
+to the current directory, as the kernel would, once, here, and `.`
+components and repeated or trailing separators are dropped. The trie is
+keyed by absolute paths in that form, so a relative walk root would be
+filed under `/`-plus-itself and opened relative to wherever the process
+is by then, and a `.` in the path would match no node. A `..` is left
+as it is (a lookup takes it lexically). Left relative if the current
+directory cannot be had.
+*/
+pub(crate) fn abs_path(path: PathBuf) -> PathBuf {
+    let path: PathBuf = match path.is_relative() {
+        true => env::current_dir().map(|cwd: PathBuf| cwd.join(&path)).unwrap_or(path),
+        false => path,
+    };
+    path.components().collect()
 }
 
 // Define a trait to handle conversion to a Weak reference

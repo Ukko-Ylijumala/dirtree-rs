@@ -2333,6 +2333,28 @@ fn test_tree_pool() {
 }
 
 #[test]
+fn test_tree_relative_paths() {
+    // the crate root: cargo's cwd for a test
+    let cwd: PathBuf = std::env::current_dir().unwrap();
+    let under = |p: &str| cwd.join(p).to_string_lossy().into_owned();
+    for sync in [false, true] {
+        let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+            .from_path(".")
+            .with_recursive(false)
+            .with_sync(sync);
+        assert_eq!(*tree.from().unwrap(), cwd, "the root path is made absolute");
+        tree.walk().unwrap();
+        assert!(tree.contains(&under("Cargo.toml")), "sync={sync}");
+        assert!(!tree.contains(&under("docs/snapshot.md")), "one level, sync={sync}");
+        // a walk from a relative path lands under the absolute one
+        tree.populate_auto(Path::new("docs"), Some(false));
+        assert!(tree.contains(&under("docs/snapshot.md")), "sync={sync}");
+        assert!(tree.get_node("/docs").is_none(), "nothing filed under `/` itself");
+        tree_validate_counts(&tree);
+    }
+}
+
+#[test]
 fn test_tree_rescan_via_worker() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();

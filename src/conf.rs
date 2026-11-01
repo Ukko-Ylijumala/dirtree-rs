@@ -5,7 +5,7 @@ use super::observer::{NOOP_OBSERVER, TreeObserver};
 use super::osname::decode_path;
 use super::visitor::{Visitor, WalkEvent};
 use super::{FileMode, Filters};
-use super::utils::mod_atom_u32;
+use super::utils::{abs_path, mod_atom_u32};
 use crossbeam::channel::Sender;
 use parking_lot::RwLock;
 use rayon::ThreadPool;
@@ -153,7 +153,7 @@ impl TreeConf {
         self.from.get()
     }
     pub(super) fn set_from(&self, path: &str) {
-        self.from.set(decode_path(path)).ok();
+        self.from.set(abs_path(decode_path(path))).ok();
     }
 
     pub fn ctime(&self) -> &SecondsSinceEpoch {

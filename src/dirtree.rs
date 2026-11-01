@@ -11,7 +11,7 @@ use super::update::settled_stamp;
 use super::visitor::*;
 use super::worker::tree_worker;
 use super::{FileMode, Filters};
-use super::utils::{PATH_SEP, panic_message, path_parts};
+use super::utils::{PATH_SEP, abs_path, panic_message, path_parts};
 
 use dirhandle::{
     CheckedOutHandle, DirFd, DirHandle, EntryExt, OpenHandles, path_fd_at, path_fd_beneath,
@@ -480,7 +480,7 @@ impl DirTree {
     is the blocking form.
     */
     pub fn scan(&self, path: &str, recursive: Option<bool>) -> TreeResult<()> {
-        self.queue_bg_op(TreeOp::Scan(decode_path(path), recursive))
+        self.queue_bg_op(TreeOp::Scan(abs_path(decode_path(path)), recursive))
     }
 
     /**
@@ -492,7 +492,7 @@ impl DirTree {
     with [TreeError::WorkerNotRunning] when no worker would run it.
     */
     pub fn rescan(&self, path: &str) -> TreeResult<()> {
-        self.queue_bg_op(TreeOp::Update(decode_path(path)))
+        self.queue_bg_op(TreeOp::Update(abs_path(decode_path(path))))
     }
 
     /// Queue `op` for the worker, or fail if there is no worker to run it.
@@ -567,7 +567,15 @@ impl DirTree {
         }
     }
 
-    /// Set the root (filesystem) path of the tree.
+    /**
+    Set the root (filesystem) path of the tree, encoded (see
+    [encode_name](super::encode_name)). A relative path is taken
+    relative to the current directory here, once: the tree keys its
+    nodes by absolute paths, and so do [DirTree::scan], [DirTree::rescan]
+    and the `populate*` walks with the paths they are given. The lookup
+    API ([DirTree::get_node], [DirTree::update], [DirTree::remove])
+    takes absolute paths only.
+    */
     pub fn from_path(self, path: &str) -> Self {
         self.conf.set_from(path);
         self.insert_from();
@@ -761,6 +769,15 @@ impl DirTree {
     /// where each subdirectory is queued as a scan of its own.
     #[instrument(level = "debug", skip_all, fields(p = self.rel_path(path).to_str()))]
     pub fn populate(&self, path: &Path, recursive: Option<bool>) {
+        // a relative walk root is made absolute; the entries below it come absolute
+        let abs: PathBuf;
+        let path: &Path = match path.is_relative() {
+            true => {
+                abs = abs_path(path.to_path_buf());
+                &abs
+            }
+            false => path,
+        };
         trace!(target: "get_entries", "{}", path.display());
         /*
         Stamped as the parallel walk stamps (see populate_par_inner): from
@@ -939,7 +956,7 @@ impl DirTree {
         recursive: Option<bool>,
         hooks: &WalkHooks,
     ) -> Result<Arc<Directory>, Error> {
-        let path: &PathBuf = &path.to_path_buf();
+        let path: &PathBuf = &abs_path(path.to_path_buf());
         let pooled: DirHandle = DirHandle::open_beneath(anchor, rel)?;
         let inode: u64 = pooled.stat()?.st_ino;
         let node: Arc<Directory> = self
@@ -973,8 +990,8 @@ impl DirTree {
         recursive: Option<bool>,
         hooks: &WalkHooks,
     ) {
-        // the walker passes owned paths down; one conversion per walk root
-        let path: &PathBuf = &path.to_path_buf();
+        // the walker passes owned paths down; one conversion per walk root, made absolute
+        let path: &PathBuf = &abs_path(path.to_path_buf());
         let Some(node) = self.walk_root_node(path, None, recursive) else {
             return;
         };
