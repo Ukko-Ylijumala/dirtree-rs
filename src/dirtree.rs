@@ -989,7 +989,7 @@ impl DirTree {
             .walk_root_node(path, Some(inode), recursive)
             .ok_or_else(|| Error::new(ErrorKind::NotADirectory, "a file occupies the walk root's path"))?;
         // the walk lists through a handle of its own; the pooled one anchors later opens
-        let handle: Result<DirHandle, Error> = DirHandle::open_at(&pooled, c".");
+        let handle: Result<DirHandle, Error> = pooled.try_clone();
         node.set_anchored();
         if !node.fd().is_open() {
             let checked_out: CheckedOutHandle = self.handles.adopt(pooled);

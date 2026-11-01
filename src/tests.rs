@@ -876,7 +876,7 @@ fn test_dir_by_fd() {
     let dir: &str = temp.path().to_str().unwrap();
     std::fs::create_dir_all(temp.path().join("a/b")).unwrap();
     let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
-    let b: DirHandle = DirHandle::new(&temp.path().join("a/b")).unwrap();
+    let b: DirHandle = DirHandle::new(temp.path().join("a/b")).unwrap();
     let found: Arc<Directory> = tree.dir_by_fd(b.as_fd()).expect("a/b by its fd");
     assert!(Arc::ptr_eq(&found, &tree.get_dir(&format!("{dir}/a/b")).unwrap()));
     /*
@@ -885,7 +885,7 @@ fn test_dir_by_fd() {
     */
     std::fs::remove_dir(temp.path().join("a/b")).unwrap();
     std::fs::create_dir(temp.path().join("a/b")).unwrap();
-    let new_b: DirHandle = DirHandle::new(&temp.path().join("a/b")).unwrap();
+    let new_b: DirHandle = DirHandle::new(temp.path().join("a/b")).unwrap();
     assert!(tree.dir_by_fd(new_b.as_fd()).is_none(), "another inode");
     assert!(tree.dir_by_fd(b.as_fd()).is_none(), "removed: no path");
     let other: TempDir = TempDir::new().unwrap();
