@@ -688,12 +688,15 @@ impl DirTree {
     }
 
     /**
-    The directory at `path` could not be opened for a diff. If it is gone,
-    it vanished between its parent's diff and this open: detach it here,
-    since the parent pass has already moved on. Anything else is a fault.
+    The directory at `path` could not be opened for a diff. If the kernel
+    says it is gone, it vanished between its parent's diff and this open:
+    detach it here, since the parent pass has already moved on. Anything
+    else is a fault, a `NotFound` of the tree's own included (nothing to
+    open the directory from, see [DirTree::path_fd]): the directory may
+    well be there, so the tree keeps it.
     */
     fn update_open_failed(&self, path: &PathBuf, node: &Arc<Directory>, e: Error, ctr: &UpdateCtr) {
-        if e.kind() == ErrorKind::NotFound
+        if e.raw_os_error() == Some(libc::ENOENT)
             && let Some(parent) = node.parent()
         {
             let child: Child = Child::Dir(node.clone());

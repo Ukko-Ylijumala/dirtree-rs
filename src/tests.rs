@@ -2913,6 +2913,11 @@ fn test_populate_par_beneath() {
     assert!(!node.fd().is_open());
     let err = tree.path_fd(&sub).expect_err("without the pooled handle, nothing anchors the walk root");
     assert!(err.kind() == ErrorKind::NotFound || matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)), "{err}");
+    // a diff below it is then a fault, not a vanished directory: the tree keeps what it holds
+    let stats: UpdateStats = tree.update_node(&sub, Some(true)).unwrap();
+    assert_eq!((stats.errors, stats.scanned_dirs), (1, 0), "{stats}");
+    assert!(tree.contains(&sub_s), "a closed anchor does not mean the directory is gone");
+    tree_validate_counts(&tree);
 }
 
 #[test]
