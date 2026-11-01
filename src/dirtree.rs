@@ -1246,7 +1246,16 @@ impl DirTree {
             let mut entries = entries;
             let n_dirs: usize = partition_dirs_first(&mut entries);
             let (dirs, files) = entries.split_at(n_dirs);
-            node.reserve_children(entries.len());
+            /*
+            Room for every entry when files are stored, else for the
+            subdirectories only: a directory skeleton reserved a slot per
+            file it never stored (24 MB of empty slots on /usr). The files
+            a visitor has stored anyway grow the map as they come.
+            */
+            node.reserve_children(match self.filemode().is_node() {
+                true => entries.len(),
+                false => n_dirs,
+            });
             /*
             Past MAX_RECURSE_DEPTH frames each subdirectory is walked by a
             task of its own (see process_par_dir), which may start after

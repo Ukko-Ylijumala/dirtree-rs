@@ -2972,6 +2972,23 @@ fn test_tree_cancel_and_clear() {
     tree_validate_counts(&tree);
 }
 
+#[test]
+fn test_tree_skeleton_reserves_no_file_slots() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(100).level(2, 0).create(temp.path()).unwrap();
+    let capacity = |tree: &DirTree| tree.get_dir(dir).unwrap().children().read().capacity();
+
+    // a directory skeleton: room for the two subdirectories, not for the hundred files it never stores
+    let tree: DirTree = walked_tree(dir, FileMode::UNSET, false);
+    assert_eq!(tree.conf().files(), 0);
+    assert!(capacity(&tree) < 8, "{} slots reserved for 2 subdirectories", capacity(&tree));
+    // with files stored, room for every entry up front
+    let tree: DirTree = walked_tree(dir, FileMode::NODE, false);
+    assert_eq!(tree.conf().files(), 100);
+    assert!(capacity(&tree) >= 102, "{} slots for 102 entries", capacity(&tree));
+}
+
 fn walked_tree(dir: &str, filemode: FileMode, resident: bool) -> DirTree {
     let tree: DirTree = DirTree::new(filemode, Filters::default())
         .from_path(dir)
