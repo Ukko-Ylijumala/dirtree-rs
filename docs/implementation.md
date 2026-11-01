@@ -269,8 +269,9 @@ don't need a custom `Visitor` impl:
 
 - **`CompositeVisitor`** — fan out to N visitors. Verdict combination
   rule: most restrictive wins (`SkipChildren` > `Tag{descend:false}` >
-  `Tag{descend:true}` > `Continue`). Multiple `Tag`s emit multiple
-  `WalkEvent`s. Prune is OR (any inner pruning prunes). Every inner
+  `Tag{descend:true}` > `Continue`); of two `Tag`s of equal precedence
+  the first wins, so one tag is stored and one `WalkEvent` sent. Prune
+  is OR (any inner pruning prunes). Every inner
   `visit_file` runs, and `Drop` > `Store` > `Keep`. Max-depth is min
   (any inner depth cap caps).
 

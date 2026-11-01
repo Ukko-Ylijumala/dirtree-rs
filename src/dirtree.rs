@@ -2212,9 +2212,10 @@ impl DirTree {
 
     /**
     A lazy iterator over the directories a visitor tagged with `tag` (see
-    [Directory::tag]), as of their last walk. Tags come from the walker
-    only: a diff-rescan ([DirTree::update]) or a watcher event changing a
-    directory's entries does not re-run the visitor on it.
+    [Directory::tag]), as of their last walk or diff-rescan: an
+    [update](DirTree::update) visits each directory it lists again, and
+    with a visitor the watcher leaves its creates and moves to a diff, so
+    a marker that came or went is picked up there too.
     */
     pub fn tagged<'a>(&'a self, tag: ScopeTag) -> impl Iterator<Item = Arc<Directory>> + 'a {
         self.iter_dirs()

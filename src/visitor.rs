@@ -228,8 +228,9 @@ impl Verdict {
 
     Precedence: `SkipChildren` > `Tag{descend: false}` > `Tag{descend: true}` > `Continue`.
 
-    When two `Tag` verdicts of equal precedence collide, `self`'s tag wins;
-    the caller is expected to emit any extra events for the loser separately.
+    When two `Tag` verdicts of equal precedence collide, `self`'s tag wins:
+    the combined verdict is the one applied, so one tag is stored and one
+    [`WalkEvent`] sent, and the loser's tag is not seen by the tree.
     */
     pub fn combine(self, other: Self) -> Self {
         use Verdict::*;
