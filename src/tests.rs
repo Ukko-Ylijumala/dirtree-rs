@@ -2908,6 +2908,9 @@ fn test_populate_par_beneath() {
         .populate_par_beneath(&plugin, &anchor, rel, Some(true), &WalkHooks::default())
         .expect_err("a symlink in the way");
     assert!(matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)), "{err}");
+    // lost changes diff the anchored root, through the pooled handle
+    let stats: UpdateStats = tree.apply_changes([TreeChange::Lost]);
+    assert_eq!((stats.scanned_dirs, stats.errors), (2, 0), "the walked directory and sub: {stats}");
     // ...and so is a directory below it once the pooled handle is closed
     tree.handle_close(plugin_s);
     assert!(!node.fd().is_open());

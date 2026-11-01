@@ -803,12 +803,16 @@ impl DirTree {
         (dir.inode() == st.st_ino).then_some(dir)
     }
 
-    /// The topmost walk roots: walk-root directories with no walk root above them.
+    /**
+    The topmost walk roots: the directories a caller named, by their path
+    ([Directory::is_walk_root]) or beneath an fd ([Directory::is_anchored]),
+    with no such directory above them.
+    */
     pub(super) fn walk_roots(&self) -> Vec<Arc<Directory>> {
         let mut roots: Vec<Arc<Directory>> = Vec::new();
         let mut todo: Vec<Arc<Directory>> = vec![self.root()];
         while let Some(dir) = todo.pop() {
-            if dir.is_walk_root() {
+            if dir.is_walk_root() || dir.is_anchored() {
                 roots.push(dir);
                 continue;
             }
