@@ -287,7 +287,7 @@ impl DirTree {
         let (state, depth): (WalkState, usize) = self.state_of(&node);
         // opened from its walk root (or a pooled ancestor), not by its path
         match self.dir_at(&node) {
-            Ok(at) => rayon::scope(|s| self.update_inner(&diff, &full, node, at, state, depth, s, 0)),
+            Ok(at) => self.scope(|s| self.update_inner(&diff, &full, node, at, state, depth, s, 0)),
             Err(e) => self.update_open_failed(&full, &node, e, &diff.ctr),
         }
         let stats: UpdateStats = diff.ctr.snapshot();

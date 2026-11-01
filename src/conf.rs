@@ -8,6 +8,7 @@ use super::{FileMode, Filters};
 use super::utils::mod_atom_u32;
 use crossbeam::channel::Sender;
 use parking_lot::RwLock;
+use rayon::ThreadPool;
 use std::{
     fmt::{self, Debug, Display, Formatter},
     os::fd::BorrowedFd,
@@ -111,6 +112,8 @@ pub struct TreeConf {
     pub(super) discovery_tx: RwLock<Option<Sender<WalkEvent>>>,
     /// Progress reporting; [`NoopObserver`](super::NoopObserver) until set.
     observer: OnceLock<Arc<dyn TreeObserver>>,
+    /// The thread pool the walks and diffs run on; rayon's global one until set.
+    pool: OnceLock<Arc<ThreadPool>>,
     /// Set while a watcher follows the tree, see [ListHook].
     list_hook: RwLock<Option<ListHook>>,
     /// Cooperative cancellation flag. Checked at the top of every `populate_par_inner`.
@@ -247,6 +250,17 @@ impl TreeConf {
     /// Set the progress observer. Only the first one set takes effect.
     pub(super) fn set_observer(&self, o: Arc<dyn TreeObserver>) {
         self.observer.set(o).ok();
+    }
+
+    /// The thread pool of the tree's own, if one was set (see `DirTree::with_pool`).
+    #[inline]
+    pub(super) fn pool(&self) -> Option<&ThreadPool> {
+        self.pool.get().map(Arc::as_ref)
+    }
+
+    /// Set the thread pool. Only the first one set takes effect.
+    pub(super) fn set_pool(&self, pool: Arc<ThreadPool>) {
+        self.pool.set(pool).ok();
     }
 
     /// Set or clear the [ListHook] (one watcher per tree).

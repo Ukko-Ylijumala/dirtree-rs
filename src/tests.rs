@@ -2288,6 +2288,50 @@ fn test_tree_walk_cancel() {
     tree_validate_counts(&tree);
 }
 
+/// Records the thread pools the walker calls from, for [test_tree_pool].
+#[derive(Debug, Default)]
+struct PoolProbe {
+    /// (threads in the current pool, on a pool thread at all) per call
+    seen: Mutex<HashSet<(usize, bool)>>,
+}
+
+impl Visitor for PoolProbe {
+    fn visit_dir(&self, _ctx: DirContext<'_>) -> Verdict {
+        self.seen.lock().insert((rayon::current_num_threads(), rayon::current_thread_index().is_some()));
+        Verdict::Continue
+    }
+
+    fn visit_file(&self, _ctx: &FileContext<'_>) -> FileVerdict {
+        self.seen.lock().insert((rayon::current_num_threads(), rayon::current_thread_index().is_some()));
+        FileVerdict::Keep
+    }
+}
+
+#[test]
+fn test_tree_pool() {
+    let temp: TempDir = TempDir::new().unwrap();
+    let dir: &str = temp.path().to_str().unwrap();
+    TreeSpec::new().root_files(2).level(3, 2).level(2, 1).create(temp.path()).unwrap();
+    // a pool of an odd size no default has
+    let threads: usize = 3;
+    let pool: Arc<rayon::ThreadPool> = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap());
+    let probe: Arc<PoolProbe> = Arc::new(PoolProbe::default());
+    let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
+        .from_path(dir)
+        .with_recursive(true)
+        .with_visitor(probe.clone())
+        .with_pool(pool.clone());
+
+    // the walk, then a diff of it all: every hook call from a thread of that pool
+    tree.walk().unwrap();
+    assert_eq!(*probe.seen.lock(), HashSet::from([(threads, true)]));
+    probe.seen.lock().clear();
+    write(temp.path().join("level_1_0/new.bin"), b"n").unwrap();
+    assert_eq!(tree.update(dir, Some(true)).unwrap().added_files, 1);
+    assert_eq!(*probe.seen.lock(), HashSet::from([(threads, true)]));
+    tree_validate_counts(&tree);
+}
+
 #[test]
 fn test_tree_rescan_via_worker() {
     let temp: TempDir = TempDir::new().unwrap();

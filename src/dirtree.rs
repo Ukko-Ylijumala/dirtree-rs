@@ -662,6 +662,29 @@ impl DirTree {
     }
 
     /**
+    Builder: run the parallel walker and the diff-rescan on `pool`
+    instead of rayon's global pool. A consumer that runs its own work on
+    the global pool (detection, say) so keeps the tree's I/O-bound tasks
+    apart from it, and sizes them on their own. Every scope the tree
+    opens runs there, the tasks it spawns and the parallel iterators
+    below them included; the sync walker and the watcher's thread are
+    not pooled. Only the first one set takes effect.
+    */
+    pub fn with_pool(self, pool: Arc<rayon::ThreadPool>) -> Self {
+        self.conf.set_pool(pool);
+        self
+    }
+
+    /// A rayon scope on the tree's pool ([DirTree::with_pool]), or the global one.
+    #[inline]
+    pub(super) fn scope<'s, R: Send>(&self, f: impl FnOnce(&rayon::Scope<'s>) -> R + Send) -> R {
+        match self.conf.pool() {
+            Some(pool) => pool.scope(f),
+            None => rayon::scope(f),
+        }
+    }
+
+    /**
     Walk this tree's configured root path, populating it (one level only
     unless recursive, see `with_recursive()`). Blocking; progress goes to
     the observer set with `with_observer()`. Fails with
@@ -867,7 +890,8 @@ impl DirTree {
     buffer to look ahead in the directory stream.
 
     Several walks may run on one tree at once, from different threads
-    (each in a [rayon::scope] of its own): nodes are created under their
+    (each in a scope of its own, on the tree's pool or rayon's global
+    one, see [DirTree::with_pool]): nodes are created under their
     parent's lock, and the counters are atomic. See also
     [DirTree::populate_par_with].
     */
@@ -933,7 +957,7 @@ impl DirTree {
         }
         let walk: Walk = self.new_walk(path, 0, recursive, hooks);
         let state: WalkState = self.initial_walk_state(path, 0);
-        rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node.clone(), s, 0, 0));
+        self.scope(|s| self.populate_par_inner(&walk, path, handle, state, node.clone(), s, 0, 0));
         Ok(node)
     }
 
@@ -961,7 +985,7 @@ impl DirTree {
         let state: WalkState = self.initial_walk_state(path, dev);
         // a symlinked walk root is followed, see DirAt
         let handle: Result<DirHandle, Error> = at.open(path);
-        rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, 0, 0));
+        self.scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, 0, 0));
     }
 
     /**
@@ -1011,7 +1035,7 @@ impl DirTree {
         let hooks: WalkHooks = WalkHooks::default();
         let walk: Walk = self.new_walk(path, depth, Some(true), &hooks);
         let handle: Result<DirHandle, Error> = at.open(path);
-        rayon::scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, depth, 0));
+        self.scope(|s| self.populate_par_inner(&walk, path, handle, state, node, s, depth, 0));
     }
 
     /**
