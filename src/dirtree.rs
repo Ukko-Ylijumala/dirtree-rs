@@ -32,7 +32,7 @@ use tracing::{debug, error, instrument, trace, trace_span, warn};
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    ffi::{CStr, CString, OsStr},
+    ffi::{CString, OsStr, OsString},
     fmt::{self, Display, Formatter},
     fs::{DirEntry, Metadata, metadata, read_link},
     io::{Error, ErrorKind},
@@ -1326,9 +1326,10 @@ impl DirTree {
         dir-first lookahead.
         */
         /*
-        For readlinkat() on the symlinks listed here. Taken before the
-        listing borrows the handle mutably; the handle is only moved once
-        every entry has been processed, so the fd stays open meanwhile.
+        For the visitor's context, and for the O_PATH fd the spawned
+        descents open from. Taken before the listing borrows the handle
+        mutably; the handle is only moved once every entry has been
+        processed, so the fd stays open meanwhile.
         */
         let dirfd: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(handle.as_raw_fd()) };
         // a watcher watches this directory before it is read (see ListHook)
@@ -1464,12 +1465,11 @@ impl DirTree {
         entry: &EntryExt<'_>,
     ) {
         /*
-        name_as_bytes() borrows the name stored in the entry itself.
-        from_bytes() wraps it as &OsStr without any allocation, so
-        filtered entries never pay for the String allocation from
-        entry.name().
+        file_name_os() views the name stored in the entry itself as an
+        &OsStr without any allocation, so filtered entries never pay for
+        the String allocation from entry.name().
         */
-        let name_os = OsStr::from_bytes(entry.name_as_bytes());
+        let name_os: &OsStr = entry.file_name_os();
         trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
 
         /*
@@ -1607,7 +1607,7 @@ impl DirTree {
         for entry in batch {
             let Some(entry_t) = entry.file_type() else {
                 // no d_type, and the fstatat for it failed
-                let entry_p: PathBuf = parent_path.join(OsStr::from_bytes(entry.name_as_bytes()));
+                let entry_p: PathBuf = entry.path_in(parent_path);
                 self.add_error_to(
                     walk.observer,
                     TreeEvent::error(FaultKind::Stat, "Unknown entry type")
@@ -1620,7 +1620,7 @@ impl DirTree {
             let Some(kind) = FileKind::from_type(entry_t) else {
                 continue;
             };
-            let name_os: &OsStr = OsStr::from_bytes(entry.name_as_bytes());
+            let name_os: &OsStr = entry.file_name_os();
             trace!(target: "ENTRY", "{:?} : {:?}", name_os, entry);
             if !self.conf.filters().passes(name_os, false) {
                 continue;
@@ -1670,9 +1670,7 @@ impl DirTree {
                 continue;
             };
             let target: Option<u32> = match kind {
-                FileKind::Symlink => {
-                    self.link_target_at(walk.observer, dirfd, parent_path, entry.file_name())
-                }
+                FileKind::Symlink => self.link_target_of(walk.observer, entry, parent_path),
                 _ => None,
             };
             let child: Child = Child::File(FileEntry::new(entry.ino(), kind, target));
@@ -1744,40 +1742,56 @@ impl DirTree {
     }
 
     /**
-    The interned target of the symlink `name` in the directory `dirfd`
-    (at `parent`), or [None] if it cannot be read (e.g. removed since it
-    was listed), which is a [FaultKind::ReadLink] told to `observer`.
+    The interned target of the symlink `entry`, listed in the directory
+    at `parent` (`readlinkat` from the entry's own directory fd), or
+    [None] if it cannot be read (e.g. removed since it was listed), which
+    is a [FaultKind::ReadLink] told to `observer`.
+    */
+    pub(super) fn link_target_of(
+        &self,
+        observer: &dyn TreeObserver,
+        entry: &EntryExt<'_>,
+        parent: &Path,
+    ) -> Option<u32> {
+        self.intern_link_target(observer, entry.read_link(), || entry.path_in(parent))
+    }
+
+    /**
+    [DirTree::link_target_of] for a symlink `name` of the directory open
+    as `dirfd` (at `parent`) that was never listed: the watcher's, named
+    by its event.
     */
     pub(super) fn link_target_at(
         &self,
         observer: &dyn TreeObserver,
         dirfd: BorrowedFd<'_>,
         parent: &Path,
-        name: &CStr,
+        name: &OsStr,
     ) -> Option<u32> {
-        match readlinkat(dirfd, name) {
+        let target: Result<OsString, Error> = readlinkat(dirfd, name).map_err(Error::from);
+        self.intern_link_target(observer, target, || parent.join(name))
+    }
+
+    /// [DirTree::link_target_of] for a symlink given by its path.
+    pub(super) fn link_target(&self, path: &Path) -> Option<u32> {
+        let target: Result<OsString, Error> = read_link(path).map(PathBuf::into_os_string);
+        self.intern_link_target(self.conf.observer(), target, || path.to_path_buf())
+    }
+
+    /// The tail the `link_target*` readers share: intern `target` as read, or record the error at `path()`.
+    fn intern_link_target(
+        &self,
+        observer: &dyn TreeObserver,
+        target: Result<OsString, Error>,
+        path: impl FnOnce() -> PathBuf,
+    ) -> Option<u32> {
+        match target {
             Ok(target) => Some(self.strings.insert(encode_os(&target))),
             Err(e) => {
-                let path: PathBuf = parent.join(OsStr::from_bytes(name.to_bytes()));
                 self.add_error_to(
                     observer,
                     TreeEvent::error(FaultKind::ReadLink, &format!("Cannot read symlink: {e}"))
-                        .path(&encode_os(&path))
-                        .errno(e as i32),
-                );
-                None
-            }
-        }
-    }
-
-    /// [DirTree::link_target_at] for a symlink given by its path.
-    pub(super) fn link_target(&self, path: &Path) -> Option<u32> {
-        match read_link(path) {
-            Ok(target) => Some(self.strings.insert(encode_os(&target))),
-            Err(e) => {
-                self.add_error(
-                    TreeEvent::error(FaultKind::ReadLink, &format!("Cannot read symlink: {e}"))
-                        .path(&encode_os(path))
+                        .path(&encode_os(&path()))
                         .io(&e),
                 );
                 None

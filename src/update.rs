@@ -61,7 +61,6 @@ use std::{
     ops::AddAssign,
     io::{Error, ErrorKind},
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
-    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering::Relaxed},
@@ -443,7 +442,7 @@ impl DirTree {
         The diff keeps its own stamp (above), so the handle's own state
         tracking would be wasted work: iterate untracked.
         */
-        // for readlinkat() on new symlinks; the handle outlives the entries
+        // for the visitor's context; the handle outlives the entries
         let dirfd: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(handle.as_raw_fd()) };
         let mut iter = handle.iter_untracked();
         let entries: Vec<EntryExt> = iter.by_ref().collect();
@@ -506,7 +505,7 @@ impl DirTree {
         let mut passing: Vec<&EntryExt> = Vec::with_capacity(entries.len());
         let mut unknown: Vec<u32> = Vec::new();
         for e in entries.iter().filter(|_| descend) {
-            let name_os: &OsStr = OsStr::from_bytes(e.name_as_bytes());
+            let name_os: &OsStr = e.file_name_os();
             if e.file_type().is_none() {
                 // lookup only: a name the store lacks is not in the tree either
                 if let Some(idx) = self.strings.idx(encode_os(name_os).as_ref()) {
@@ -567,7 +566,7 @@ impl DirTree {
         for (name_idx, entry) in disk {
             let is_dir: bool = entry.is_dir();
             let disk_ino: u64 = entry.ino();
-            let name_os: &OsStr = OsStr::from_bytes(entry.name_as_bytes());
+            let name_os: &OsStr = entry.file_name_os();
             /*
             What a new or replaced non-directory is recorded as, if it is
             at all: the visitor's verdict decides as in the walk, else
@@ -588,7 +587,7 @@ impl DirTree {
                     return None;
                 }
                 let target: Option<u32> = match kind {
-                    FileKind::Symlink => self.link_target_at(self.conf.observer(), dirfd, path, entry.file_name()),
+                    FileKind::Symlink => self.link_target_of(self.conf.observer(), entry, path),
                     _ => None,
                 };
                 Some(FileEntry::new(disk_ino, kind, target))

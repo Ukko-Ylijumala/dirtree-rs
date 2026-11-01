@@ -730,13 +730,11 @@ impl TreeWatcher {
                 .saturating_sub(1)
                 .min(u8::MAX as usize) as u8;
             let counted: bool = if self.tree.filemode().is_node() {
-                let target: Option<u32> = match (kind, CString::new(name.as_bytes())) {
-                    (FileKind::Symlink, Ok(cname)) => self.tree.link_target_at(
-                        self.tree.conf.observer(),
-                        here.as_fd(),
-                        &dir_path,
-                        &cname,
-                    ),
+                let target: Option<u32> = match kind {
+                    FileKind::Symlink => {
+                        self.tree
+                            .link_target_at(self.tree.conf.observer(), here.as_fd(), &dir_path, name)
+                    }
                     _ => None,
                 };
                 let file: FileEntry = FileEntry::new(ino, kind, target);
