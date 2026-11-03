@@ -680,7 +680,9 @@ fn test_snapshot_round_trip() {
     std::fs::create_dir(temp.path().join("tagged")).unwrap();
     write(temp.path().join("tagged/MARK"), b"").unwrap();
     // a name that is not UTF-8
-    write(temp.path().join(OsStr::from_bytes(b"latin-\xe4.txt")), b"").unwrap();
+    if raw_names(temp.path(), "test_snapshot_round_trip") {
+        write(temp.path().join(OsStr::from_bytes(b"latin-\xe4.txt")), b"").unwrap();
+    }
 
     let tree: DirTree = DirTree::new(FileMode::NODE, Filters::default())
         .from_path(dir)
@@ -2129,8 +2131,9 @@ fn chmod(path: &Path, mode: u32) {
 fn test_tree_faults() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
-    // not UTF-8 either: the fault carries the exact path
-    let locked: PathBuf = temp.path().join(OsStr::from_bytes(b"lock\xe9d"));
+    // not UTF-8 either, where the filesystem takes it: the fault carries the exact path
+    let name: &[u8] = if raw_names(temp.path(), "test_tree_faults") { b"lock\xe9d" } else { b"locked" };
+    let locked: PathBuf = temp.path().join(OsStr::from_bytes(name));
     std::fs::create_dir_all(locked.join("inner")).unwrap();
     std::fs::create_dir(temp.path().join("open")).unwrap();
     let denied = TreeFault { kind: FaultKind::OpenDir, path: Some(locked.clone()), errno: Some(libc::EACCES) };
@@ -2934,6 +2937,9 @@ fn disk_paths(dir: &Path, out: &mut HashSet<PathBuf>) {
 fn test_tree_hostile_names() {
     let temp: TempDir = TempDir::new().unwrap();
     let dir: &str = temp.path().to_str().unwrap();
+    if !raw_names(temp.path(), "test_tree_hostile_names") {
+        return;
+    }
     let expected: NodeCounts = hostile_names(temp.path());
     let mut on_disk: HashSet<PathBuf> = HashSet::new();
     disk_paths(temp.path(), &mut on_disk);
@@ -3052,6 +3058,26 @@ fn mkfifo(path: &Path) {
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo {}", path.display());
 }
 
+/**
+Whether the filesystem holding `dir` takes names that are not UTF-8. A ZFS
+dataset with `utf8only=on` (Ubuntu's root pool) refuses them with EILSEQ;
+then `test` notes that it skips them.
+*/
+fn raw_names(dir: &Path, test: &str) -> bool {
+    let probe: PathBuf = dir.join(OsStr::from_bytes(b"probe-\xff"));
+    match write(&probe, b"") {
+        Ok(()) => {
+            remove_file(&probe).unwrap();
+            true
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!("{test}: skipping names that are not UTF-8, refused at {}", dir.display());
+            false
+        }
+        Err(e) => panic!("probe {}: {e}", probe.display()),
+    }
+}
+
 fn wait_for<F: Fn() -> bool>(cond: F, msg: &str) {
     for _ in 0..200 {
         if cond() {
@@ -3064,7 +3090,6 @@ fn wait_for<F: Fn() -> bool>(cond: F, msg: &str) {
 
 /* --------------------------------- */
 
-/// A tree of `dir` in `filemode`, walked recursively (parallel walker).
 /// A walk below an fd the caller holds: the subtree is reached with no
 /// symlink in any component, its node is known by the name the caller
 /// gives, and every later open below it resolves beneath the same fd --
@@ -3279,6 +3304,7 @@ fn test_tree_events() {
     assert!(tree.events().is_empty(), "nor does a blocking update");
 }
 
+/// A tree of `dir` in `filemode`, walked recursively (parallel walker).
 fn walked_tree(dir: &str, filemode: FileMode, resident: bool) -> DirTree {
     let tree: DirTree = DirTree::new(filemode, Filters::default())
         .from_path(dir)
