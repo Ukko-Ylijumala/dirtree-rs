@@ -40,7 +40,7 @@ version = "0.7.0"
 
 [dependencies.stringstore]
 git = "https://github.com/Ukko-Ylijumala/stringstore-rs"
-version = "0.4.4"
+version = "0.5.0"
 
 [dependencies.timesince]
 version = "0.3.4"
